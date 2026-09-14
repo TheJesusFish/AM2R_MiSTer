@@ -381,6 +381,9 @@ void publish_joy_masks(StateControl &state, FILE *log)
 			gPreviousJoyMask[player] = mask;
 		}
 	}
+	// The three-bit menu value selects a symmetric whole-pixel inset. The
+	// runner applies it only to edge UI; game layers remain native 320x240.
+	gJoyShm->crt_ui_inset = user_io_status_get("[26:24]") * 2u;
 	__sync_synchronize();
 }
 

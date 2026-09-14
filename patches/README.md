@@ -37,13 +37,14 @@ git apply ../../patches/butterscotch-opaque-prefix-cull.patch
 git apply ../../patches/butterscotch-water-native-deferred-export.patch
 git apply ../../patches/butterscotch-water-pipeline-performance.patch
 git apply ../../patches/butterscotch-large-file-metadata.patch
+git apply ../../patches/butterscotch-crt-ui-inset.patch
 ```
 
-The twenty-six files were generated from the hardware-validated working tree and
+The twenty-seven files were generated from the hardware-validated working tree and
 each passes `git apply --reverse --check` against that tree. See the final
 hardware and save-state reports under `reports/` for build identities and test
 results.
-Applying all twenty-five to a fresh detached clone at the base commit reconstructs
+Applying all twenty-seven to a fresh detached clone at the base commit reconstructs
 the current runner source after normalizing checkout line endings. The first
 seven patches were reconstructed and byte-compared with the
 80 MHz hardware-tested runner source on 2026-09-06. The eighth adds semantic
@@ -115,6 +116,13 @@ overlay file-existence checks. This avoids 32-bit ARM `stat()` returning
 `EOVERFLOW` for ordinary saves on CIFS shares whose server-provided inode
 numbers exceed 32 bits, without changing libc's file ABI. Such files now
 participate in the normal save-over-bundle lookup without being recopied.
+The twenty-seventh patch adds an experimental whole-pixel vertical inset for
+edge UI. It moves text glyphs and AM2R's cropped HUD surface only when their
+content enters the top or bottom sixteen-line band. It also moves the separate
+AM2R 1.1 title-screen version and URL overlays while leaving the title artwork,
+gameplay layers, camera coordinates, and collision coordinates at their native
+320x240 positions. The setting is transported through a versioned
+wrapper/runner shared-memory field and defaults to off.
 
 | Patch | SHA-256 |
 | --- | --- |
@@ -144,6 +152,7 @@ participate in the normal save-over-bundle lookup without being recopied.
 | `butterscotch-water-native-deferred-export.patch` | `fd3c2335f90ab461adba4bc59882c3be19ef158d265aeaebde1c9caba5a920bc` |
 | `butterscotch-water-pipeline-performance.patch` | `95d1c60a743ef916f0c779b92eae033b40c2628730ab02b8fb47a9ee2e2dc1c2` |
 | `butterscotch-large-file-metadata.patch` | `498ac455036b22d9b3e2061c6c798a46d140830279494abcb517fe102cfff9e0` |
+| `butterscotch-crt-ui-inset.patch` | `9abbe0daa25b2b047ea4e14834a373445775aa0c316c24d40c46344f78d0711f` |
 
 Persistent checkpoints use DMTCP 3.2.0. Apply the MiSTer ARMv7 portability
 patch to a clean DMTCP checkout at commit

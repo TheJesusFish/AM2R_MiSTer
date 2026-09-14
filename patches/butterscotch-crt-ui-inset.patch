@@ -1,0 +1,191 @@
+diff --git a/src/backends/mister.c b/src/backends/mister.c
+index 6a409de..9810f1c 100644
+--- a/src/backends/mister.c
++++ b/src/backends/mister.c
+@@ -54,12 +54,13 @@
+ #define AM2R_JOY_SHM_PATH "/dev/shm/am2r-joy"
+ #define AM2R_JOY_SHM_ENV "AM2R_JOY_SHM"
+ #define AM2R_JOY_SHM_MAGIC 0x524a3241u
+-#define AM2R_JOY_SHM_VERSION 1u
++#define AM2R_JOY_SHM_VERSION 2u
+ 
+ typedef struct {
+     uint32_t magic;
+     uint32_t version;
+     uint32_t joy_mask[2];
++    uint32_t crt_ui_inset;
+ } Am2rJoyShm;
+ 
+ typedef struct { uint64_t word[8]; } MisterGpuCommand;
+@@ -339,6 +340,10 @@ static void initGpu(void) {
+ 
+ bool MisterGpu_isAvailable(void) { return g_gpu_available; }
+ 
++uint32_t MisterGpu_getCrtUiInset(void) {
++    return g_joy_shm != NULL ? g_joy_shm->crt_ui_inset : 0;
++}
++
+ void MisterGpu_beginFrame(void) {
+     g_gpu_frame_serial++;
+     if (g_gpu_frame_serial == 0) g_gpu_frame_serial = 1;
+diff --git a/src/backends/mister_gpu.h b/src/backends/mister_gpu.h
+index c630ca1..3468793 100644
+--- a/src/backends/mister_gpu.h
++++ b/src/backends/mister_gpu.h
+@@ -6,6 +6,7 @@
+ #include <stdint.h>
+ 
+ bool MisterGpu_isAvailable(void);
++uint32_t MisterGpu_getCrtUiInset(void);
+ void MisterGpu_beginFrame(void);
+ uint32_t MisterGpu_uploadTexture(const void* rgbaPixels, size_t bytes);
+ uint32_t MisterGpu_uploadDynamicTexture(const void* rgbaPixels, size_t bytes);
+diff --git a/src/crt_ui_inset.h b/src/crt_ui_inset.h
+new file mode 100644
+index 0000000..db78373
+--- /dev/null
++++ b/src/crt_ui_inset.h
+@@ -0,0 +1,37 @@
++// SPDX-License-Identifier: AGPL-3.0-only
++
++#ifndef _BS_CRT_UI_INSET_H_
++#define _BS_CRT_UI_INSET_H_
++
++#include <stdint.h>
++
++// Keep edge UI at native pixel size. Only elements which actually enter the
++// sixteen-line overscan band move; full-screen artwork and gameplay layers do
++// not qualify.
++static inline int32_t CrtUi_verticalOffset(int32_t frameHeight,
++                                            int32_t minY, int32_t maxY,
++                                            uint32_t inset) {
++    if (frameHeight <= 0 || minY >= maxY || inset == 0) return 0;
++    if (inset > (uint32_t)(frameHeight / 4)) inset = (uint32_t)(frameHeight / 4);
++
++    const int32_t edgeBand = 16;
++    const int32_t middle = frameHeight / 2;
++    if (minY < edgeBand && maxY <= middle) return (int32_t)inset;
++    if (maxY > frameHeight - edgeBand && minY >= middle) return -(int32_t)inset;
++    return 0;
++}
++
++// AM2R 1.1 draws the small version tag and project URL as separate BGND
++// resources in titleroom. Keep those two UI overlays visible without moving
++// the title artwork behind them. The resource IDs are stable for the only
++// supported data.win revision and are additionally gated by the room ID.
++static inline int32_t CrtUi_am2rTitleBackgroundOffset(int32_t roomIndex,
++                                                       int32_t backgroundIndex,
++                                                       uint32_t inset) {
++    if (roomIndex != 1 || inset == 0) return 0;
++    if (backgroundIndex == 164) return (int32_t)inset;
++    if (backgroundIndex == 165) return -(int32_t)inset;
++    return 0;
++}
++
++#endif
+diff --git a/src/sw_renderer.c b/src/sw_renderer.c
+index 337eb5a..d861a60 100644
+--- a/src/sw_renderer.c
++++ b/src/sw_renderer.c
+@@ -8,6 +8,7 @@
+ #include "log.h"
+ #ifdef USE_MISTER
+ #include "backends/mister_gpu.h"
++#include "crt_ui_inset.h"
+ #endif
+ 
+ #include "stb_ds.h"
+@@ -110,6 +111,24 @@ typedef struct {
+     float r, g, b, a;  // vertex color (0-1)
+ } SWVertex;
+ 
++#ifdef USE_MISTER
++static void swApplyCrtUiTextOffset(SWRenderer* sw, SWVertex vertices[4]) {
++    int32_t minY = (int32_t)floorf(vertices[0].y);
++    int32_t maxY = (int32_t)ceilf(vertices[0].y);
++    for (int i = 1; i < 4; ++i) {
++        int32_t y0 = (int32_t)floorf(vertices[i].y);
++        int32_t y1 = (int32_t)ceilf(vertices[i].y);
++        if (y0 < minY) minY = y0;
++        if (y1 > maxY) maxY = y1;
++    }
++    int32_t offset = CrtUi_verticalOffset(sw->hostHeight, minY, maxY,
++                                          MisterGpu_getCrtUiInset());
++    if (offset != 0) {
++        for (int i = 0; i < 4; ++i) vertices[i].y += (float)offset;
++    }
++}
++#endif
++
+ // ===[ Triangle Rasterizer ]===
+ 
+ static inline float edgeFunction(float ax, float ay, float bx, float by, float px, float py) {
+@@ -762,6 +781,8 @@ static bool rasterizeAxisAlignedQuad(SWRenderer* sw, SWVertex v[4], const uint8_
+                 int32_t maxSourceY = sw->surfaceContentMaxY[sourceSurface];
+                 int32_t cropHeight = maxSourceY - minSourceY;
+                 if (minSourceX < maxSourceX && cropHeight > 0 && cropHeight <= 64) {
++                    int32_t hudOffset = CrtUi_verticalOffset(240,
++                        minSourceY, maxSourceY, MisterGpu_getCrtUiInset());
+                     if (sw->gpuHudScratch == nullptr)
+                         sw->gpuHudScratch = (uint8_t*)safeCalloc(320u * 64u, 4u);
+                     for (int32_t py = 0; py < cropHeight; ++py)
+@@ -772,6 +793,9 @@ static bool rasterizeAxisAlignedQuad(SWRenderer* sw, SWVertex v[4], const uint8_
+                     texH = 64;
+                     v[0].v = v[1].v = -(float)minSourceY / 64.0f;
+                     v[2].v = v[3].v = (240.0f - (float)minSourceY) / 64.0f;
++                    for (int i = 0; i < 4; ++i) v[i].y += (float)hudOffset;
++                    minY += hudOffset;
++                    maxY += hudOffset;
+                     minX += minSourceX;
+                     maxX -= 320 - maxSourceX;
+                     minY += minSourceY;
+@@ -1639,6 +1663,10 @@ static void swDrawText(Renderer* renderer, const char* text, float x, float y, f
+             worldToScreen(sw, wx2, wy2, &verts[2].x, &verts[2].y);
+             worldToScreen(sw, wx3, wy3, &verts[3].x, &verts[3].y);
+ 
++#ifdef USE_MISTER
++            swApplyCrtUiTextOffset(sw, verts);
++#endif
++
+             verts[0].u = u0; verts[0].v = v0;
+             verts[1].u = u1; verts[1].v = v0;
+             verts[2].u = u1; verts[2].v = v1;
+@@ -1779,6 +1807,10 @@ static void swDrawTextColor(Renderer* renderer, const char* text, float x, float
+             worldToScreen(sw, wx2, wy2, &verts[2].x, &verts[2].y);
+             worldToScreen(sw, wx3, wy3, &verts[3].x, &verts[3].y);
+ 
++#ifdef USE_MISTER
++            swApplyCrtUiTextOffset(sw, verts);
++#endif
++
+             verts[0].u = u0; verts[0].v = v0;
+             verts[1].u = u1; verts[1].v = v0;
+             verts[2].u = u1; verts[2].v = v1;
+diff --git a/src/vm_builtins.c b/src/vm_builtins.c
+index cb7b9e4..1091b1f 100644
+--- a/src/vm_builtins.c
++++ b/src/vm_builtins.c
+@@ -34,6 +34,10 @@
+ #include "base64.h"
+ #include "gettime.h"
+ #include "stb_image_write.h"
++#ifdef USE_MISTER
++#include "backends/mister_gpu.h"
++#include "crt_ui_inset.h"
++#endif
+ 
+ #if defined(__GNUC__) || defined(__clang__)
+ #pragma GCC diagnostic ignored "-Wunused-parameter"
+@@ -10495,6 +10499,12 @@ static RValue builtin_draw_background_ext(VMContext* ctx, RValue* args, MAYBE_UN
+     uint32_t color = RValue_toColour(args[6]);
+     float alpha = (float) RValue_toReal(args[7]);
+ 
++#ifdef USE_MISTER
++    y += (float)CrtUi_am2rTitleBackgroundOffset(runner->currentRoomIndex,
++                                                 bgIndex,
++                                                 MisterGpu_getCrtUiInset());
++#endif
++
+     int32_t tpagIndex = Renderer_resolveBackgroundTPAGIndex(runner->dataWin, bgIndex);
+     if (0 > tpagIndex) return RValue_makeUndefined();
+ 

@@ -46,9 +46,26 @@ try {
 	if (-not $topSource.Contains('CRT Adjustments') -or
 		-not $topSource.Contains('Analog H Position') -or
 		-not $topSource.Contains('Analog V Position') -or
-		-not $topSource.Contains('Analog H Scale')) {
+		-not $topSource.Contains('Analog H Scale') -or
+		-not $topSource.Contains('CRT UI V Inset')) {
 		throw 'AM2R.sv must expose the core-local analog CRT controls.'
 	}
+	$wrapperSource = Get-Content -Raw -LiteralPath (Join-Path $projectRoot 'src\hps-wrapper\am2r_wrapper.cpp')
+	$wrapperShm = Get-Content -Raw -LiteralPath (Join-Path $projectRoot 'src\hps-wrapper\am2r_joy_shm.h')
+	$runnerMister = Get-Content -Raw -LiteralPath (Join-Path $projectRoot 'third_party\Butterscotch\src\backends\mister.c')
+	if (-not $wrapperSource.Contains('user_io_status_get("[26:24]") * 2u') -or
+		-not $wrapperShm.Contains('#define AM2R_JOY_SHM_VERSION 2u') -or
+		-not $runnerMister.Contains('#define AM2R_JOY_SHM_VERSION 2u') -or
+		-not $wrapperShm.Contains('uint32_t crt_ui_inset;') -or
+		-not $runnerMister.Contains('uint32_t crt_ui_inset;')) {
+		throw 'CRT UI inset wrapper/runner shared-memory ABI is inconsistent.'
+	}
+
+	$crtUiTest = Join-Path $library 'am2r_crt_ui_inset_test.exe'
+	& scripts\zig-cc-windows.cmd tests\runtime\crt_ui_inset_regression.c -O2 -o $crtUiTest
+	if ($LASTEXITCODE -ne 0) { throw "CRT UI inset compile failed with exit code $LASTEXITCODE." }
+	& $crtUiTest
+	if ($LASTEXITCODE -ne 0) { throw "CRT UI inset test failed with exit code $LASTEXITCODE." }
 
     $alsaSource = Get-Content -Raw -LiteralPath (Join-Path $projectRoot 'sys\alsa.sv')
 	if (-not $alsaSource.Contains('if(len[18:14] && (hurryup < 1)) hurryup <= 1;') -or
@@ -59,7 +76,7 @@ try {
 
 	$templateSys = Join-Path $projectRoot 'third_party\Template_MiSTer\sys'
 	if (Test-Path -LiteralPath $templateSys) {
-		$frameworkDiff = & git diff --no-index --name-only -- $templateSys (Join-Path $projectRoot 'sys') 2>$null
+		$frameworkDiff = & git -c core.safecrlf=false diff --no-index --name-only -- $templateSys (Join-Path $projectRoot 'sys') 2>$null
 		if ($LASTEXITCODE -notin @(0, 1)) {
 			throw "Unable to compare sys/ against the Template checkout (git exit $LASTEXITCODE)."
 		}

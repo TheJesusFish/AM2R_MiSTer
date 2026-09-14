@@ -83,11 +83,21 @@ is intended for 15 kHz analog displays whose visible raster clips the native
 image. All controls default to zero/off; in that state the RTL is an exact
 clock, RGB, blanking, and sync bypass and adds no buffering.
 
+The experimental **CRT UI V Inset** option moves only UI pixels which enter the
+top or bottom sixteen-line edge band, plus the title screen's separate version
+and URL overlays. It keeps those elements at their original pixel size: the
+320×240 game scene, camera, collision coordinates, title background, and other
+artwork are neither scaled nor cropped. Values are the number of whole pixels
+moved toward the center; 6px is the initial approximately-five-percent
+safe-area trial. The option is off by default.
+
 MiSTer's core interface exposes one video stream before the framework splits
 the direct analog path from the HDMI/ascal path. Consequently, enabling a CRT
 adjustment also changes the signal presented to ascal even though the final
 HDMI mode is still produced by the normal framework. Leave the controls off
-when only HDMI is in use. Horizontal scaling buffers one scanline, not a frame.
+when only HDMI is in use. That limitation also applies to the UI inset because
+the runner composes it before the framework split. Horizontal scaling buffers
+one scanline, not a frame; the UI inset adds no video buffering.
 
 ## Architecture
 
