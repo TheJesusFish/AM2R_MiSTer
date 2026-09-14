@@ -19,6 +19,7 @@ musAncientGuardian.ogg
 musArachnus.ogg
 musArea1A.ogg
 musArea1B.ogg
+musArea2A.ogg
 musArea2B.ogg
 musArea3A.ogg
 musArea3B.ogg
