@@ -1,0 +1,1807 @@
+diff --git a/src/sw_renderer.c b/src/sw_renderer.c
+new file mode 100644
+index 0000000..8de1b79
+--- /dev/null
++++ b/src/sw_renderer.c
+@@ -0,0 +1,1801 @@
++#include "sw_renderer.h"
++#include "matrix_math.h"
++#include "text_utils.h"
++#include "utils.h"
++#include "runner.h"
++#include "image_decoder.h"
++#include "log.h"
++#ifdef USE_MISTER
++#include "backends/mister_gpu.h"
++#endif
++
++#include "stb_ds.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <math.h>
++
++// ===[ Pixel Helpers ]===
++
++static inline uint8_t clampByte(int32_t value) {
++    return (uint8_t)(value < 0 ? 0 : (value > 255 ? 255 : value));
++}
++
++static inline uint8_t floatColorByte(float value) {
++    return clampByte((int32_t)lroundf(value * 255.0f));
++}
++
++static inline void blendPixel(SWRenderer* sw, uint8_t* dst, uint8_t sr, uint8_t sg, uint8_t sb, uint8_t sa) {
++    if (sw->alphaTestEnable && sa < sw->alphaTestRef) return;
++    if (sa == 0) return;
++
++    if (sw->fogEnable) {
++        sr = BGR_R(sw->fogColor);
++        sg = BGR_G(sw->fogColor);
++        sb = BGR_B(sw->fogColor);
++    }
++
++    uint8_t rr = sr, rg = sg, rb = sb, ra = sa;
++    if (sw->blendEnable) {
++        const uint32_t invA = 255u - sa;
++        switch (sw->blendMode) {
++            case bm_add:
++                rr = clampByte((int32_t)dst[0] + (int32_t)sr * sa / 255);
++                rg = clampByte((int32_t)dst[1] + (int32_t)sg * sa / 255);
++                rb = clampByte((int32_t)dst[2] + (int32_t)sb * sa / 255);
++                ra = clampByte((int32_t)dst[3] + sa);
++                break;
++            case bm_subtract:
++                rr = clampByte((int32_t)dst[0] - (int32_t)sr * sa / 255);
++                rg = clampByte((int32_t)dst[1] - (int32_t)sg * sa / 255);
++                rb = clampByte((int32_t)dst[2] - (int32_t)sb * sa / 255);
++                ra = dst[3];
++                break;
++            case bm_max:
++                rr = sr > dst[0] ? sr : dst[0];
++                rg = sg > dst[1] ? sg : dst[1];
++                rb = sb > dst[2] ? sb : dst[2];
++                ra = sa > dst[3] ? sa : dst[3];
++                break;
++            case bm_min:
++                rr = sr < dst[0] ? sr : dst[0];
++                rg = sg < dst[1] ? sg : dst[1];
++                rb = sb < dst[2] ? sb : dst[2];
++                ra = sa < dst[3] ? sa : dst[3];
++                break;
++            case bm_reverse_subtract:
++                rr = clampByte((int32_t)sr * sa / 255 - dst[0]);
++                rg = clampByte((int32_t)sg * sa / 255 - dst[1]);
++                rb = clampByte((int32_t)sb * sa / 255 - dst[2]);
++                ra = sa;
++                break;
++            default:
++                rr = (uint8_t)(((uint32_t)sr * sa + (uint32_t)dst[0] * invA) / 255u);
++                rg = (uint8_t)(((uint32_t)sg * sa + (uint32_t)dst[1] * invA) / 255u);
++                rb = (uint8_t)(((uint32_t)sb * sa + (uint32_t)dst[2] * invA) / 255u);
++                ra = (uint8_t)(sa + (uint32_t)dst[3] * invA / 255u);
++                break;
++        }
++    }
++    if (sw->colorWriteR) dst[0] = rr;
++    if (sw->colorWriteG) dst[1] = rg;
++    if (sw->colorWriteB) dst[2] = rb;
++    if (sw->colorWriteA) dst[3] = ra;
++}
++
++static inline void sampleTexture(const uint8_t* pixels, int32_t texW, int32_t texH, float u, float v, uint8_t* r, uint8_t* g, uint8_t* b, uint8_t* a) {
++    int32_t tx = (int32_t) (u * (float) texW);
++    int32_t ty = (int32_t) (v * (float) texH);
++
++    // Clamp
++    if (0 > tx) tx = 0;
++    if (0 > ty) ty = 0;
++    if (tx >= texW) tx = texW - 1;
++    if (ty >= texH) ty = texH - 1;
++
++    const uint8_t* p = pixels + (ty * texW + tx) * 4;
++    *r = p[0];
++    *g = p[1];
++    *b = p[2];
++    *a = p[3];
++}
++
++// ===[ Triangle Vertex ]===
++
++typedef struct {
++    float x, y;       // screen position
++    float u, v;        // texture UV (normalized 0-1)
++    float r, g, b, a;  // vertex color (0-1)
++} SWVertex;
++
++// ===[ Triangle Rasterizer ]===
++
++static inline float edgeFunction(float ax, float ay, float bx, float by, float px, float py) {
++    return (bx - ax) * (py - ay) - (by - ay) * (px - ax);
++}
++
++#ifdef USE_MISTER
++static bool swGpuIsOutputTarget(const SWRenderer* sw) {
++    int32_t app = sw->base.runner->applicationSurfaceId;
++    return sw->currentSurface == app ||
++           (sw->gpuHostContinuation && sw->currentSurface == RENDER_TARGET_HOST_FRAMEBUFFER);
++}
++
++static void swGpuFallback(SWRenderer* sw, const char* reason) {
++    if (!sw->gpuFrameEligible) return;
++    if (sw->gpuFallbackFrames < 20) {
++        logInfo("MiSTer GPU fallback frame %d: %s (clear=%d skipped=%d host=%d)\n",
++                sw->base.runner->frameCount, reason, sw->gpuSawClear,
++                sw->gpuHasSkippedDraws, sw->gpuHostContinuation);
++    }
++    if (sw->gpuHasSkippedDraws) {
++        uint32_t cycles = 0;
++        if (MisterGpu_finishFrame(&cycles)) {
++            uint8_t* destination = nullptr;
++            if (sw->gpuHostContinuation) {
++                destination = sw->hostFramebuffer;
++            } else {
++                int32_t app = sw->base.runner->applicationSurfaceId;
++                if (app >= 0 && (uint32_t)app < sw->surfaceCount && sw->surfaceExistsFlags[app])
++                    destination = sw->surfacePixels[app];
++            }
++            MisterGpu_readbackRgba(destination, 320, 240);
++        }
++    }
++    MisterGpu_useSoftwareFrame();
++    sw->gpuFrameEligible = false;
++    sw->gpuFallbackFrames++;
++}
++
++static void swGpuFallbackIfOutput(SWRenderer* sw, const char* reason) {
++    // CPU rendering into an off-screen surface does not invalidate commands
++    // already recorded for the application/host framebuffer. The surface is
++    // synchronized to shared DDR only if it is later composited by the GPU.
++    if (swGpuIsOutputTarget(sw)) swGpuFallback(sw, reason);
++}
++
++static uint32_t swGpuTextureAddress(SWRenderer* sw, const uint8_t* pixels,
++                                    int32_t width, int32_t height) {
++    for (uint32_t page = 0; page < sw->textureCount; ++page) {
++        if (sw->texturePixels[page] == pixels)
++            return sw->gpuTextureAddresses[page];
++    }
++    return MisterGpu_uploadDynamicTexture(pixels, (size_t)width * height * 4u);
++}
++
++static bool swGpuTryAffineQuad(SWRenderer* sw, SWVertex v[4],
++                               const uint8_t* texPixels, int32_t texW, int32_t texH) {
++    if (texPixels == nullptr || texW <= 0 || texH <= 0 ||
++        !sw->gpuFrameEligible || !sw->gpuSawClear || !swGpuIsOutputTarget(sw) ||
++        !sw->blendEnable || sw->blendMode != bm_normal || sw->alphaTestEnable ||
++        sw->fogEnable || !sw->colorWriteR || !sw->colorWriteG ||
++        !sw->colorWriteB || !sw->colorWriteA) return false;
++
++    for (int i = 0; i < 4; ++i) {
++        if (v[i].r != 1.0f || v[i].g != 1.0f || v[i].b != 1.0f || v[i].a != 1.0f)
++            return false;
++    }
++
++    float fminX=v[0].x,fmaxX=v[0].x,fminY=v[0].y,fmaxY=v[0].y;
++    for (int i = 1; i < 4; ++i) {
++        if (v[i].x < fminX) fminX=v[i].x;
++        if (v[i].x > fmaxX) fmaxX=v[i].x;
++        if (v[i].y < fminY) fminY=v[i].y;
++        if (v[i].y > fmaxY) fmaxY=v[i].y;
++    }
++    int32_t minX=(int32_t)floorf(fminX),maxX=(int32_t)ceilf(fmaxX);
++    int32_t minY=(int32_t)floorf(fminY),maxY=(int32_t)ceilf(fmaxY);
++    if(minX<sw->scissorX)minX=sw->scissorX;if(minY<sw->scissorY)minY=sw->scissorY;
++    if(maxX>sw->scissorX+sw->scissorW)maxX=sw->scissorX+sw->scissorW;
++    if(maxY>sw->scissorY+sw->scissorH)maxY=sw->scissorY+sw->scissorH;
++    if(minX<0)minX=0;if(minY<0)minY=0;if(maxX>sw->fbWidth)maxX=sw->fbWidth;if(maxY>sw->fbHeight)maxY=sw->fbHeight;
++    if (minX >= maxX || minY >= maxY) return true;
++
++    const double exx=(double)v[1].x-v[0].x,exy=(double)v[1].y-v[0].y;
++    const double eyx=(double)v[3].x-v[0].x,eyy=(double)v[3].y-v[0].y;
++    const double determinant=exx*eyy-exy*eyx;
++    if (fabs(determinant) < 0.000001) return false;
++    const double txDx=eyy/determinant,txDy=-eyx/determinant;
++    const double tyDx=-exy/determinant,tyDy=exx/determinant;
++    const double uEx=((double)v[1].u-v[0].u)*texW,uEy=((double)v[3].u-v[0].u)*texW;
++    const double vEx=((double)v[1].v-v[0].v)*texH,vEy=((double)v[3].v-v[0].v)*texH;
++    const double uDx=uEx*txDx+uEy*tyDx,uDy=uEx*txDy+uEy*tyDy;
++    const double vDx=vEx*txDx+vEy*tyDx,vDy=vEx*txDy+vEy*tyDy;
++    const double px=(double)minX+0.5-v[0].x,py=(double)minY+0.5-v[0].y;
++    const double uStart=(double)v[0].u*texW+uDx*px+uDy*py;
++    const double vStart=(double)v[0].v*texH+vDx*px+vDy*py;
++
++    double uMin=(double)v[0].u*texW,uMax=uMin,vMin=(double)v[0].v*texH,vMax=vMin;
++    for (int i = 1; i < 4; ++i) {
++        double u=(double)v[i].u*texW,w=(double)v[i].v*texH;
++        if(u<uMin)uMin=u;if(u>uMax)uMax=u;if(w<vMin)vMin=w;if(w>vMax)vMax=w;
++    }
++    const int64_t fuMin=llround(uMin*65536.0),fuMax=llround(uMax*65536.0);
++    const int64_t fvMin=llround(vMin*65536.0),fvMax=llround(vMax*65536.0);
++    const int64_t fuStart=llround(uStart*65536.0),fvStart=llround(vStart*65536.0);
++    const int64_t fuDx=llround(uDx*65536.0),fvDx=llround(vDx*65536.0);
++    const int64_t fuDy=llround(uDy*65536.0),fvDy=llround(vDy*65536.0);
++    if(fuMin<INT32_MIN||fuMin>INT32_MAX||fuMax<INT32_MIN||fuMax>INT32_MAX||
++       fvMin<INT32_MIN||fvMin>INT32_MAX||fvMax<INT32_MIN||fvMax>INT32_MAX||
++       fuStart<INT32_MIN||fuStart>INT32_MAX||fvStart<INT32_MIN||fvStart>INT32_MAX||
++       fuDx<INT32_MIN||fuDx>INT32_MAX||fvDx<INT32_MIN||fvDx>INT32_MAX||
++       fuDy<INT32_MIN||fuDy>INT32_MAX||fvDy<INT32_MIN||fvDy>INT32_MAX) return false;
++
++    uint32_t textureAddress=swGpuTextureAddress(sw,texPixels,texW,texH);
++    if(textureAddress==0 || !MisterGpu_addAffineBlit(textureAddress,(uint32_t)texW*4u,
++       (int16_t)minX,(int16_t)minY,(uint16_t)(maxX-minX),(uint16_t)(maxY-minY),
++       (int32_t)fuMin,(int32_t)fuMax,(int32_t)fvMin,(int32_t)fvMax,
++       (int32_t)fuStart,(int32_t)fvStart,(int32_t)fuDx,(int32_t)fvDx,
++       (int32_t)fuDy,(int32_t)fvDy)) return false;
++    sw->frameTriangleQuads++;
++    sw->frameTrianglePixels+=(uint64_t)(maxX-minX)*(uint64_t)(maxY-minY);
++    sw->gpuHasSkippedDraws=true;
++    return true;
++}
++#endif
++
++static void rasterizeTriangle(SWRenderer* sw, SWVertex v0, SWVertex v1, SWVertex v2, const uint8_t* texPixels, int32_t texW, int32_t texH) {
++    // Compute bounding box
++    float fminX = v0.x;
++    if (v1.x < fminX) fminX = v1.x;
++    if (v2.x < fminX) fminX = v2.x;
++    float fmaxX = v0.x;
++    if (v1.x > fmaxX) fmaxX = v1.x;
++    if (v2.x > fmaxX) fmaxX = v2.x;
++    float fminY = v0.y;
++    if (v1.y < fminY) fminY = v1.y;
++    if (v2.y < fminY) fminY = v2.y;
++    float fmaxY = v0.y;
++    if (v1.y > fmaxY) fmaxY = v1.y;
++    if (v2.y > fmaxY) fmaxY = v2.y;
++
++    int32_t minX = (int32_t) floorf(fminX);
++    int32_t maxX = (int32_t) ceilf(fmaxX);
++    int32_t minY = (int32_t) floorf(fminY);
++    int32_t maxY = (int32_t) ceilf(fmaxY);
++
++    // Clamp to scissor rect
++    if (minX < sw->scissorX) minX = sw->scissorX;
++    if (minY < sw->scissorY) minY = sw->scissorY;
++    if (maxX > sw->scissorX + sw->scissorW) maxX = sw->scissorX + sw->scissorW;
++    if (maxY > sw->scissorY + sw->scissorH) maxY = sw->scissorY + sw->scissorH;
++
++    // Clamp to framebuffer
++    if (0 > minX) minX = 0;
++    if (0 > minY) minY = 0;
++    if (maxX > sw->fbWidth) maxX = sw->fbWidth;
++    if (maxY > sw->fbHeight) maxY = sw->fbHeight;
++
++    if (minX >= maxX || minY >= maxY) return;
++    sw->frameTrianglePixels += (uint64_t)(maxX-minX)*(uint64_t)(maxY-minY);
++
++    // Triangle area (2x, for barycentric normalization)
++    float area = edgeFunction(v0.x, v0.y, v1.x, v1.y, v2.x, v2.y);
++    if (fabsf(area) < 0.001f) return; // degenerate triangle
++
++    // Ensure consistent winding (CCW)
++    if (area < 0) {
++        SWVertex tmp = v1;
++        v1 = v2;
++        v2 = tmp;
++        area = -area;
++    }
++
++    float invArea = 1.0f / area;
++
++    // Edge function increments per pixel
++    float dw0_dx = v1.y - v2.y;
++    float dw0_dy = v2.x - v1.x;
++    float dw1_dx = v2.y - v0.y;
++    float dw1_dy = v0.x - v2.x;
++    float dw2_dx = v0.y - v1.y;
++    float dw2_dy = v1.x - v0.x;
++
++    // Edge functions at (minX + 0.5, minY + 0.5) - sample at pixel center
++    float px = (float) minX + 0.5f;
++    float py = (float) minY + 0.5f;
++    float w0_row = edgeFunction(v1.x, v1.y, v2.x, v2.y, px, py);
++    float w1_row = edgeFunction(v2.x, v2.y, v0.x, v0.y, px, py);
++    float w2_row = edgeFunction(v0.x, v0.y, v1.x, v1.y, px, py);
++
++    for (int32_t y = minY; maxY > y; y++) {
++        float w0 = w0_row;
++        float w1 = w1_row;
++        float w2 = w2_row;
++
++        for (int32_t x = minX; maxX > x; x++) {
++            if (w0 >= 0 && w1 >= 0 && w2 >= 0) {
++                // Barycentric weights
++                float b0 = w0 * invArea;
++                float b1 = w1 * invArea;
++                float b2 = w2 * invArea;
++
++                // Interpolate color
++                float cr = b0 * v0.r + b1 * v1.r + b2 * v2.r;
++                float cg = b0 * v0.g + b1 * v1.g + b2 * v2.g;
++                float cb = b0 * v0.b + b1 * v1.b + b2 * v2.b;
++                float ca = b0 * v0.a + b1 * v1.a + b2 * v2.a;
++                if (0.0f > ca) ca = 0.0f;
++                if (ca > 1.0f) ca = 1.0f;
++
++                uint8_t finalR, finalG, finalB, finalA;
++
++                if (texPixels != nullptr) {
++                    // Interpolate UV and sample texture
++                    float u = b0 * v0.u + b1 * v1.u + b2 * v2.u;
++                    float v = b0 * v0.v + b1 * v1.v + b2 * v2.v;
++
++                    uint8_t texR, texG, texB, texA;
++                    sampleTexture(texPixels, texW, texH, u, v, &texR, &texG, &texB, &texA);
++
++                    // Modulate texture by vertex color
++                    finalR = (uint8_t) (texR * cr);
++                    finalG = (uint8_t) (texG * cg);
++                    finalB = (uint8_t) (texB * cb);
++                    finalA = (uint8_t) (texA * ca);
++                } else {
++                    finalR = (uint8_t) (cr * 255.0f);
++                    finalG = (uint8_t) (cg * 255.0f);
++                    finalB = (uint8_t) (cb * 255.0f);
++                    finalA = (uint8_t) (ca * 255.0f);
++                }
++
++                uint8_t* dst = sw->framebuffer + (y * sw->fbWidth + x) * 4;
++                blendPixel(sw, dst, finalR, finalG, finalB, finalA);
++            }
++
++            w0 += dw0_dx;
++            w1 += dw1_dx;
++            w2 += dw2_dx;
++        }
++
++        w0_row += dw0_dy;
++        w1_row += dw1_dy;
++        w2_row += dw2_dy;
++    }
++}
++
++// Fast path for the overwhelmingly common GameMaker case: an unrotated quad.
++// This visits every destination pixel once instead of evaluating two
++// barycentric triangles over the same bounding box.
++static bool rasterizeAxisAlignedQuad(SWRenderer* sw, SWVertex v[4], const uint8_t* texPixels, int32_t texW, int32_t texH) {
++    const float epsilon = 0.01f;
++    if (fabsf(v[0].y-v[1].y)>epsilon || fabsf(v[2].y-v[3].y)>epsilon ||
++        fabsf(v[0].x-v[3].x)>epsilon || fabsf(v[1].x-v[2].x)>epsilon) {
++#ifdef USE_MISTER
++        static uint32_t nonAxisLogs = 0;
++        if (swGpuIsOutputTarget(sw) && nonAxisLogs < 8) {
++            logInfo("MiSTer GPU affine candidate: tex=%d blend=%d enable=%d "
++                    "v0=%.3f,%.3f/%.6f,%.6f/%08x "
++                    "v1=%.3f,%.3f/%.6f,%.6f/%08x "
++                    "v2=%.3f,%.3f/%.6f,%.6f/%08x "
++                    "v3=%.3f,%.3f/%.6f,%.6f/%08x\n",
++                    texPixels != nullptr, sw->blendMode, sw->blendEnable,
++                    v[0].x, v[0].y, v[0].u, v[0].v,
++                    (uint32_t)floatColorByte(v[0].r) | ((uint32_t)floatColorByte(v[0].g)<<8) |
++                    ((uint32_t)floatColorByte(v[0].b)<<16) | ((uint32_t)floatColorByte(v[0].a)<<24),
++                    v[1].x, v[1].y, v[1].u, v[1].v,
++                    (uint32_t)floatColorByte(v[1].r) | ((uint32_t)floatColorByte(v[1].g)<<8) |
++                    ((uint32_t)floatColorByte(v[1].b)<<16) | ((uint32_t)floatColorByte(v[1].a)<<24),
++                    v[2].x, v[2].y, v[2].u, v[2].v,
++                    (uint32_t)floatColorByte(v[2].r) | ((uint32_t)floatColorByte(v[2].g)<<8) |
++                    ((uint32_t)floatColorByte(v[2].b)<<16) | ((uint32_t)floatColorByte(v[2].a)<<24),
++                    v[3].x, v[3].y, v[3].u, v[3].v,
++                    (uint32_t)floatColorByte(v[3].r) | ((uint32_t)floatColorByte(v[3].g)<<8) |
++                    ((uint32_t)floatColorByte(v[3].b)<<16) | ((uint32_t)floatColorByte(v[3].a)<<24));
++            nonAxisLogs++;
++        }
++        if (swGpuTryAffineQuad(sw, v, texPixels, texW, texH)) return true;
++        swGpuFallbackIfOutput(sw, "non-axis quad");
++#endif
++        return false;
++    }
++    const float dx=v[1].x-v[0].x, dy=v[3].y-v[0].y;
++    if (fabsf(dx)<epsilon || fabsf(dy)<epsilon) return true;
++    int32_t minX=(int32_t)floorf(fminf(v[0].x,v[1].x));
++    int32_t maxX=(int32_t)ceilf(fmaxf(v[0].x,v[1].x));
++    int32_t minY=(int32_t)floorf(fminf(v[0].y,v[3].y));
++    int32_t maxY=(int32_t)ceilf(fmaxf(v[0].y,v[3].y));
++    if(minX<sw->scissorX)minX=sw->scissorX;if(minY<sw->scissorY)minY=sw->scissorY;
++    if(maxX>sw->scissorX+sw->scissorW)maxX=sw->scissorX+sw->scissorW;
++    if(maxY>sw->scissorY+sw->scissorH)maxY=sw->scissorY+sw->scissorH;
++    if(minX<0)minX=0;if(minY<0)minY=0;if(maxX>sw->fbWidth)maxX=sw->fbWidth;if(maxY>sw->fbHeight)maxY=sw->fbHeight;
++    if(minX>=maxX||minY>=maxY)return true;
++    sw->frameAxisQuads++;
++    sw->frameAxisPixels+=(uint64_t)(maxX-minX)*(uint64_t)(maxY-minY);
++    const bool uniform=v[0].r==v[1].r&&v[0].r==v[2].r&&v[0].r==v[3].r&&
++                       v[0].g==v[1].g&&v[0].g==v[2].g&&v[0].g==v[3].g&&
++                       v[0].b==v[1].b&&v[0].b==v[2].b&&v[0].b==v[3].b&&
++                       v[0].a==v[1].a&&v[0].a==v[2].a&&v[0].a==v[3].a;
++    const float invDx=1.0f/dx,invDy=1.0f/dy;
++    const bool supportedBlend=sw->blendMode==bm_normal||sw->blendMode==bm_add;
++    const bool normalState=supportedBlend&&!sw->alphaTestEnable&&!sw->fogEnable&&
++                           sw->colorWriteR&&sw->colorWriteG&&sw->colorWriteB&&sw->colorWriteA;
++    const bool additive=sw->blendMode==bm_add;
++    const bool compatibleState=uniform&&normalState;
++    const bool compatibleTexture=texPixels&&compatibleState;
++    const bool verticalTint=texPixels&&!uniform&&normalState&&
++        v[0].r==v[1].r&&v[0].g==v[1].g&&v[0].b==v[1].b&&v[0].a==v[1].a&&
++        v[3].r==v[2].r&&v[3].g==v[2].g&&v[3].b==v[2].b&&v[3].a==v[2].a;
++    const uint8_t tintR=(uint8_t)lroundf(v[0].r*255.0f),tintG=(uint8_t)lroundf(v[0].g*255.0f);
++    const uint8_t tintB=(uint8_t)lroundf(v[0].b*255.0f),tintA=(uint8_t)lroundf(v[0].a*255.0f);
++    const uint32_t tint=(uint32_t)tintR|((uint32_t)tintG<<8)|((uint32_t)tintB<<16)|((uint32_t)tintA<<24);
++#ifdef USE_MISTER
++    if(!texPixels&&compatibleState&&sw->gpuFrameEligible&&sw->gpuSawClear&&
++       swGpuIsOutputTarget(sw)&&sw->blendEnable&&
++       MisterGpu_addFill((int16_t)minX,(int16_t)minY,(uint16_t)(maxX-minX),(uint16_t)(maxY-minY),tint,additive)){
++        sw->gpuHasSkippedDraws=true;
++        return true;
++    }
++#endif
++    if(verticalTint){
++#ifdef USE_MISTER
++        if(sw->gpuFrameEligible&&sw->gpuSawClear&&swGpuIsOutputTarget(sw)&&sw->blendEnable){
++            const double srcX0=(double)v[0].u*texW,srcY0=(double)v[0].v*texH;
++            const double srcDx=(double)(v[1].u-v[0].u)*texW/dx;
++            const double srcDy=(double)(v[3].v-v[0].v)*texH/dy;
++            const int64_t stepX=(int64_t)(srcDx*65536.0);
++            const int64_t startX=(int64_t)((srcX0+(((double)minX+0.5)-v[0].x)*srcDx)*65536.0);
++            const int64_t startY=(int64_t)((srcY0+(((double)minY+0.5)-v[0].y)*srcDy)*65536.0);
++            const double stepYDouble=srcDy*65536.0;
++            const float tyStart=((float)minY+0.5f-v[0].y)/dy;
++            const uint32_t tintStart=(uint32_t)floatColorByte(v[0].r+tyStart*(v[3].r-v[0].r))|
++                ((uint32_t)floatColorByte(v[0].g+tyStart*(v[3].g-v[0].g))<<8)|
++                ((uint32_t)floatColorByte(v[0].b+tyStart*(v[3].b-v[0].b))<<16)|
++                ((uint32_t)floatColorByte(v[0].a+tyStart*(v[3].a-v[0].a))<<24);
++            const int32_t dr=(int32_t)lroundf((v[3].r-v[0].r)*255.0f*256.0f/dy);
++            const int32_t dg=(int32_t)lroundf((v[3].g-v[0].g)*255.0f*256.0f/dy);
++            const int32_t db=(int32_t)lroundf((v[3].b-v[0].b)*255.0f*256.0f/dy);
++            const int32_t da=(int32_t)lroundf((v[3].a-v[0].a)*255.0f*256.0f/dy);
++            const bool fits=startX>=INT32_MIN&&startX<=INT32_MAX&&startY>=INT32_MIN&&startY<=INT32_MAX&&
++                stepX>=INT32_MIN&&stepX<=INT32_MAX&&stepYDouble>=INT32_MIN&&stepYDouble<=INT32_MAX&&
++                dr>=INT16_MIN&&dr<=INT16_MAX&&dg>=INT16_MIN&&dg<=INT16_MAX&&
++                db>=INT16_MIN&&db<=INT16_MAX&&da>=INT16_MIN&&da<=INT16_MAX;
++            uint32_t textureAddress=swGpuTextureAddress(sw,texPixels,texW,texH);
++            if(textureAddress&&fits&&MisterGpu_addBlitVGradient(textureAddress,(uint32_t)texW*4u,
++               (int16_t)minX,(int16_t)minY,(uint16_t)(maxX-minX),(uint16_t)(maxY-minY),
++               (int32_t)startX,(int32_t)startY,(int32_t)stepX,(int32_t)stepYDouble,
++               tintStart,(int16_t)dr,(int16_t)dg,(int16_t)db,(int16_t)da,additive)){
++                sw->framePlainQuads++;
++                sw->framePlainPixels+=(uint64_t)(maxX-minX)*(uint64_t)(maxY-minY);
++                sw->gpuHasSkippedDraws=true;
++                return true;
++            }
++        }
++#endif
++    }
++    if(compatibleTexture){
++        sw->framePlainQuads++;
++        sw->framePlainPixels+=(uint64_t)(maxX-minX)*(uint64_t)(maxY-minY);
++        const double srcX0=(double)v[0].u*texW;
++        const double srcY0=(double)v[0].v*texH;
++        const double srcDx=(double)(v[1].u-v[0].u)*texW/dx;
++        const double srcDy=(double)(v[3].v-v[0].v)*texH/dy;
++        const int64_t stepX=(int64_t)(srcDx*65536.0);
++        const int64_t startX=(int64_t)((srcX0+(((double)minX+0.5)-v[0].x)*srcDx)*65536.0);
++#ifdef USE_MISTER
++        if (sw->gpuFrameEligible && sw->gpuSawClear && swGpuIsOutputTarget(sw) && sw->blendEnable) {
++            uint32_t textureAddress = swGpuTextureAddress(sw, texPixels, texW, texH);
++            const int64_t startY = (int64_t)((srcY0 + (((double)minY + 0.5) - v[0].y) * srcDy) * 65536.0);
++            const double stepYDouble = srcDy * 65536.0;
++            const bool coordinatesFit = stepX >= INT32_MIN && stepX <= INT32_MAX &&
++                startX >= INT32_MIN && startX <= INT32_MAX && startY >= INT32_MIN && startY <= INT32_MAX &&
++                stepYDouble >= INT32_MIN && stepYDouble <= INT32_MAX;
++            if (textureAddress != 0 && coordinatesFit &&
++                MisterGpu_addBlit(textureAddress, (uint32_t)texW * 4u,
++                    (int16_t)minX, (int16_t)minY, (uint16_t)(maxX-minX), (uint16_t)(maxY-minY),
++                    (int32_t)startX, (int32_t)startY, (int32_t)stepX,
++                    (int32_t)stepYDouble, tint, additive)) {
++                sw->gpuHasSkippedDraws = true;
++                return true;
++            }
++            if (sw->gpuFallbackFrames < 20)
++                logInfo("MiSTer GPU blit reject: address=%08x fit=%d uv=%lld,%lld step=%lld,%.0f tex=%dx%d dst=%dx%d\n",
++                        textureAddress, coordinatesFit, (long long)startX, (long long)startY,
++                        (long long)stepX, stepYDouble, texW, texH, maxX-minX, maxY-minY);
++        }
++        swGpuFallbackIfOutput(sw, "textured blit not recordable");
++#endif
++        for(int32_t y=minY;y<maxY;++y){
++            int32_t sy=(int32_t)(srcY0+(((double)y+0.5)-v[0].y)*srcDy);
++            if(sy<0)sy=0;if(sy>=texH)sy=texH-1;
++            int64_t srcX=startX;
++            uint32_t*dst=(uint32_t*)(sw->framebuffer+((size_t)y*sw->fbWidth+minX)*4);
++            const uint32_t*srcRow=(const uint32_t*)(texPixels+(size_t)sy*texW*4);
++            for(int32_t x=minX;x<maxX;++x,srcX+=stepX,++dst){
++                int32_t sx=(int32_t)(srcX>>16);if(sx<0)sx=0;if(sx>=texW)sx=texW-1;
++                uint32_t pixel=srcRow[sx];
++                if(tint!=0xffffffffu){
++                    uint32_t pr=(pixel&255u)*tintR/255u;
++                    uint32_t pg=((pixel>>8)&255u)*tintG/255u;
++                    uint32_t pb=((pixel>>16)&255u)*tintB/255u;
++                    uint32_t pa=((pixel>>24)&255u)*tintA/255u;
++                    pixel=pr|(pg<<8)|(pb<<16)|(pa<<24);
++                }
++                uint32_t sa=pixel>>24;
++                if(sa==0)continue;
++                if(!sw->blendEnable||sa==255){*dst=pixel;continue;}
++                uint32_t d=*dst,inv=255-sa;
++                uint32_t r=(((pixel&255)*sa+(d&255)*inv)/255)&255;
++                uint32_t g=(((((pixel>>8)&255)*sa+((d>>8)&255)*inv)/255)&255)<<8;
++                uint32_t b=(((((pixel>>16)&255)*sa+((d>>16)&255)*inv)/255)&255)<<16;
++                uint32_t a=(sa+((d>>24)*inv)/255)<<24;
++                *dst=r|g|b|a;
++            }
++        }
++        return true;
++    }
++#ifdef USE_MISTER
++    static uint32_t gpuRejectLogs = 0;
++    if (swGpuIsOutputTarget(sw) && gpuRejectLogs < 24) {
++        uint32_t colors[4];
++        for (int i = 0; i < 4; ++i)
++            colors[i] = (uint32_t)(uint8_t)lroundf(v[i].r*255.0f) |
++                        ((uint32_t)(uint8_t)lroundf(v[i].g*255.0f)<<8) |
++                        ((uint32_t)(uint8_t)lroundf(v[i].b*255.0f)<<16) |
++                        ((uint32_t)(uint8_t)lroundf(v[i].a*255.0f)<<24);
++        logInfo("MiSTer GPU axis reject: texture=%d uniform=%d blend=%d enable=%d alphaTest=%d fog=%d write=%d%d%d%d dst=%dx%d colors=%08x,%08x,%08x,%08x\n",
++                texPixels != nullptr, uniform, sw->blendMode, sw->blendEnable,
++                sw->alphaTestEnable, sw->fogEnable, sw->colorWriteR,
++                sw->colorWriteG, sw->colorWriteB, sw->colorWriteA,
++                maxX-minX, maxY-minY, colors[0], colors[1], colors[2], colors[3]);
++        gpuRejectLogs++;
++    }
++    swGpuFallbackIfOutput(sw, "unsupported axis quad state");
++#endif
++    for(int32_t y=minY;y<maxY;++y){
++        float ty=((float)y+0.5f-v[0].y)*invDy;if(ty<0.0f||ty>=1.0f)continue;
++        float texV=v[0].v+ty*(v[3].v-v[0].v);
++        int32_t sy=(int32_t)(texV*texH);if(sy<0)sy=0;if(sy>=texH)sy=texH-1;
++        float tx=((float)minX+0.5f-v[0].x)*invDx;
++        float txStep=invDx;
++        uint8_t* dst=sw->framebuffer+((size_t)y*sw->fbWidth+minX)*4;
++        for(int32_t x=minX;x<maxX;++x,tx+=txStep,dst+=4){
++            if(tx<0.0f||tx>=1.0f)continue;
++            float cr,cg,cb,ca;
++            if(uniform){cr=v[0].r;cg=v[0].g;cb=v[0].b;ca=v[0].a;}
++            else{
++                float tr=v[0].r+tx*(v[1].r-v[0].r),br=v[3].r+tx*(v[2].r-v[3].r);cr=tr+ty*(br-tr);
++                float tg=v[0].g+tx*(v[1].g-v[0].g),bg=v[3].g+tx*(v[2].g-v[3].g);cg=tg+ty*(bg-tg);
++                float tb=v[0].b+tx*(v[1].b-v[0].b),bb=v[3].b+tx*(v[2].b-v[3].b);cb=tb+ty*(bb-tb);
++                float ta=v[0].a+tx*(v[1].a-v[0].a),ba=v[3].a+tx*(v[2].a-v[3].a);ca=ta+ty*(ba-ta);
++            }
++            uint8_t r,g,b,a;
++            if(texPixels){float texU=v[0].u+tx*(v[1].u-v[0].u);int32_t sx=(int32_t)(texU*texW);if(sx<0)sx=0;if(sx>=texW)sx=texW-1;const uint8_t*p=texPixels+((size_t)sy*texW+sx)*4;r=(uint8_t)(p[0]*cr);g=(uint8_t)(p[1]*cg);b=(uint8_t)(p[2]*cb);a=(uint8_t)(p[3]*ca);}
++            else{r=(uint8_t)(255.0f*cr);g=(uint8_t)(255.0f*cg);b=(uint8_t)(255.0f*cb);a=(uint8_t)(255.0f*ca);}
++            blendPixel(sw,dst,r,g,b,a);
++        }
++    }
++    return true;
++}
++
++// Rasterizes a rotated/deformed quad as two triangles.
++static void rasterizeQuad(SWRenderer* sw, SWVertex v[4], const uint8_t* texPixels, int32_t texW, int32_t texH) {
++    if (rasterizeAxisAlignedQuad(sw, v, texPixels, texW, texH)) return;
++    sw->frameTriangleQuads++;
++    rasterizeTriangle(sw, v[0], v[1], v[2], texPixels, texW, texH);
++    rasterizeTriangle(sw, v[2], v[3], v[0], texPixels, texW, texH);
++}
++
++// ===[ Vtable Implementations ]===
++
++extern void Runner_setNextFrame(uint32_t* framebuffer, int width, int height);
++
++static void swUseHostTarget(SWRenderer* sw) {
++    sw->framebuffer = sw->hostFramebuffer;
++    sw->fbWidth = sw->hostWidth;
++    sw->fbHeight = sw->hostHeight;
++    sw->currentSurface = RENDER_TARGET_HOST_FRAMEBUFFER;
++}
++
++static bool swUseSurfaceTarget(SWRenderer* sw, int32_t id) {
++    if (id < 0 || (uint32_t)id >= sw->surfaceCount || !sw->surfaceExistsFlags[id]) return false;
++    sw->framebuffer = sw->surfacePixels[id];
++    sw->fbWidth = sw->surfaceWidths[id];
++    sw->fbHeight = sw->surfaceHeights[id];
++    sw->currentSurface = id;
++    return true;
++}
++
++static void swEnsureSurfaceCapacity(SWRenderer* sw, uint32_t needed) {
++    if (needed <= sw->surfaceCapacity) return;
++    uint32_t newCapacity = sw->surfaceCapacity ? sw->surfaceCapacity * 2 : 16;
++    while (newCapacity < needed) newCapacity *= 2;
++    sw->surfacePixels = (uint8_t**)safeRealloc(sw->surfacePixels, newCapacity * sizeof(uint8_t*));
++    sw->surfaceWidths = (int32_t*)safeRealloc(sw->surfaceWidths, newCapacity * sizeof(int32_t));
++    sw->surfaceHeights = (int32_t*)safeRealloc(sw->surfaceHeights, newCapacity * sizeof(int32_t));
++    sw->surfaceExistsFlags = (bool*)safeRealloc(sw->surfaceExistsFlags, newCapacity * sizeof(bool));
++    for (uint32_t i = sw->surfaceCapacity; i < newCapacity; ++i) {
++        sw->surfacePixels[i] = nullptr;
++        sw->surfaceWidths[i] = 0;
++        sw->surfaceHeights[i] = 0;
++        sw->surfaceExistsFlags[i] = false;
++    }
++    sw->surfaceCapacity = newCapacity;
++}
++
++static bool swEnsureTextureLoaded(SWRenderer* sw, uint32_t pageId) {
++    if (pageId >= sw->textureCount) return false;
++    if (sw->textureLoaded[pageId]) return sw->texturePixels[pageId] != nullptr;
++    sw->textureLoaded[pageId] = true;
++
++    DataWin* dw = sw->base.dataWin;
++    DataWin_loadTxtrIfNeeded(dw, pageId);
++    Texture* txtr = &dw->txtr.textures[pageId];
++    int width = 0, height = 0;
++    const bool gm2022_5 = DataWin_isVersionAtLeast(dw, 2022, 5, 0, 0);
++    uint8_t* pixels = ImageDecoder_decodeToRgba(txtr->blobData, (size_t)txtr->blobSize, gm2022_5, &width, &height);
++    if (pixels == nullptr) {
++        logWarn("SW: failed to decode TXTR page %u\n", pageId);
++        return false;
++    }
++    if (!txtr->mapped) {
++        free(txtr->blobData);
++        txtr->blobData = nullptr;
++    }
++    sw->texturePixels[pageId] = pixels;
++    sw->textureWidths[pageId] = width;
++    sw->textureHeights[pageId] = height;
++#ifdef USE_MISTER
++    sw->gpuTextureAddresses[pageId] = MisterGpu_uploadTexture(
++        pixels, (size_t)width * (size_t)height * 4u);
++#endif
++    logInfo("SW: loaded TXTR page %u (%dx%d)\n", pageId, width, height);
++    return true;
++}
++
++static void swInit(Renderer* renderer, DataWin* dataWin) {
++    SWRenderer* sw = (SWRenderer*) renderer;
++    renderer->dataWin = dataWin;
++
++    // Texture pages are decoded on demand so the MiSTer does not pay the
++    // memory cost for rooms it has not visited.
++    sw->textureCount = dataWin->txtr.count;
++    sw->texturePixels = safeCalloc(sw->textureCount, sizeof(uint8_t*));
++    sw->textureWidths = safeCalloc(sw->textureCount, sizeof(int32_t));
++    sw->textureHeights = safeCalloc(sw->textureCount, sizeof(int32_t));
++    sw->textureLoaded = safeCalloc(sw->textureCount, sizeof(bool));
++#ifdef USE_MISTER
++    sw->gpuTextureAddresses = safeCalloc(sw->textureCount, sizeof(uint32_t));
++#endif
++    sw->hostWidth = (int32_t)dataWin->gen8.defaultWindowWidth;
++    sw->hostHeight = (int32_t)dataWin->gen8.defaultWindowHeight;
++    if (sw->hostWidth <= 0) sw->hostWidth = 320;
++    if (sw->hostHeight <= 0) sw->hostHeight = 240;
++    sw->hostFramebuffer = (uint8_t*)safeCalloc((size_t)sw->hostWidth * sw->hostHeight, 4);
++    swUseHostTarget(sw);
++    Matrix4f_identity(&renderer->gmlMatrices[MATRIX_WORLD]);
++    logInfo("SW: software renderer initialized (%u lazy texture pages)\n", sw->textureCount);
++}
++
++static void swDestroy(Renderer* renderer) {
++    SWRenderer* sw = (SWRenderer*) renderer;
++
++    for (uint32_t i = 0; sw->textureCount > i; i++) {
++        free(sw->texturePixels[i]);
++    }
++    free(sw->texturePixels);
++    free(sw->textureWidths);
++    free(sw->textureHeights);
++    free(sw->textureLoaded);
++#ifdef USE_MISTER
++    free(sw->gpuTextureAddresses);
++#endif
++    for (uint32_t i = 0; i < sw->surfaceCount; ++i) free(sw->surfacePixels[i]);
++    free(sw->surfacePixels);
++    free(sw->surfaceWidths);
++    free(sw->surfaceHeights);
++    free(sw->surfaceExistsFlags);
++    free(sw->hostFramebuffer);
++    free(sw);
++}
++
++static void swBeginFrame(Renderer* renderer, int32_t gameW, int32_t gameH, int32_t windowW, int32_t windowH) {
++    SWRenderer* sw = (SWRenderer*) renderer;
++    sw->gameW = gameW;
++    sw->gameH = gameH;
++    sw->frameAxisPixels=sw->framePlainPixels=sw->frameTrianglePixels=0;
++    sw->frameAxisQuads=sw->framePlainQuads=sw->frameTriangleQuads=0;
++
++    if (windowW != sw->hostWidth || windowH != sw->hostHeight) {
++        free(sw->hostFramebuffer);
++        sw->hostWidth = windowW;
++        sw->hostHeight = windowH;
++        sw->hostFramebuffer = (uint8_t*)safeCalloc((size_t)windowW * (size_t)windowH, 4);
++    }
++    if (!swUseSurfaceTarget(sw, renderer->runner->applicationSurfaceId)) swUseHostTarget(sw);
++    sw->scissorX = 0;
++    sw->scissorY = 0;
++    sw->scissorW = sw->fbWidth;
++    sw->scissorH = sw->fbHeight;
++#ifdef USE_MISTER
++    MisterGpu_beginFrame();
++    sw->gpuFrameEligible = MisterGpu_isAvailable() && sw->fbWidth == 320 && sw->fbHeight == 240 &&
++                           sw->currentSurface == renderer->runner->applicationSurfaceId;
++    sw->gpuSawClear = false;
++    sw->gpuHasSkippedDraws = false;
++    sw->gpuHostContinuation = false;
++#endif
++}
++
++static void swEndFrameInit(Renderer* renderer) {
++    if (renderer->runner->usingAppSurface && !renderer->runner->appSurfaceAutoDraw)
++        swUseHostTarget((SWRenderer*)renderer);
++}
++
++static void swEndFrameEnd(Renderer* renderer) {
++    SWRenderer* sw = (SWRenderer*)renderer;
++    if ((renderer->runner->frameCount % 300) == 0)
++        logInfo("SW frame %d: axis=%u/%llu plain=%u/%llu rotated=%u/%llu\n",
++                renderer->runner->frameCount, sw->frameAxisQuads, (unsigned long long)sw->frameAxisPixels,
++                sw->framePlainQuads, (unsigned long long)sw->framePlainPixels,
++                sw->frameTriangleQuads, (unsigned long long)sw->frameTrianglePixels);
++    if (!renderer->runner->usingAppSurface || !renderer->runner->appSurfaceAutoDraw) return;
++    int32_t id = renderer->runner->applicationSurfaceId;
++    if (id < 0 || (uint32_t)id >= sw->surfaceCount || !sw->surfaceExistsFlags[id]) return;
++    swUseHostTarget(sw);
++#ifdef USE_MISTER
++    sw->gpuHostContinuation = true;
++    if (sw->gpuFrameEligible && sw->gpuHasSkippedDraws) return;
++#endif
++    int32_t copyW = sw->surfaceWidths[id] < sw->hostWidth ? sw->surfaceWidths[id] : sw->hostWidth;
++    int32_t copyH = sw->surfaceHeights[id] < sw->hostHeight ? sw->surfaceHeights[id] : sw->hostHeight;
++    for (int32_t y = 0; y < copyH; ++y)
++        memcpy(sw->hostFramebuffer + (size_t)y * sw->hostWidth * 4,
++               sw->surfacePixels[id] + (size_t)y * sw->surfaceWidths[id] * 4,
++               (size_t)copyW * 4);
++}
++
++static void swBeginView(Renderer* renderer, int32_t viewX, int32_t viewY, int32_t viewW, int32_t viewH, int32_t portX, int32_t portY, int32_t portW, int32_t portH, float viewAngle) {
++    SWRenderer* sw = (SWRenderer*) renderer;
++
++    // Set scissor to port rectangle
++    sw->scissorX = portX;
++    sw->scissorY = portY;
++    sw->scissorW = portW;
++    sw->scissorH = portH;
++
++    // Build projection matrix (same as GL renderer)
++    Matrix4f projection;
++    Matrix4f_identity(&projection);
++    Matrix4f_ortho(&projection, (float) viewX, (float) (viewX + viewW), (float) (viewY + viewH), (float) viewY, -1.0f, 1.0f);
++
++    if (viewAngle != 0.0f) {
++        float cx = (float) viewX + (float) viewW / 2.0f;
++        float cy = (float) viewY + (float) viewH / 2.0f;
++        Matrix4f rot;
++        Matrix4f_identity(&rot);
++        Matrix4f_translate(&rot, cx, cy, 0.0f);
++        float angleRad = viewAngle * (float) M_PI / 180.0f;
++        Matrix4f_rotateZ(&rot, -angleRad);
++        Matrix4f_translate(&rot, -cx, -cy, 0.0f);
++        Matrix4f result;
++        Matrix4f_multiply(&result, &projection, &rot);
++        projection = result;
++    }
++
++    // Build viewport transform: NDC [-1,1] -> framebuffer pixels
++    // x_screen = portX + (ndc_x + 1) * portW / 2
++    // y_screen = portY + (1 - ndc_y) * portH / 2  (flip Y for top-down FB)
++    Matrix4f viewport;
++    memset(&viewport, 0, sizeof(Matrix4f));
++    viewport.m[0] = (float) portW / 2.0f;      // scale X
++    viewport.m[5] = -(float) portH / 2.0f;     // scale Y (flipped)
++    viewport.m[10] = 1.0f;
++    viewport.m[12] = (float) portX + (float) portW / 2.0f; // translate X
++    viewport.m[13] = (float) portY + (float) portH / 2.0f; // translate Y
++    viewport.m[15] = 1.0f;
++
++    // Combined: world -> NDC -> screen pixels
++    Matrix4f_multiply(&sw->worldToScreen, &viewport, &projection);
++}
++
++static void swEndView(Renderer* renderer) {
++    (void) renderer;
++    // Nothing to flush in immediate mode
++}
++
++static void swApplyProjection(Renderer* renderer, const Matrix4f* viewMatrix, const Matrix4f* projectionMatrix) {
++    if (viewMatrix != nullptr) renderer->gmlMatrices[MATRIX_VIEW] = *viewMatrix;
++    if (projectionMatrix != nullptr) renderer->gmlMatrices[MATRIX_PROJECTION] = *projectionMatrix;
++}
++
++static void swBeginGUI(Renderer* renderer, int32_t guiW, int32_t guiH, int32_t portX, int32_t portY, int32_t portW, int32_t portH, int32_t targetSurfaceId) {
++    SWRenderer* sw = (SWRenderer*)renderer;
++    if (targetSurfaceId == RENDER_TARGET_HOST_FRAMEBUFFER) swUseHostTarget(sw);
++    else if (!swUseSurfaceTarget(sw, targetSurfaceId)) swUseHostTarget(sw);
++    swBeginView(renderer, 0, 0, guiW, guiH, portX, portY, portW, portH, 0.0f);
++}
++
++static void swSetGuiProjection(Renderer* renderer, int32_t guiW, int32_t guiH, int32_t portW, int32_t portH, bool renderingToUserSurface) {
++    (void)renderingToUserSurface;
++    swBeginView(renderer, 0, 0, guiW, guiH, 0, 0, portW, portH, 0.0f);
++}
++
++static void swEndGUI(Renderer* renderer) {
++    SWRenderer* sw = (SWRenderer*)renderer;
++#ifdef USE_MISTER
++    // Pre, Post and Draw GUI each close a GUI pass. The final GUI pass is the
++    // one after the application-surface handoff, so defer GPU submission until
++    // platformSwapBuffers rather than accidentally presenting three times.
++    if (sw->gpuHostContinuation) {
++        if ((renderer->runner->frameCount % 300) == 0)
++            logInfo("MiSTer GPU frame %d: queued=%d fallback=%u (eligible=%d clear=%d)\n",
++                    renderer->runner->frameCount, sw->gpuHasSkippedDraws,
++                    sw->gpuFallbackFrames, sw->gpuFrameEligible, sw->gpuSawClear);
++        sw->gpuFrameEligible = false;
++    }
++#endif
++    if (sw->currentSurface == RENDER_TARGET_HOST_FRAMEBUFFER && sw->hostFramebuffer != nullptr)
++        Runner_setNextFrame((uint32_t*)sw->hostFramebuffer, sw->hostWidth, sw->hostHeight);
++}
++
++// Transforms a world-space point to screen pixel coordinates
++static inline void worldToScreen(SWRenderer* sw, float wx, float wy, float* sx, float* sy) {
++    Matrix4f_transformPoint(&sw->worldToScreen, wx, wy, sx, sy);
++}
++
++// ===[ Sprite Drawing ]===
++
++static void swDrawSprite(Renderer* renderer, int32_t tpagIndex, float x, float y, float originX, float originY, float xscale, float yscale, float angleDeg, uint32_t color, float alpha) {
++    SWRenderer* sw = (SWRenderer*) renderer;
++    DataWin* dw = renderer->dataWin;
++
++    if (0 > tpagIndex || dw->tpag.count <= (uint32_t) tpagIndex) return;
++
++    TexturePageItem* tpag = &dw->tpag.items[tpagIndex];
++    int16_t pageId = tpag->texturePageId;
++    if (0 > pageId || sw->textureCount <= (uint32_t) pageId) return;
++    if (!swEnsureTextureLoaded(sw, (uint32_t)pageId)) return;
++
++    uint8_t* texPixels = sw->texturePixels[pageId];
++    int32_t texW = sw->textureWidths[pageId];
++    int32_t texH = sw->textureHeights[pageId];
++    if (texPixels == nullptr || texW == 0 || texH == 0) return;
++
++    // Compute normalized UVs from TPAG source rect
++    float u0 = (float) tpag->sourceX / (float) texW;
++    float v0 = (float) tpag->sourceY / (float) texH;
++    float u1 = (float) (tpag->sourceX + tpag->sourceWidth) / (float) texW;
++    float v1 = (float) (tpag->sourceY + tpag->sourceHeight) / (float) texH;
++
++    // Compute local quad corners (with target offset and origin)
++    float localX0 = (float) tpag->targetX - originX;
++    float localY0 = (float) tpag->targetY - originY;
++    float localX1 = localX0 + (float) tpag->sourceWidth;
++    float localY1 = localY0 + (float) tpag->sourceHeight;
++
++    // Build 2D model transform
++    float angleRad = -angleDeg * ((float) M_PI / 180.0f);
++    Matrix4f transform;
++    Matrix4f_setTransform2D(&transform, x, y, xscale, yscale, angleRad);
++
++    // Transform 4 corners to world space
++    float wx0, wy0, wx1, wy1, wx2, wy2, wx3, wy3;
++    Matrix4f_transformPoint(&transform, localX0, localY0, &wx0, &wy0);
++    Matrix4f_transformPoint(&transform, localX1, localY0, &wx1, &wy1);
++    Matrix4f_transformPoint(&transform, localX1, localY1, &wx2, &wy2);
++    Matrix4f_transformPoint(&transform, localX0, localY1, &wx3, &wy3);
++
++    // Transform to screen space
++    SWVertex verts[4];
++    worldToScreen(sw, wx0, wy0, &verts[0].x, &verts[0].y);
++    worldToScreen(sw, wx1, wy1, &verts[1].x, &verts[1].y);
++    worldToScreen(sw, wx2, wy2, &verts[2].x, &verts[2].y);
++    worldToScreen(sw, wx3, wy3, &verts[3].x, &verts[3].y);
++
++    // Set UV coordinates
++    verts[0].u = u0; verts[0].v = v0; // top-left
++    verts[1].u = u1; verts[1].v = v0; // top-right
++    verts[2].u = u1; verts[2].v = v1; // bottom-right
++    verts[3].u = u0; verts[3].v = v1; // bottom-left
++
++    // Convert BGR color to RGB floats
++    float r = (float) BGR_R(color) / 255.0f;
++    float g = (float) BGR_G(color) / 255.0f;
++    float b = (float) BGR_B(color) / 255.0f;
++
++    for (int i = 0; 4 > i; i++) {
++        verts[i].r = r;
++        verts[i].g = g;
++        verts[i].b = b;
++        verts[i].a = alpha;
++    }
++
++    rasterizeQuad(sw, verts, texPixels, texW, texH);
++}
++
++static void swDrawSpritePart(Renderer* renderer, int32_t tpagIndex, int32_t srcOffX, int32_t srcOffY, int32_t srcW, int32_t srcH, float x, float y, float xscale, float yscale, float angleDeg, float pivotX, float pivotY, uint32_t color, float alpha) {
++    SWRenderer* sw = (SWRenderer*) renderer;
++    DataWin* dw = renderer->dataWin;
++
++    if (0 > tpagIndex || dw->tpag.count <= (uint32_t) tpagIndex) return;
++
++    TexturePageItem* tpag = &dw->tpag.items[tpagIndex];
++    int16_t pageId = tpag->texturePageId;
++    if (0 > pageId || sw->textureCount <= (uint32_t) pageId) return;
++    if (!swEnsureTextureLoaded(sw, (uint32_t)pageId)) return;
++
++    uint8_t* texPixels = sw->texturePixels[pageId];
++    int32_t texW = sw->textureWidths[pageId];
++    int32_t texH = sw->textureHeights[pageId];
++    if (texPixels == nullptr || texW == 0 || texH == 0) return;
++
++    // Compute UVs for the sub-region within the atlas
++    float u0 = (float) (tpag->sourceX + srcOffX) / (float) texW;
++    float v0 = (float) (tpag->sourceY + srcOffY) / (float) texH;
++    float u1 = (float) (tpag->sourceX + srcOffX + srcW) / (float) texW;
++    float v1 = (float) (tpag->sourceY + srcOffY + srcH) / (float) texH;
++
++    float localX0 = -pivotX;
++    float localY0 = -pivotY;
++    float localX1 = localX0 + (float)srcW;
++    float localY1 = localY0 + (float)srcH;
++    Matrix4f transform;
++    Matrix4f_setTransform2D(&transform, x + pivotX * xscale, y + pivotY * yscale,
++                            xscale, yscale, -angleDeg * ((float)M_PI / 180.0f));
++    float wx0, wy0, wx1, wy1, wx2, wy2, wx3, wy3;
++    Matrix4f_transformPoint(&transform, localX0, localY0, &wx0, &wy0);
++    Matrix4f_transformPoint(&transform, localX1, localY0, &wx1, &wy1);
++    Matrix4f_transformPoint(&transform, localX1, localY1, &wx2, &wy2);
++    Matrix4f_transformPoint(&transform, localX0, localY1, &wx3, &wy3);
++
++    // Transform to screen space
++    SWVertex verts[4];
++    worldToScreen(sw, wx0, wy0, &verts[0].x, &verts[0].y);
++    worldToScreen(sw, wx1, wy1, &verts[1].x, &verts[1].y);
++    worldToScreen(sw, wx2, wy2, &verts[2].x, &verts[2].y);
++    worldToScreen(sw, wx3, wy3, &verts[3].x, &verts[3].y);
++
++    verts[0].u = u0; verts[0].v = v0;
++    verts[1].u = u1; verts[1].v = v0;
++    verts[2].u = u1; verts[2].v = v1;
++    verts[3].u = u0; verts[3].v = v1;
++
++    float r = (float) BGR_R(color) / 255.0f;
++    float g = (float) BGR_G(color) / 255.0f;
++    float b = (float) BGR_B(color) / 255.0f;
++
++    for (int i = 0; 4 > i; i++) {
++        verts[i].r = r;
++        verts[i].g = g;
++        verts[i].b = b;
++        verts[i].a = alpha;
++    }
++
++    rasterizeQuad(sw, verts, texPixels, texW, texH);
++}
++
++// ===[ Primitive Drawing ]===
++
++static void emitColoredQuadSW(SWRenderer* sw, float x0, float y0, float x1, float y1, float r, float g, float b, float a) {
++    SWVertex verts[4];
++    worldToScreen(sw, x0, y0, &verts[0].x, &verts[0].y);
++    worldToScreen(sw, x1, y0, &verts[1].x, &verts[1].y);
++    worldToScreen(sw, x1, y1, &verts[2].x, &verts[2].y);
++    worldToScreen(sw, x0, y1, &verts[3].x, &verts[3].y);
++
++    for (int i = 0; 4 > i; i++) {
++        verts[i].u = 0; verts[i].v = 0;
++        verts[i].r = r; verts[i].g = g; verts[i].b = b; verts[i].a = a;
++    }
++
++    rasterizeQuad(sw, verts, nullptr, 0, 0);
++}
++
++static void swDrawRectangle(Renderer* renderer, float x1, float y1, float x2, float y2, uint32_t color, float alpha, bool outline) {
++    SWRenderer* sw = (SWRenderer*) renderer;
++
++    float r = (float) BGR_R(color) / 255.0f;
++    float g = (float) BGR_G(color) / 255.0f;
++    float b = (float) BGR_B(color) / 255.0f;
++
++    if (outline) {
++        emitColoredQuadSW(sw, x1, y1, x2 + 1, y1 + 1, r, g, b, alpha);
++        emitColoredQuadSW(sw, x1, y2, x2 + 1, y2 + 1, r, g, b, alpha);
++        emitColoredQuadSW(sw, x1, y1 + 1, x1 + 1, y2, r, g, b, alpha);
++        emitColoredQuadSW(sw, x2, y1 + 1, x2 + 1, y2, r, g, b, alpha);
++    } else {
++        emitColoredQuadSW(sw, x1, y1, x2 + 1, y2 + 1, r, g, b, alpha);
++    }
++}
++
++static void swDrawLine(Renderer* renderer, float x1, float y1, float x2, float y2, float width, uint32_t color, float alpha) {
++    SWRenderer* sw = (SWRenderer*) renderer;
++
++    float r = (float) BGR_R(color) / 255.0f;
++    float g = (float) BGR_G(color) / 255.0f;
++    float b = (float) BGR_B(color) / 255.0f;
++
++    // Compute perpendicular offset for line thickness
++    float dx = x2 - x1;
++    float dy = y2 - y1;
++    float len = sqrtf(dx * dx + dy * dy);
++    if (0.0001f > len) return;
++
++    float halfW = width * 0.5f;
++    float px = (-dy / len) * halfW;
++    float py = (dx / len) * halfW;
++
++    // Build quad from line endpoints with thickness
++    SWVertex verts[4];
++    worldToScreen(sw, x1 + px, y1 + py, &verts[0].x, &verts[0].y);
++    worldToScreen(sw, x1 - px, y1 - py, &verts[1].x, &verts[1].y);
++    worldToScreen(sw, x2 - px, y2 - py, &verts[2].x, &verts[2].y);
++    worldToScreen(sw, x2 + px, y2 + py, &verts[3].x, &verts[3].y);
++
++    for (int i = 0; 4 > i; i++) {
++        verts[i].u = 0; verts[i].v = 0;
++        verts[i].r = r; verts[i].g = g; verts[i].b = b; verts[i].a = alpha;
++    }
++
++    rasterizeQuad(sw, verts, nullptr, 0, 0);
++}
++
++static void swDrawLineColor(Renderer* renderer, float x1, float y1, float x2, float y2, float width, uint32_t color1, uint32_t color2, float alpha) {
++    SWRenderer* sw = (SWRenderer*) renderer;
++
++    float r1 = (float) BGR_R(color1) / 255.0f;
++    float g1 = (float) BGR_G(color1) / 255.0f;
++    float b1 = (float) BGR_B(color1) / 255.0f;
++
++    float r2 = (float) BGR_R(color2) / 255.0f;
++    float g2 = (float) BGR_G(color2) / 255.0f;
++    float b2 = (float) BGR_B(color2) / 255.0f;
++
++    float dx = x2 - x1;
++    float dy = y2 - y1;
++    float len = sqrtf(dx * dx + dy * dy);
++    if (0.0001f > len) return;
++
++    float halfW = width * 0.5f;
++    float px = (-dy / len) * halfW;
++    float py = (dx / len) * halfW;
++
++    SWVertex verts[4];
++    worldToScreen(sw, x1 + px, y1 + py, &verts[0].x, &verts[0].y);
++    worldToScreen(sw, x1 - px, y1 - py, &verts[1].x, &verts[1].y);
++    worldToScreen(sw, x2 - px, y2 - py, &verts[2].x, &verts[2].y);
++    worldToScreen(sw, x2 + px, y2 + py, &verts[3].x, &verts[3].y);
++
++    verts[0].u = 0; verts[0].v = 0; verts[0].r = r1; verts[0].g = g1; verts[0].b = b1; verts[0].a = alpha;
++    verts[1].u = 0; verts[1].v = 0; verts[1].r = r1; verts[1].g = g1; verts[1].b = b1; verts[1].a = alpha;
++    verts[2].u = 0; verts[2].v = 0; verts[2].r = r2; verts[2].g = g2; verts[2].b = b2; verts[2].a = alpha;
++    verts[3].u = 0; verts[3].v = 0; verts[3].r = r2; verts[3].g = g2; verts[3].b = b2; verts[3].a = alpha;
++
++    rasterizeQuad(sw, verts, nullptr, 0, 0);
++}
++
++static void swDrawTriangle(Renderer* renderer, float x1, float y1, float x2, float y2, float x3, float y3, uint32_t color1, uint32_t color2, uint32_t color3, float alpha, bool outline) {
++    SWRenderer* sw = (SWRenderer*) renderer;
++
++    if (outline) {
++        swDrawLine(renderer, x1, y1, x2, y2, 1, color1, alpha);
++        swDrawLine(renderer, x2, y2, x3, y3, 1, color2, alpha);
++        swDrawLine(renderer, x3, y3, x1, y1, 1, color3, alpha);
++    } else {
++        SWVertex v0, v1, v2;
++        worldToScreen(sw, x1, y1, &v0.x, &v0.y);
++        worldToScreen(sw, x2, y2, &v1.x, &v1.y);
++        worldToScreen(sw, x3, y3, &v2.x, &v2.y);
++
++        v0.u = 0; v0.v = 0; v0.r = (float)BGR_R(color1) / 255.0f; v0.g = (float)BGR_G(color1) / 255.0f; v0.b = (float)BGR_B(color1) / 255.0f; v0.a = alpha;
++        v1.u = 0; v1.v = 0; v1.r = (float)BGR_R(color2) / 255.0f; v1.g = (float)BGR_G(color2) / 255.0f; v1.b = (float)BGR_B(color2) / 255.0f; v1.a = alpha;
++        v2.u = 0; v2.v = 0; v2.r = (float)BGR_R(color3) / 255.0f; v2.g = (float)BGR_G(color3) / 255.0f; v2.b = (float)BGR_B(color3) / 255.0f; v2.a = alpha;
++
++        rasterizeTriangle(sw, v0, v1, v2, nullptr, 0, 0);
++    }
++}
++
++// ===[ Text Drawing ]===
++
++// Resolves the texture pixel data for a font
++typedef struct {
++    Font* font;
++    TexturePageItem* fontTpag; // single TPAG for regular fonts (nullptr for sprite fonts)
++    uint8_t* texPixels;
++    int32_t texW, texH;
++    Sprite* spriteFontSprite; // source sprite for sprite fonts (nullptr for regular fonts)
++} SWFontState;
++
++static bool swResolveFontState(SWRenderer* sw, DataWin* dw, Font* font, SWFontState* state) {
++    state->font = font;
++    state->fontTpag = nullptr;
++    state->texPixels = nullptr;
++    state->texW = 0;
++    state->texH = 0;
++    state->spriteFontSprite = nullptr;
++
++    if (!font->isSpriteFont) {
++        int32_t fontTpagIndex = font->tpagIndex;
++        if (0 > fontTpagIndex) return false;
++
++        state->fontTpag = &dw->tpag.items[fontTpagIndex];
++        int16_t pageId = state->fontTpag->texturePageId;
++        if (0 > pageId || (uint32_t) pageId >= sw->textureCount) return false;
++        if (!swEnsureTextureLoaded(sw, (uint32_t)pageId)) return false;
++
++        state->texPixels = sw->texturePixels[pageId];
++        state->texW = sw->textureWidths[pageId];
++        state->texH = sw->textureHeights[pageId];
++        if (state->texPixels == nullptr || state->texW == 0 || state->texH == 0) return false;
++    } else if (font->spriteIndex >= 0 && dw->sprt.count > (uint32_t) font->spriteIndex) {
++        state->spriteFontSprite = &dw->sprt.sprites[font->spriteIndex];
++    }
++    return true;
++}
++
++// Resolves glyph UV and position
++static bool swResolveGlyph(SWRenderer* sw, DataWin* dw, SWFontState* state, FontGlyph* glyph, float cursorX, float cursorY, uint8_t** outTexPixels, int32_t* outTexW, int32_t* outTexH, float* outU0, float* outV0, float* outU1, float* outV1, float* outLocalX0, float* outLocalY0) {
++    Font* font = state->font;
++    if (font->isSpriteFont && state->spriteFontSprite != nullptr) {
++        Sprite* sprite = state->spriteFontSprite;
++        int32_t glyphIndex = (int32_t) (glyph - font->glyphs);
++        if (0 > glyphIndex || glyphIndex >= (int32_t) sprite->textureCount) return false;
++
++        int32_t tpagIdx = sprite->tpagIndices[glyphIndex];
++        if (0 > tpagIdx) return false;
++
++        TexturePageItem* glyphTpag = &dw->tpag.items[tpagIdx];
++        int16_t pid = glyphTpag->texturePageId;
++        if (0 > pid || (uint32_t) pid >= sw->textureCount) return false;
++        if (!swEnsureTextureLoaded(sw, (uint32_t)pid)) return false;
++
++        *outTexPixels = sw->texturePixels[pid];
++        *outTexW = sw->textureWidths[pid];
++        *outTexH = sw->textureHeights[pid];
++        if (*outTexPixels == nullptr || *outTexW == 0 || *outTexH == 0) return false;
++
++        *outU0 = (float) glyphTpag->sourceX / (float) *outTexW;
++        *outV0 = (float) glyphTpag->sourceY / (float) *outTexH;
++        *outU1 = (float) (glyphTpag->sourceX + glyphTpag->sourceWidth) / (float) *outTexW;
++        *outV1 = (float) (glyphTpag->sourceY + glyphTpag->sourceHeight) / (float) *outTexH;
++
++        *outLocalX0 = cursorX + (float) glyph->offset;
++        *outLocalY0 = cursorY + (float) ((int32_t) glyphTpag->targetY - sprite->originY);
++    } else {
++        *outTexPixels = state->texPixels;
++        *outTexW = state->texW;
++        *outTexH = state->texH;
++        *outU0 = (float) (state->fontTpag->sourceX + glyph->sourceX) / (float) state->texW;
++        *outV0 = (float) (state->fontTpag->sourceY + glyph->sourceY) / (float) state->texH;
++        *outU1 = (float) (state->fontTpag->sourceX + glyph->sourceX + glyph->sourceWidth) / (float) state->texW;
++        *outV1 = (float) (state->fontTpag->sourceY + glyph->sourceY + glyph->sourceHeight) / (float) state->texH;
++
++        *outLocalX0 = cursorX + glyph->offset;
++        *outLocalY0 = cursorY;
++    }
++    return true;
++}
++
++static void swDrawText(Renderer* renderer, const char* text, float x, float y, float xscale, float yscale, float angleDeg, float lineSeparation) {
++    SWRenderer* sw = (SWRenderer*) renderer;
++    DataWin* dw = renderer->dataWin;
++
++    int32_t fontIndex = renderer->drawFont;
++    if (0 > fontIndex || dw->font.count <= (uint32_t) fontIndex) return;
++
++    Font* font = &dw->font.fonts[fontIndex];
++
++    SWFontState fontState;
++    if (!swResolveFontState(sw, dw, font, &fontState)) return;
++
++    uint32_t color = renderer->drawColor;
++    float alpha = renderer->drawAlpha;
++    float cr = (float) BGR_R(color) / 255.0f;
++    float cg = (float) BGR_G(color) / 255.0f;
++    float cb = (float) BGR_B(color) / 255.0f;
++
++    int32_t textLen = (int32_t) strlen(text);
++    int32_t lineCount = TextUtils_countLines(text, textLen);
++
++    float totalHeight = (float) lineCount * (float) font->emSize;
++    float valignOffset = 0;
++    if (renderer->drawValign == 1) valignOffset = -totalHeight / 2.0f;
++    else if (renderer->drawValign == 2) valignOffset = -totalHeight;
++
++    float angleRad = -angleDeg * ((float) M_PI / 180.0f);
++    Matrix4f transform;
++    Matrix4f_setTransform2D(&transform, x, y, xscale * font->scaleX, yscale * font->scaleY, angleRad);
++
++    float cursorY = valignOffset;
++    int32_t lineStart = 0;
++
++    for (int32_t lineIdx = 0; lineCount > lineIdx; lineIdx++) {
++        int32_t lineEnd = lineStart;
++        while (textLen > lineEnd && !TextUtils_isNewlineChar(text[lineEnd])) lineEnd++;
++        int32_t lineLen = lineEnd - lineStart;
++
++        float lineWidth = TextUtils_measureLineWidth(font, text + lineStart, lineLen);
++        float halignOffset = 0;
++        if (renderer->drawHalign == 1) halignOffset = -lineWidth / 2.0f;
++        else if (renderer->drawHalign == 2) halignOffset = -lineWidth;
++
++        float cursorX = halignOffset;
++        int32_t pos = 0;
++
++        while (lineLen > pos) {
++            uint16_t ch = TextUtils_decodeUtf8(text + lineStart, lineLen, &pos);
++            FontGlyph* glyph = TextUtils_findGlyph(font, ch);
++            if (glyph == nullptr) continue;
++            if (glyph->sourceWidth == 0 || glyph->sourceHeight == 0) {
++                cursorX += glyph->shift;
++                continue;
++            }
++
++            uint8_t* glyphTexPixels;
++            int32_t glyphTexW, glyphTexH;
++            float u0, v0, u1, v1;
++            float localX0, localY0;
++
++            if (!swResolveGlyph(sw, dw, &fontState, glyph, cursorX, cursorY, &glyphTexPixels, &glyphTexW, &glyphTexH, &u0, &v0, &u1, &v1, &localX0, &localY0)) {
++                cursorX += glyph->shift;
++                continue;
++            }
++
++            float localX1 = localX0 + (float) glyph->sourceWidth;
++            float localY1 = localY0 + (float) glyph->sourceHeight;
++
++            // Transform corners through model matrix then to screen
++            float wx0, wy0, wx1, wy1, wx2, wy2, wx3, wy3;
++            Matrix4f_transformPoint(&transform, localX0, localY0, &wx0, &wy0);
++            Matrix4f_transformPoint(&transform, localX1, localY0, &wx1, &wy1);
++            Matrix4f_transformPoint(&transform, localX1, localY1, &wx2, &wy2);
++            Matrix4f_transformPoint(&transform, localX0, localY1, &wx3, &wy3);
++
++            SWVertex verts[4];
++            worldToScreen(sw, wx0, wy0, &verts[0].x, &verts[0].y);
++            worldToScreen(sw, wx1, wy1, &verts[1].x, &verts[1].y);
++            worldToScreen(sw, wx2, wy2, &verts[2].x, &verts[2].y);
++            worldToScreen(sw, wx3, wy3, &verts[3].x, &verts[3].y);
++
++            verts[0].u = u0; verts[0].v = v0;
++            verts[1].u = u1; verts[1].v = v0;
++            verts[2].u = u1; verts[2].v = v1;
++            verts[3].u = u0; verts[3].v = v1;
++
++            for (int i = 0; 4 > i; i++) {
++                verts[i].r = cr; verts[i].g = cg; verts[i].b = cb; verts[i].a = alpha;
++            }
++
++            rasterizeQuad(sw, verts, glyphTexPixels, glyphTexW, glyphTexH);
++
++            cursorX += glyph->shift;
++            if (lineLen > pos) {
++                int32_t savedPos = pos;
++                uint16_t nextCh = TextUtils_decodeUtf8(text + lineStart, lineLen, &pos);
++                pos = savedPos;
++                cursorX += TextUtils_getKerningOffset(glyph, nextCh);
++            }
++        }
++
++        cursorY += (float) font->emSize + lineSeparation;
++        if (textLen > lineEnd) {
++            lineStart = TextUtils_skipNewline(text, lineEnd, textLen);
++        } else {
++            lineStart = lineEnd;
++        }
++    }
++}
++
++static void swDrawTextColor(Renderer* renderer, const char* text, float x, float y, float xscale, float yscale, float angleDeg, int32_t _c1, int32_t _c2, int32_t _c3, int32_t _c4, float alpha, float lineSeparation) {
++    SWRenderer* sw = (SWRenderer*) renderer;
++    DataWin* dw = renderer->dataWin;
++
++    int32_t fontIndex = renderer->drawFont;
++    if (0 > fontIndex || dw->font.count <= (uint32_t) fontIndex) return;
++
++    Font* font = &dw->font.fonts[fontIndex];
++
++    SWFontState fontState;
++    if (!swResolveFontState(sw, dw, font, &fontState)) return;
++
++    PreprocessedText processedText = TextUtils_preprocessGmlText(text);
++    const char* processed = processedText.text;
++    int32_t textLen = (int32_t) strlen(processed);
++    if (textLen == 0) { PreprocessedText_free(processedText); return; }
++
++    int32_t lineCount = TextUtils_countLines(processed, textLen);
++
++    float totalHeight = (float) lineCount * (float) font->emSize;
++    float valignOffset = 0;
++    if (renderer->drawValign == 1) valignOffset = -totalHeight / 2.0f;
++    else if (renderer->drawValign == 2) valignOffset = -totalHeight;
++
++    float angleRad = -angleDeg * ((float) M_PI / 180.0f);
++    Matrix4f transform;
++    Matrix4f_setTransform2D(&transform, x, y, xscale * font->scaleX, yscale * font->scaleY, angleRad);
++
++    float cursorY = valignOffset;
++    int32_t lineStart = 0;
++
++    // Color gradient deltas (16.16 fixed-point, matching GL renderer)
++    int32_t left_r_dx = ((_c2 & 0xff0000) - (_c1 & 0xff0000)) / textLen;
++    int32_t left_g_dx = ((((_c2 & 0xff00) << 8) - ((_c1 & 0xff00) << 8))) / textLen;
++    int32_t left_b_dx = ((((_c2 & 0xff) << 16) - ((_c1 & 0xff) << 16))) / textLen;
++
++    int32_t right_r_dx = ((_c3 & 0xff0000) - (_c4 & 0xff0000)) / textLen;
++    int32_t right_g_dx = ((((_c3 & 0xff00) << 8) - ((_c4 & 0xff00) << 8))) / textLen;
++    int32_t right_b_dx = ((((_c3 & 0xff) << 16) - ((_c4 & 0xff) << 16))) / textLen;
++
++    int32_t left_delta_r = left_r_dx;
++    int32_t left_delta_g = left_g_dx;
++    int32_t left_delta_b = left_b_dx;
++    int32_t right_delta_r = right_r_dx;
++    int32_t right_delta_g = right_g_dx;
++    int32_t right_delta_b = right_b_dx;
++
++    int32_t c1 = _c1;
++    int32_t c4 = _c4;
++
++    for (int32_t lineIdx = 0; lineCount > lineIdx; lineIdx++) {
++        int32_t lineEnd = lineStart;
++        while (textLen > lineEnd && !TextUtils_isNewlineChar(processed[lineEnd])) lineEnd++;
++        int32_t lineLen = lineEnd - lineStart;
++
++        float lineWidth = TextUtils_measureLineWidth(font, processed + lineStart, lineLen);
++        float halignOffset = 0;
++        if (renderer->drawHalign == 1) halignOffset = -lineWidth / 2.0f;
++        else if (renderer->drawHalign == 2) halignOffset = -lineWidth;
++
++        float cursorX = halignOffset;
++        int32_t pos = 0;
++
++        while (lineLen > pos) {
++            int32_t c2 = ((c1 & 0xff0000) + (left_delta_r & 0xff0000)) & 0xff0000;
++            c2 |= ((c1 & 0xff00) + (left_delta_g >> 8) & 0xff00) & 0xff00;
++            c2 |= ((c1 & 0xff) + (left_delta_b >> 16)) & 0xff;
++            int32_t c3 = ((c4 & 0xff0000) + (right_delta_r & 0xff0000)) & 0xff0000;
++            c3 |= ((c4 & 0xff00) + (right_delta_g >> 8) & 0xff00) & 0xff00;
++            c3 |= ((c4 & 0xff) + (right_delta_b >> 16)) & 0xff;
++
++            left_delta_r += left_r_dx;
++            left_delta_g += left_g_dx;
++            left_delta_b += left_b_dx;
++            right_delta_r += right_r_dx;
++            right_delta_g += right_g_dx;
++            right_delta_b += right_b_dx;
++
++            uint16_t ch = TextUtils_decodeUtf8(processed + lineStart, lineLen, &pos);
++            FontGlyph* glyph = TextUtils_findGlyph(font, ch);
++            if (glyph == nullptr) continue;
++            if (glyph->sourceWidth == 0 || glyph->sourceHeight == 0) {
++                cursorX += glyph->shift;
++                continue;
++            }
++
++            uint8_t* glyphTexPixels;
++            int32_t glyphTexW, glyphTexH;
++            float u0, v0, u1, v1;
++            float localX0, localY0;
++
++            if (!swResolveGlyph(sw, dw, &fontState, glyph, cursorX, cursorY, &glyphTexPixels, &glyphTexW, &glyphTexH, &u0, &v0, &u1, &v1, &localX0, &localY0)) {
++                cursorX += glyph->shift;
++                continue;
++            }
++
++            float localX1 = localX0 + (float) glyph->sourceWidth;
++            float localY1 = localY0 + (float) glyph->sourceHeight;
++
++            float wx0, wy0, wx1, wy1, wx2, wy2, wx3, wy3;
++            Matrix4f_transformPoint(&transform, localX0, localY0, &wx0, &wy0);
++            Matrix4f_transformPoint(&transform, localX1, localY0, &wx1, &wy1);
++            Matrix4f_transformPoint(&transform, localX1, localY1, &wx2, &wy2);
++            Matrix4f_transformPoint(&transform, localX0, localY1, &wx3, &wy3);
++
++            SWVertex verts[4];
++            worldToScreen(sw, wx0, wy0, &verts[0].x, &verts[0].y);
++            worldToScreen(sw, wx1, wy1, &verts[1].x, &verts[1].y);
++            worldToScreen(sw, wx2, wy2, &verts[2].x, &verts[2].y);
++            worldToScreen(sw, wx3, wy3, &verts[3].x, &verts[3].y);
++
++            verts[0].u = u0; verts[0].v = v0;
++            verts[1].u = u1; verts[1].v = v0;
++            verts[2].u = u1; verts[2].v = v1;
++            verts[3].u = u0; verts[3].v = v1;
++
++            // Per-vertex colors (top-left=c1, top-right=c2, bottom-right=c3, bottom-left=c4)
++            verts[0].r = (float) BGR_R(c1) / 255.0f; verts[0].g = (float) BGR_G(c1) / 255.0f; verts[0].b = (float) BGR_B(c1) / 255.0f; verts[0].a = alpha;
++            verts[1].r = (float) BGR_R(c2) / 255.0f; verts[1].g = (float) BGR_G(c2) / 255.0f; verts[1].b = (float) BGR_B(c2) / 255.0f; verts[1].a = alpha;
++            verts[2].r = (float) BGR_R(c3) / 255.0f; verts[2].g = (float) BGR_G(c3) / 255.0f; verts[2].b = (float) BGR_B(c3) / 255.0f; verts[2].a = alpha;
++            verts[3].r = (float) BGR_R(c4) / 255.0f; verts[3].g = (float) BGR_G(c4) / 255.0f; verts[3].b = (float) BGR_B(c4) / 255.0f; verts[3].a = alpha;
++
++            rasterizeQuad(sw, verts, glyphTexPixels, glyphTexW, glyphTexH);
++
++            cursorX += glyph->shift;
++            if (lineLen > pos) {
++                int32_t savedPos = pos;
++                uint16_t nextCh = TextUtils_decodeUtf8(processed + lineStart, lineLen, &pos);
++                pos = savedPos;
++                cursorX += TextUtils_getKerningOffset(glyph, nextCh);
++            }
++            c4 = c3;
++            c1 = c2;
++        }
++
++        cursorY += (float) font->emSize + lineSeparation;
++        if (textLen > lineEnd) {
++            lineStart = TextUtils_skipNewline(processed, lineEnd, textLen);
++        } else {
++            lineStart = lineEnd;
++        }
++    }
++
++    PreprocessedText_free(processedText);
++}
++
++static void swFlush(Renderer* renderer) {
++    (void) renderer;
++}
++
++void SWRenderer_clearFrameBuffer(Renderer* renderer, uint32_t color) {
++    SWRenderer* sw = (SWRenderer*)renderer;
++    if (sw->hostFramebuffer == nullptr) return;
++    uint8_t* dst = sw->hostFramebuffer;
++    uint8_t r = BGR_R(color), g = BGR_G(color), b = BGR_B(color);
++    for (int32_t i = 0; i < sw->hostWidth * sw->hostHeight; ++i) {
++        dst[i * 4 + 0] = r;
++        dst[i * 4 + 1] = g;
++        dst[i * 4 + 2] = b;
++        dst[i * 4 + 3] = 255;
++    }
++}
++
++static void swClearScreen(Renderer* renderer, uint32_t color, float alpha) {
++    SWRenderer* sw = (SWRenderer*)renderer;
++    if (sw->framebuffer == nullptr) return;
++    uint8_t r = BGR_R(color), g = BGR_G(color), b = BGR_B(color);
++    uint8_t a = clampByte((int32_t)(alpha * 255.0f + 0.5f));
++#ifdef USE_MISTER
++    if (sw->gpuFrameEligible) {
++        if (swGpuIsOutputTarget(sw) && sw->fbWidth == 320 && sw->fbHeight == 240 &&
++            MisterGpu_addClear((uint32_t)r | ((uint32_t)g << 8) |
++                               ((uint32_t)b << 16) | ((uint32_t)a << 24))) {
++            sw->gpuSawClear = true;
++            // The CPU copy is not presented while the FPGA owns this frame.
++            // Mark the clear as skipped work so a later fallback submits and
++            // reads it back before software drawing resumes.
++            sw->gpuHasSkippedDraws = true;
++            return;
++        } else {
++            swGpuFallbackIfOutput(sw, "clear target/state");
++        }
++    }
++#endif
++    for (int32_t i = 0; i < sw->fbWidth * sw->fbHeight; ++i) {
++        uint8_t* dst = sw->framebuffer + (size_t)i * 4;
++        dst[0] = r; dst[1] = g; dst[2] = b; dst[3] = a;
++    }
++}
++
++static void swDrawRectangleColor(Renderer* renderer, float x1, float y1, float x2, float y2, uint32_t c1, uint32_t c2, uint32_t c3, uint32_t c4, float alpha, bool outline) {
++    if (outline) {
++        swDrawLine(renderer, x1, y1, x2, y1, 1.0f, c1, alpha);
++        swDrawLine(renderer, x2, y1, x2, y2, 1.0f, c2, alpha);
++        swDrawLine(renderer, x2, y2, x1, y2, 1.0f, c3, alpha);
++        swDrawLine(renderer, x1, y2, x1, y1, 1.0f, c4, alpha);
++        return;
++    }
++    SWRenderer* sw = (SWRenderer*)renderer;
++    SWVertex v[4];
++    worldToScreen(sw, x1, y1, &v[0].x, &v[0].y);
++    worldToScreen(sw, x2 + 1.0f, y1, &v[1].x, &v[1].y);
++    worldToScreen(sw, x2 + 1.0f, y2 + 1.0f, &v[2].x, &v[2].y);
++    worldToScreen(sw, x1, y2 + 1.0f, &v[3].x, &v[3].y);
++    uint32_t colors[4] = {c1, c2, c3, c4};
++    for (int i = 0; i < 4; ++i) {
++        v[i].u = v[i].v = 0.0f;
++        v[i].r = (float)BGR_R(colors[i]) / 255.0f;
++        v[i].g = (float)BGR_G(colors[i]) / 255.0f;
++        v[i].b = (float)BGR_B(colors[i]) / 255.0f;
++        v[i].a = alpha;
++    }
++    rasterizeQuad(sw, v, nullptr, 0, 0);
++}
++
++static void swDrawSpritePartColor(Renderer* renderer, int32_t tpagIndex, int32_t srcOffX, int32_t srcOffY, int32_t srcW, int32_t srcH, float x, float y, float xscale, float yscale, float angleDeg, float pivotX, float pivotY, uint32_t color1, uint32_t color2, uint32_t color3, uint32_t color4, float alpha) {
++    (void)color2; (void)color3; (void)color4;
++    swDrawSpritePart(renderer, tpagIndex, srcOffX, srcOffY, srcW, srcH, x, y, xscale, yscale, angleDeg, pivotX, pivotY, color1, alpha);
++}
++
++static void swDrawSpritePos(Renderer* renderer, int32_t tpagIndex, float x1, float y1, float x2, float y2, float x3, float y3, float x4, float y4, float alpha) {
++    SWRenderer* sw = (SWRenderer*)renderer;
++    DataWin* dw = renderer->dataWin;
++    if (tpagIndex < 0 || (uint32_t)tpagIndex >= dw->tpag.count) return;
++    TexturePageItem* t = &dw->tpag.items[tpagIndex];
++    if (t->texturePageId < 0 || !swEnsureTextureLoaded(sw, (uint32_t)t->texturePageId)) return;
++    int32_t tw = sw->textureWidths[t->texturePageId], th = sw->textureHeights[t->texturePageId];
++    SWVertex v[4];
++    worldToScreen(sw, x1, y1, &v[0].x, &v[0].y); worldToScreen(sw, x2, y2, &v[1].x, &v[1].y);
++    worldToScreen(sw, x3, y3, &v[2].x, &v[2].y); worldToScreen(sw, x4, y4, &v[3].x, &v[3].y);
++    float u0 = (float)t->sourceX / tw, v0 = (float)t->sourceY / th;
++    float u1 = (float)(t->sourceX + t->sourceWidth) / tw, v1 = (float)(t->sourceY + t->sourceHeight) / th;
++    v[0].u=u0; v[0].v=v0; v[1].u=u1; v[1].v=v0; v[2].u=u1; v[2].v=v1; v[3].u=u0; v[3].v=v1;
++    for (int i = 0; i < 4; ++i) { v[i].r=v[i].g=v[i].b=1.0f; v[i].a=alpha; }
++    rasterizeQuad(sw, v, sw->texturePixels[t->texturePageId], tw, th);
++}
++
++static int32_t swCreateSpriteFromSurface(Renderer* renderer, int32_t surfaceID, int32_t x, int32_t y, int32_t w, int32_t h, bool removeback, bool smooth, int32_t xorig, int32_t yorig) {
++    (void) renderer; (void) surfaceID; (void) x; (void) y; (void) w; (void) h;
++    (void) removeback; (void) smooth; (void) xorig; (void) yorig;
++    logWarn("SW: sprite_create_from_surface is not implemented\n");
++    return -1;
++}
++
++static void swDeleteSprite(Renderer* renderer, int32_t spriteIndex) {
++    (void) renderer; (void) spriteIndex;
++}
++
++static BlendFactors swGpuGetBlendFactors(Renderer* renderer) { return ((SWRenderer*)renderer)->blendFactors; }
++static int32_t swGpuGetBlendMode(Renderer* renderer) { return ((SWRenderer*)renderer)->blendMode; }
++static void swGpuSetBlendMode(Renderer* renderer, int32_t mode) { ((SWRenderer*)renderer)->blendMode = mode; }
++static void swGpuSetBlendModeExt(Renderer* renderer, int32_t s, int32_t d, int32_t sa, int32_t da) {
++    SWRenderer* sw = (SWRenderer*)renderer; sw->blendMode = bm_complex;
++    sw->blendFactors.src=s; sw->blendFactors.dst=d; sw->blendFactors.srcAlpha=sa; sw->blendFactors.dstAlpha=da;
++}
++static void swGpuSetBlendEnable(Renderer* renderer, bool enable) { ((SWRenderer*)renderer)->blendEnable = enable; }
++static bool swGpuGetBlendEnable(Renderer* renderer) { return ((SWRenderer*)renderer)->blendEnable; }
++static void swGpuSetAlphaTestEnable(Renderer* renderer, bool enable) { ((SWRenderer*)renderer)->alphaTestEnable = enable; }
++static bool swGpuGetAlphaTestEnable(Renderer* renderer) { return ((SWRenderer*)renderer)->alphaTestEnable; }
++static void swGpuSetAlphaTestRef(Renderer* renderer, uint8_t ref) { ((SWRenderer*)renderer)->alphaTestRef = ref; }
++static void swGpuSetColorWriteEnable(Renderer* renderer, bool r, bool g, bool b, bool a) {
++    SWRenderer* sw = (SWRenderer*)renderer; sw->colorWriteR=r; sw->colorWriteG=g; sw->colorWriteB=b; sw->colorWriteA=a;
++}
++static void swGpuGetColorWriteEnable(Renderer* renderer, bool* r, bool* g, bool* b, bool* a) {
++    SWRenderer* sw = (SWRenderer*)renderer; if(r)*r=sw->colorWriteR; if(g)*g=sw->colorWriteG; if(b)*b=sw->colorWriteB; if(a)*a=sw->colorWriteA;
++}
++static void swGpuSetFog(Renderer* renderer, bool enable, uint32_t color) { SWRenderer* sw=(SWRenderer*)renderer; sw->fogEnable=enable; sw->fogColor=color; }
++
++static int32_t swCreateSurface(Renderer* renderer, int32_t width, int32_t height) {
++    SWRenderer* sw = (SWRenderer*)renderer;
++    if (width <= 0 || height <= 0) return -1;
++    uint32_t id;
++    for (id = 0; id < sw->surfaceCount; ++id) if (!sw->surfaceExistsFlags[id]) break;
++    if (id == sw->surfaceCount) {
++        swEnsureSurfaceCapacity(sw, id + 1);
++        sw->surfaceCount = id + 1;
++    }
++    free(sw->surfacePixels[id]);
++    sw->surfacePixels[id] = (uint8_t*)safeCalloc((size_t)width * (size_t)height, 4);
++    sw->surfaceWidths[id] = width;
++    sw->surfaceHeights[id] = height;
++    sw->surfaceExistsFlags[id] = true;
++    return (int32_t)id;
++}
++
++static bool swSurfaceExists(Renderer* renderer, int32_t id) {
++    SWRenderer* sw = (SWRenderer*)renderer;
++    return id >= 0 && (uint32_t)id < sw->surfaceCount && sw->surfaceExistsFlags[id];
++}
++
++static int32_t swEnsureApplicationSurface(Renderer* renderer, int32_t width, int32_t height) {
++    SWRenderer* sw = (SWRenderer*)renderer;
++    int32_t id = renderer->runner->applicationSurfaceId;
++    if (!swSurfaceExists(renderer, id)) {
++        id = swCreateSurface(renderer, width, height);
++        renderer->runner->applicationSurfaceId = id;
++    } else if (sw->surfaceWidths[id] != width || sw->surfaceHeights[id] != height) {
++        uint8_t* pixels = (uint8_t*)safeCalloc((size_t)width * (size_t)height, 4);
++        free(sw->surfacePixels[id]);
++        sw->surfacePixels[id] = pixels;
++        sw->surfaceWidths[id] = width;
++        sw->surfaceHeights[id] = height;
++    }
++    return id;
++}
++
++static bool swSetRenderTarget(Renderer* renderer, int32_t id, bool implicitApplicationSurface) {
++    (void)implicitApplicationSurface;
++    SWRenderer* sw = (SWRenderer*)renderer;
++    if (!swUseSurfaceTarget(sw, id)) return false;
++    sw->scissorX=0; sw->scissorY=0; sw->scissorW=sw->fbWidth; sw->scissorH=sw->fbHeight;
++    swBeginView(renderer, 0, 0, sw->fbWidth, sw->fbHeight, 0, 0, sw->fbWidth, sw->fbHeight, 0.0f);
++    return true;
++}
++
++static float swGetSurfaceWidth(Renderer* renderer, int32_t id) {
++    SWRenderer* sw=(SWRenderer*)renderer; return swSurfaceExists(renderer,id)?(float)sw->surfaceWidths[id]:0.0f;
++}
++static float swGetSurfaceHeight(Renderer* renderer, int32_t id) {
++    SWRenderer* sw=(SWRenderer*)renderer; return swSurfaceExists(renderer,id)?(float)sw->surfaceHeights[id]:0.0f;
++}
++
++static void swSurfaceResize(Renderer* renderer, int32_t id, int32_t width, int32_t height) {
++    SWRenderer* sw=(SWRenderer*)renderer;
++    if (!swSurfaceExists(renderer,id) || width <= 0 || height <= 0) return;
++    bool current = sw->currentSurface == id;
++    free(sw->surfacePixels[id]);
++    sw->surfacePixels[id]=(uint8_t*)safeCalloc((size_t)width*(size_t)height,4);
++    sw->surfaceWidths[id]=width; sw->surfaceHeights[id]=height;
++    if (current) swUseSurfaceTarget(sw,id);
++}
++
++static void swSurfaceFree(Renderer* renderer, int32_t id) {
++    SWRenderer* sw=(SWRenderer*)renderer;
++    if (!swSurfaceExists(renderer,id) || id == renderer->runner->applicationSurfaceId) return;
++    if (sw->currentSurface == id) swUseHostTarget(sw);
++    free(sw->surfacePixels[id]); sw->surfacePixels[id]=nullptr;
++    sw->surfaceWidths[id]=sw->surfaceHeights[id]=0; sw->surfaceExistsFlags[id]=false;
++}
++
++static void swDrawPixelBuffer(SWRenderer* sw, const uint8_t* pixels, int32_t texW, int32_t texH,
++                              int32_t srcLeft, int32_t srcTop, int32_t srcWidth, int32_t srcHeight,
++                              float x, float y, float xscale, float yscale, float angleDeg,
++                              uint32_t c1, uint32_t c2, uint32_t c3, uint32_t c4, float alpha) {
++    if (pixels == nullptr || texW <= 0 || texH <= 0 || srcWidth <= 0 || srcHeight <= 0) return;
++    Matrix4f transform;
++    Matrix4f_setTransform2D(&transform, x, y, xscale, yscale, -angleDeg*((float)M_PI/180.0f));
++    float wx[4], wy[4];
++    Matrix4f_transformPoint(&transform,0,0,&wx[0],&wy[0]);
++    Matrix4f_transformPoint(&transform,(float)srcWidth,0,&wx[1],&wy[1]);
++    Matrix4f_transformPoint(&transform,(float)srcWidth,(float)srcHeight,&wx[2],&wy[2]);
++    Matrix4f_transformPoint(&transform,0,(float)srcHeight,&wx[3],&wy[3]);
++    SWVertex v[4];
++    for(int i=0;i<4;++i) worldToScreen(sw,wx[i],wy[i],&v[i].x,&v[i].y);
++    float u0=(float)srcLeft/texW, vv0=(float)srcTop/texH, u1=(float)(srcLeft+srcWidth)/texW, vv1=(float)(srcTop+srcHeight)/texH;
++    v[0].u=u0;v[0].v=vv0;v[1].u=u1;v[1].v=vv0;v[2].u=u1;v[2].v=vv1;v[3].u=u0;v[3].v=vv1;
++    uint32_t colors[4]={c1,c2,c3,c4};
++    for(int i=0;i<4;++i){v[i].r=(float)BGR_R(colors[i])/255.0f;v[i].g=(float)BGR_G(colors[i])/255.0f;v[i].b=(float)BGR_B(colors[i])/255.0f;v[i].a=alpha;}
++    rasterizeQuad(sw,v,pixels,texW,texH);
++}
++
++static void swDrawSurfaceColor(Renderer* renderer, int32_t id, int32_t srcLeft, int32_t srcTop, int32_t srcWidth, int32_t srcHeight, float x, float y, float xscale, float yscale, float angleDeg, uint32_t c1, uint32_t c2, uint32_t c3, uint32_t c4, float alpha) {
++    SWRenderer* sw=(SWRenderer*)renderer;
++    if (!swSurfaceExists(renderer,id)) return;
++    if (srcWidth < 0) {srcLeft=srcTop=0;srcWidth=sw->surfaceWidths[id];srcHeight=sw->surfaceHeights[id];}
++    swDrawPixelBuffer(sw,sw->surfacePixels[id],sw->surfaceWidths[id],sw->surfaceHeights[id],srcLeft,srcTop,srcWidth,srcHeight,x,y,xscale,yscale,angleDeg,c1,c2,c3,c4,alpha);
++}
++
++static void swDrawSurface(Renderer* renderer, int32_t id, int32_t srcLeft, int32_t srcTop, int32_t srcWidth, int32_t srcHeight, float x, float y, float xscale, float yscale, float angleDeg, uint32_t color, float alpha) {
++    swDrawSurfaceColor(renderer,id,srcLeft,srcTop,srcWidth,srcHeight,x,y,xscale,yscale,angleDeg,color,color,color,color,alpha);
++}
++
++static void swDrawSurfaceTiled(Renderer* renderer, int32_t id, float x, float y, float xscale, float yscale, float roomW, float roomH, uint32_t color, float alpha) {
++    SWRenderer* sw=(SWRenderer*)renderer; if(!swSurfaceExists(renderer,id))return;
++    float stepX=sw->surfaceWidths[id]*fabsf(xscale), stepY=sw->surfaceHeights[id]*fabsf(yscale);
++    if(stepX<1.0f||stepY<1.0f)return;
++    while(x>0)x-=stepX; while(y>0)y-=stepY;
++    for(float py=y;py<roomH;py+=stepY)for(float px=x;px<roomW;px+=stepX)
++        swDrawSurface(renderer,id,0,0,sw->surfaceWidths[id],sw->surfaceHeights[id],px,py,xscale,yscale,0,color,alpha);
++}
++
++static void swSurfaceCopy(Renderer* renderer, int32_t dstId, int32_t dx, int32_t dy, int32_t srcId, int32_t sx, int32_t sy, int32_t swidth, int32_t sheight, bool part) {
++    SWRenderer* sw=(SWRenderer*)renderer;
++#ifdef USE_MISTER
++    if (dstId == renderer->runner->applicationSurfaceId ||
++        srcId == renderer->runner->applicationSurfaceId)
++        swGpuFallback(sw, "application surface copy");
++#endif
++    if(!swSurfaceExists(renderer,dstId)||!swSurfaceExists(renderer,srcId))return;
++    if(!part){sx=sy=0;swidth=sw->surfaceWidths[srcId];sheight=sw->surfaceHeights[srcId];}
++    if(sx<0){dx-=sx;swidth+=sx;sx=0;} if(sy<0){dy-=sy;sheight+=sy;sy=0;}
++    if(dx<0){sx-=dx;swidth+=dx;dx=0;} if(dy<0){sy-=dy;sheight+=dy;dy=0;}
++    if(sx+swidth>sw->surfaceWidths[srcId])swidth=sw->surfaceWidths[srcId]-sx;
++    if(sy+sheight>sw->surfaceHeights[srcId])sheight=sw->surfaceHeights[srcId]-sy;
++    if(dx+swidth>sw->surfaceWidths[dstId])swidth=sw->surfaceWidths[dstId]-dx;
++    if(dy+sheight>sw->surfaceHeights[dstId])sheight=sw->surfaceHeights[dstId]-dy;
++    if(swidth<=0||sheight<=0)return;
++    uint8_t* temp=(uint8_t*)safeMalloc((size_t)swidth*sheight*4);
++    for(int32_t row=0;row<sheight;++row)memcpy(temp+(size_t)row*swidth*4,sw->surfacePixels[srcId]+((size_t)(sy+row)*sw->surfaceWidths[srcId]+sx)*4,(size_t)swidth*4);
++    for(int32_t row=0;row<sheight;++row)memcpy(sw->surfacePixels[dstId]+((size_t)(dy+row)*sw->surfaceWidths[dstId]+dx)*4,temp+(size_t)row*swidth*4,(size_t)swidth*4);
++    free(temp);
++}
++
++static bool swSurfaceGetPixels(Renderer* renderer, int32_t id, uint8_t* outRGBA) {
++    SWRenderer* sw=(SWRenderer*)renderer; if(!swSurfaceExists(renderer,id)||outRGBA==nullptr)return false;
++#ifdef USE_MISTER
++    if (id == renderer->runner->applicationSurfaceId)
++        swGpuFallback(sw, "application surface readback");
++#endif
++    memcpy(outRGBA,sw->surfacePixels[id],(size_t)sw->surfaceWidths[id]*sw->surfaceHeights[id]*4);return true;
++}
++
++static void swDrawSpriteTiled(Renderer* renderer, int32_t tpagIndex, float originX, float originY, float x, float y, float xscale, float yscale, bool tileX, bool tileY, float roomW, float roomH, uint32_t color, float alpha) {
++    DataWin* dw=renderer->dataWin; if(tpagIndex<0||(uint32_t)tpagIndex>=dw->tpag.count)return;
++    TexturePageItem* t=&dw->tpag.items[tpagIndex];
++    float stepX=t->boundingWidth*fabsf(xscale),stepY=t->boundingHeight*fabsf(yscale);if(stepX<1||stepY<1)return;
++    float startX=x-originX*xscale,startY=y-originY*yscale;
++    if(tileX)while(startX>0)startX-=stepX; if(tileY)while(startY>0)startY-=stepY;
++    float endX=tileX?roomW:startX+stepX,endY=tileY?roomH:startY+stepY;
++    for(float py=startY;py<endY;py+=stepY)for(float px=startX;px<endX;px+=stepX)
++        swDrawSprite(renderer,tpagIndex,px,py,0,0,xscale,yscale,0,color,alpha);
++}
++
++static void swDrawTiledPart(Renderer* renderer, int32_t tpagIndex, int32_t srcX, int32_t srcY, int32_t srcW, int32_t srcH, float dstX, float dstY, float dstW, float dstH, uint32_t color, float alpha) {
++    if(srcW<=0||srcH<=0)return;
++    for(float y=0;y<dstH;y+=srcH)for(float x=0;x<dstW;x+=srcW){
++        int32_t w=(int32_t)fminf((float)srcW,dstW-x),h=(int32_t)fminf((float)srcH,dstH-y);
++        swDrawSpritePart(renderer,tpagIndex,srcX,srcY,w,h,dstX+x,dstY+y,1,1,0,0,0,color,alpha);
++    }
++}
++
++static uint32_t swSpriteGetTexture(Renderer* renderer, int32_t tpagIndex) {
++    SWRenderer* sw=(SWRenderer*)renderer; DataWin* dw=renderer->dataWin;
++    if(tpagIndex<0||(uint32_t)tpagIndex>=dw->tpag.count)return 0;
++    int32_t page=dw->tpag.items[tpagIndex].texturePageId;
++    if(page<0||!swEnsureTextureLoaded(sw,(uint32_t)page))return 0;
++    return (uint32_t)tpagIndex+1;
++}
++static uint32_t swSurfaceGetTexture(Renderer* renderer,int32_t id){return swSurfaceExists(renderer,id)?(0x40000000u|(uint32_t)id):0;}
++
++static bool swResolveTextureHandle(SWRenderer* sw,uint32_t handle,TexturePageItem** tpag,int32_t* width,int32_t* height){
++    if(handle==0)return false;
++    if(handle&0x40000000u){int32_t id=(int32_t)(handle&~0x40000000u);if(!swSurfaceExists((Renderer*)sw,id))return false;if(tpag)*tpag=nullptr;*width=sw->surfaceWidths[id];*height=sw->surfaceHeights[id];return true;}
++    int32_t idx=(int32_t)handle-1;DataWin*dw=sw->base.dataWin;if(idx<0||(uint32_t)idx>=dw->tpag.count)return false;
++    TexturePageItem*t=&dw->tpag.items[idx];if(t->texturePageId<0||!swEnsureTextureLoaded(sw,(uint32_t)t->texturePageId))return false;
++    if(tpag)*tpag=t;*width=sw->textureWidths[t->texturePageId];*height=sw->textureHeights[t->texturePageId];return true;
++}
++static float swTextureGetTexelWidth(Renderer* renderer,uint32_t handle){int32_t w=0,h=0;return swResolveTextureHandle((SWRenderer*)renderer,handle,nullptr,&w,&h)&&w>0?1.0f/w:1.0f;}
++static float swTextureGetTexelHeight(Renderer* renderer,uint32_t handle){int32_t w=0,h=0;return swResolveTextureHandle((SWRenderer*)renderer,handle,nullptr,&w,&h)&&h>0?1.0f/h:1.0f;}
++static bool swTextureGetUVs(Renderer* renderer,uint32_t handle,float*out){SWRenderer*sw=(SWRenderer*)renderer;TexturePageItem*t=nullptr;int32_t w=0,h=0;if(!out||!swResolveTextureHandle(sw,handle,&t,&w,&h))return false;if(!t){out[0]=out[1]=0;out[2]=out[3]=1;return true;}out[0]=(float)t->sourceX/w;out[1]=(float)t->sourceY/h;out[2]=(float)(t->sourceX+t->sourceWidth)/w;out[3]=(float)(t->sourceY+t->sourceHeight)/h;return true;}
++static void swTextureSetStage(Renderer* renderer,int32_t slot,uint32_t handle){(void)renderer;(void)slot;(void)handle;}
++
++static void swGpuSetShader(Renderer* renderer,int32_t shader){renderer->currentShader=shader;}
++static void swGpuResetShader(Renderer* renderer){renderer->currentShader=-1;}
++static int32_t swShaderGetUniform(Renderer*renderer,int32_t shader,char*name){(void)renderer;(void)shader;(void)name;return -1;}
++static int32_t swShaderGetSamplerIndex(Renderer*renderer,int32_t shader,char*name){(void)renderer;(void)shader;(void)name;return -1;}
++static void swShaderSetUniformF(Renderer*r,int32_t h,int32_t c,float a,float b,float d,float e){(void)r;(void)h;(void)c;(void)a;(void)b;(void)d;(void)e;}
++static void swShaderSetUniformFArray(Renderer*r,int32_t h,float*v,uint32_t c){(void)r;(void)h;(void)v;(void)c;}
++static void swShaderSetUniformI(Renderer*r,int32_t h,int32_t c,int32_t a,int32_t b,int32_t d,int32_t e){(void)r;(void)h;(void)c;(void)a;(void)b;(void)d;(void)e;}
++static bool swShaderIsCompiled(Renderer*r,int32_t shader){(void)r;(void)shader;return false;}
++static bool swShadersSupported(void){return false;}
++static void swSetMatrix(Renderer*renderer,int32_t type,Matrix4f matrix){if(type>=0&&type<MATRICES_MAX)renderer->gmlMatrices[type]=matrix;}
++
++// ===[ Vtable ]===
++
++static RendererVtable swVtable;
++
++// ===[ Public API ]===
++
++Renderer* SWRenderer_create(void) {
++    SWRenderer* sw = safeCalloc(1, sizeof(SWRenderer));
++    sw->base.vtable = &swVtable;
++    swVtable.init=swInit; swVtable.destroy=swDestroy; swVtable.beginFrame=swBeginFrame;
++    swVtable.endFrameInit=swEndFrameInit; swVtable.endFrameEnd=swEndFrameEnd;
++    swVtable.beginView=swBeginView; swVtable.endView=swEndView; swVtable.applyProjection=swApplyProjection;
++    swVtable.beginGUI=swBeginGUI; swVtable.setGuiProjection=swSetGuiProjection; swVtable.endGUI=swEndGUI;
++    swVtable.drawSprite=swDrawSprite; swVtable.drawSpritePart=swDrawSpritePart;
++    swVtable.drawSpritePartColor=swDrawSpritePartColor; swVtable.drawSpritePos=swDrawSpritePos;
++    swVtable.drawRectangle=swDrawRectangle; swVtable.drawRectangleColor=swDrawRectangleColor;
++    swVtable.drawLine=swDrawLine; swVtable.drawTriangle=swDrawTriangle; swVtable.drawLineColor=swDrawLineColor;
++    swVtable.drawText=swDrawText; swVtable.drawTextColor=swDrawTextColor; swVtable.flush=swFlush;
++    swVtable.clearScreen=swClearScreen; swVtable.createSpriteFromSurface=swCreateSpriteFromSurface; swVtable.deleteSprite=swDeleteSprite;
++    swVtable.gpuGetBlendFactors=swGpuGetBlendFactors; swVtable.gpuGetBlendMode=swGpuGetBlendMode;
++    swVtable.gpuSetBlendMode=swGpuSetBlendMode; swVtable.gpuSetBlendModeExt=swGpuSetBlendModeExt;
++    swVtable.gpuSetBlendEnable=swGpuSetBlendEnable; swVtable.gpuGetBlendEnable=swGpuGetBlendEnable;
++    swVtable.gpuSetAlphaTestEnable=swGpuSetAlphaTestEnable; swVtable.gpuGetAlphaTestEnable=swGpuGetAlphaTestEnable;
++    swVtable.gpuSetAlphaTestRef=swGpuSetAlphaTestRef; swVtable.gpuSetColorWriteEnable=swGpuSetColorWriteEnable;
++    swVtable.gpuGetColorWriteEnable=swGpuGetColorWriteEnable; swVtable.gpuSetFog=swGpuSetFog;
++    swVtable.drawTile=nullptr; swVtable.drawSpriteTiled=swDrawSpriteTiled;
++    swVtable.createSurface=swCreateSurface; swVtable.surfaceExists=swSurfaceExists;
++    swVtable.setRenderTarget=swSetRenderTarget; swVtable.ensureApplicationSurface=swEnsureApplicationSurface;
++    swVtable.getSurfaceWidth=swGetSurfaceWidth; swVtable.getSurfaceHeight=swGetSurfaceHeight;
++    swVtable.drawSurface=swDrawSurface; swVtable.drawSurfaceColor=swDrawSurfaceColor; swVtable.drawSurfaceTiled=swDrawSurfaceTiled;
++    swVtable.surfaceResize=swSurfaceResize; swVtable.surfaceFree=swSurfaceFree; swVtable.surfaceCopy=swSurfaceCopy;
++    swVtable.surfaceGetPixels=swSurfaceGetPixels; swVtable.drawTiledPart=swDrawTiledPart;
++    swVtable.gpuSetShader=swGpuSetShader; swVtable.gpuResetShader=swGpuResetShader;
++    swVtable.shaderGetUniform=swShaderGetUniform; swVtable.shaderGetSamplerIndex=swShaderGetSamplerIndex;
++    swVtable.shaderSetUniformF=swShaderSetUniformF; swVtable.shaderSetUniformFArray=swShaderSetUniformFArray;
++    swVtable.shaderSetUniformI=swShaderSetUniformI; swVtable.spriteGetTexture=swSpriteGetTexture;
++    swVtable.surfaceGetTexture=swSurfaceGetTexture; swVtable.textureGetTexelWidth=swTextureGetTexelWidth;
++    swVtable.textureGetTexelHeight=swTextureGetTexelHeight; swVtable.textureGetUVs=swTextureGetUVs;
++    swVtable.textureSetStage=swTextureSetStage; swVtable.shaderIsCompiled=swShaderIsCompiled;
++    swVtable.shadersSupported=swShadersSupported; swVtable.setMatrix=swSetMatrix;
++    sw->base.drawColor = 0xFFFFFF; // white (BGR)
++    sw->base.drawAlpha = 1.0f;
++    sw->base.drawFont = -1;
++    sw->base.drawHalign = 0;
++    sw->base.drawValign = 0;
++    sw->base.circlePrecision = 24;
++    sw->base.currentShader = -1;
++    sw->blendEnable = true;
++    sw->blendMode = bm_normal;
++    sw->blendFactors.src = bm_src_alpha;
++    sw->blendFactors.dst = bm_inv_src_alpha;
++    sw->blendFactors.srcAlpha = bm_src_alpha;
++    sw->blendFactors.dstAlpha = bm_inv_src_alpha;
++    sw->colorWriteR = sw->colorWriteG = sw->colorWriteB = sw->colorWriteA = true;
++    Matrix4f_identity(&sw->base.gmlMatrices[MATRIX_WORLD]);
++    return (Renderer*) sw;
++}

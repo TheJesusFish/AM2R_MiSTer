@@ -1,0 +1,30 @@
+diff --git a/src/audio/miniaudio/ma_audio_system.c b/src/audio/miniaudio/ma_audio_system.c
+index b2eed01..3e24f00 100644
+--- a/src/audio/miniaudio/ma_audio_system.c
++++ b/src/audio/miniaudio/ma_audio_system.c
+@@ -123,6 +123,9 @@ static bool maInitRuntime(MaAudioSystem* ma) {
+     ma_device_config deviceConfig = ma_device_config_init(ma_device_type_playback);
+     deviceConfig.playback.format   = ma_format_f32;
+     deviceConfig.playback.channels = 2;
++    // MiSTer's FPGA ALSA consumer is fixed at 48 kHz.  Pin the producer to the
++    // same rate instead of relying on backend negotiation.
++    deviceConfig.sampleRate        = 48000;
+     deviceConfig.periods           = 3;
+     deviceConfig.periodSizeInMilliseconds = 10;
+     deviceConfig.dataCallback = measuredAudioCallback;
+@@ -158,7 +161,6 @@ static void maInit(AudioSystem* audio, DataWin* dataWin, FileSystem* fileSystem)
+     ma->nonSilentCallbacks = 0;
+     ma->peakMicrounits = 0;
+     ma->outputLogElapsed = 0.0f;
+-
+     memset(ma->instances, 0, sizeof(ma->instances));
+     ma->nextInstanceCounter = 0;
+     ma->forcedSlot = -1;
+@@ -194,7 +196,6 @@ static void maDestroy(AudioSystem* audio) {
+         ma_device_uninit(&ma->device);
+         ma->runtimeInitialized = false;
+     }
+-
+     // Free stream entries
+     repeat(MAX_AUDIO_STREAMS, i) {
+         if (ma->streams[i].active) {

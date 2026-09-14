@@ -1,0 +1,317 @@
+diff --git a/src/am2r_savestate.h b/src/am2r_savestate.h
+index c63ea32..bf2f45e 100644
+--- a/src/am2r_savestate.h
++++ b/src/am2r_savestate.h
+@@ -4,7 +4,9 @@
+ #include <stdint.h>
+ 
+ #define AM2R_STATE_MAGIC 0x53523241u /* "A2RS" little-endian */
+-#define AM2R_STATE_FD_ENV "AM2R_STATE_FD"
++#define AM2R_STATE_WRAPPER_SOCKET "/tmp/am2r-state-wrapper.sock"
++#define AM2R_STATE_RUNNER_SOCKET "/tmp/am2r-state-runner.sock"
++#define AM2R_STATE_RESUME_PATH "/tmp/am2r-state-resume"
+ #define AM2R_STATE_SLOT_COUNT 4
+ 
+ typedef enum {
+diff --git a/src/backends/mister.c b/src/backends/mister.c
+index 42f4f4c..d4f4a5a 100644
+--- a/src/backends/mister.c
++++ b/src/backends/mister.c
+@@ -86,6 +86,19 @@ static int32_t g_next_width = 0;
+ static int32_t g_next_height = 0;
+ static bool g_initialized = false;
+ 
++static bool openJoyShared(void);
++
++static void closeJoyShared(void) {
++    if (g_joy_shm != NULL) {
++        munmap((void *)g_joy_shm, sizeof(Am2rJoyShm));
++        g_joy_shm = NULL;
++    }
++    if (g_joy_fd >= 0) {
++        close(g_joy_fd);
++        g_joy_fd = -1;
++    }
++}
++
+ static void* mapPhysical(int fd, uint32_t address, size_t bytes) {
+     void* result = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, address);
+     return result == MAP_FAILED ? NULL : result;
+@@ -395,10 +408,17 @@ void MisterGpu_useSoftwareFrame(void) {
+ 
+ bool MisterGpu_prepareSaveState(void) {
+     if (!g_gpu_available) return true;
+-    return waitGpuCompletion(NULL);
++    if (!waitGpuCompletion(NULL)) return false;
++
++    // The wrapper owns and recreates this shared file on every core launch.
++    // Never ask DMTCP to restore a mapping to the previous launch's inode.
++    closeJoyShared();
++    return true;
+ }
+ 
+ void MisterGpu_afterSaveStateRestore(void) {
++    if (g_joy_shm == NULL && !openJoyShared())
++        logWarn("MiSTer input: shared controller could not be reattached\n");
+     if (!g_gpu_available) return;
+ 
+     // The CPU address space came from the selected snapshot, while the shared
+@@ -587,14 +607,7 @@ void platformExit(void) {
+         close(g_input_fd);
+         g_input_fd = -1;
+     }
+-    if (g_joy_shm != NULL) {
+-        munmap((void *)g_joy_shm, sizeof(Am2rJoyShm));
+-        g_joy_shm = NULL;
+-    }
+-    if (g_joy_fd >= 0) {
+-        close(g_joy_fd);
+-        g_joy_fd = -1;
+-    }
++    closeJoyShared();
+     if (g_gpu_textures != NULL) { munmap(g_gpu_textures, GPU_TEXTURE_BYTES); g_gpu_textures = NULL; }
+     for (uint32_t i = 0; i < GPU_COMMAND_BUFFER_COUNT; ++i) {
+         if (g_gpu_command_buffers[i] != NULL) {
+diff --git a/src/loop.c b/src/loop.c
+index 1928692..a6d115d 100644
+--- a/src/loop.c
++++ b/src/loop.c
+@@ -68,8 +68,9 @@
+ #include "am2r_savestate.h"
+ #include "backends/mister_gpu.h"
+ #include <sys/socket.h>
+-#include <sys/prctl.h>
++#include <sys/syscall.h>
+ #include <sys/types.h>
++#include <sys/un.h>
+ #endif
+ 
+ #ifdef PLATFORM_VITA
+@@ -482,6 +483,7 @@ static void PreProcessedStuff_free(void) {
+ 
+ #ifdef USE_MISTER
+ static int am2rStateFd = -1;
++static struct sockaddr_un am2rStateWrapperAddress;
+ static volatile sig_atomic_t am2rStateSignalAction = 0;
+ static volatile sig_atomic_t am2rStateSignalSlot = 0;
+ 
+@@ -496,22 +498,51 @@ static void am2rStateSignalHandler(int signalNumber) {
+     }
+ }
+ 
++static void am2rStateClose(void) {
++    // The control endpoint is deliberately invisible to DMTCP's socket
++    // plugin. Unix datagrams are unsupported there, and retaining their
++    // connection metadata makes an otherwise valid image crash on restart.
++    // This endpoint is always closed before capture and recreated afterward.
++    if (am2rStateFd >= 0) syscall(SYS_close, am2rStateFd);
++    am2rStateFd = -1;
++    unlink(AM2R_STATE_RUNNER_SOCKET);
++}
++
++static bool am2rStateOpen(void) {
++    am2rStateClose();
++    am2rStateFd = (int)syscall(SYS_socket, AF_UNIX, SOCK_DGRAM, 0);
++    if (am2rStateFd < 0) return false;
++
++    struct sockaddr_un runnerAddress = {0};
++    runnerAddress.sun_family = AF_UNIX;
++    strncpy(runnerAddress.sun_path, AM2R_STATE_RUNNER_SOCKET,
++            sizeof(runnerAddress.sun_path) - 1);
++    if (syscall(SYS_bind, am2rStateFd, (struct sockaddr*)&runnerAddress,
++                sizeof(runnerAddress)) != 0) {
++        am2rStateClose();
++        return false;
++    }
++    int flags = (int)syscall(SYS_fcntl, am2rStateFd, F_GETFL, 0);
++    if (flags >= 0)
++        syscall(SYS_fcntl, am2rStateFd, F_SETFL, flags | O_NONBLOCK);
++
++    memset(&am2rStateWrapperAddress, 0, sizeof(am2rStateWrapperAddress));
++    am2rStateWrapperAddress.sun_family = AF_UNIX;
++    strncpy(am2rStateWrapperAddress.sun_path, AM2R_STATE_WRAPPER_SOCKET,
++            sizeof(am2rStateWrapperAddress.sun_path) - 1);
++    return true;
++}
++
+ static void am2rStateInit(void) {
+-    const char* value = getenv(AM2R_STATE_FD_ENV);
+-    if (value == nullptr || value[0] == '\0') return;
+-    char* end = nullptr;
+-    long fd = strtol(value, &end, 10);
+-    if (end == value || *end != '\0' || fd < 0 || fd > INT32_MAX) return;
+-    am2rStateFd = (int)fd;
+-    int flags = fcntl(am2rStateFd, F_GETFL, 0);
+-    if (flags >= 0) fcntl(am2rStateFd, F_SETFL, flags | O_NONBLOCK);
+-    signal(SIGCHLD, SIG_IGN);
+     struct sigaction action = {0};
+     action.sa_handler = am2rStateSignalHandler;
+     sigemptyset(&action.sa_mask);
+     for (int i = 0; i < AM2R_STATE_SLOT_COUNT * 2; ++i)
+         sigaction(SIGRTMIN + i, &action, nullptr);
+-    logInfo("AM2R save states: four RAM slots enabled (protocol fd %d)\n", am2rStateFd);
++    if (am2rStateOpen())
++        logInfo("AM2R save states: four persistent slots enabled\n");
++    else
++        logWarn("AM2R save states: control socket unavailable: %s\n", strerror(errno));
+ }
+ 
+ static bool am2rStateSend(Am2rStateMessageType type, int slot, int frame, int error) {
+@@ -524,16 +555,36 @@ static bool am2rStateSend(Am2rStateMessageType type, int slot, int frame, int er
+         .frame = frame,
+         .error = error,
+     };
+-    return send(am2rStateFd, &message, sizeof(message), MSG_NOSIGNAL) == (ssize_t)sizeof(message);
++    return syscall(SYS_sendto, am2rStateFd, &message, sizeof(message), MSG_NOSIGNAL,
++                   (struct sockaddr*)&am2rStateWrapperAddress,
++                   sizeof(am2rStateWrapperAddress)) == (ssize_t)sizeof(message);
+ }
+ 
+ static bool am2rStateReceive(Am2rStateMessage* message) {
+     if (am2rStateFd < 0) return false;
+-    ssize_t count = recv(am2rStateFd, message, sizeof(*message), MSG_DONTWAIT);
++    ssize_t count = syscall(SYS_recvfrom, am2rStateFd, message, sizeof(*message),
++                            MSG_DONTWAIT, nullptr, nullptr);
+     return count == (ssize_t)sizeof(*message) && message->magic == AM2R_STATE_MAGIC;
+ }
+ 
+-// Returns true only in a snapshot process that has just been restored.
++static int am2rStateWaitForResume(void) {
++    // The wrapper creates this marker only after the checkpoint image has been
++    // completely copied into its durable slot. The same wait is restored from
++    // disk, so no inherited pipe or socket is required across a core exit.
++    for (int wait = 0; wait < 180000; ++wait) {
++        int marker = open(AM2R_STATE_RESUME_PATH, O_RDONLY);
++        if (marker >= 0) {
++            char result[24] = {0};
++            ssize_t count = read(marker, result, sizeof(result) - 1);
++            close(marker);
++            unlink(AM2R_STATE_RESUME_PATH);
++            return count > 0 ? atoi(result) : EIO;
++        }
++        usleep(1000);
++    }
++    return ETIMEDOUT;
++}
++
+ static bool am2rStateSave(Runner* runner, int slot) {
+ #ifdef USE_MINIAUDIO
+     if (!MaAudioSystem_prepareSaveState(runner->audioSystem)) {
+@@ -553,70 +604,50 @@ static bool am2rStateSave(Runner* runner, int slot) {
+         return false;
+     }
+     fflush(nullptr);
+-
+-    pid_t snapshot = fork();
+-    if (snapshot < 0) {
++    unlink(AM2R_STATE_RESUME_PATH);
++    if (!am2rStateSend(AM2R_STATE_SNAPSHOT_READY, slot, runner->frameCount, 0)) {
+         int savedError = errno;
+ #ifdef USE_MINIAUDIO
+         MaAudioSystem_restoreSaveState(runner->audioSystem);
+ #else
+         runner->audioSystem->vtable->resume(runner->audioSystem);
+ #endif
+-        am2rStateSend(AM2R_STATE_SNAPSHOT_ERROR, slot, runner->frameCount, savedError);
+-        logWarn("AM2R save state %d failed: %s\n", slot + 1, strerror(savedError));
++        logWarn("AM2R save state %d could not reach wrapper: %s\n",
++                slot + 1, strerror(savedError));
+         return false;
+     }
+ 
+-    if (snapshot == 0) {
+-        // A loaded slot is cloned again before it resumes, so loading is
+-        // non-destructive and behaves like the four reusable slots in NES.
+-        for (;;) {
+-            am2rStateSend(AM2R_STATE_SNAPSHOT_READY, slot, runner->frameCount, 0);
+-            raise(SIGSTOP);
+-            int parentSignal = 0;
+-            prctl(PR_GET_PDEATHSIG, &parentSignal);
+-            logError("AM2R save state %d resume stage=awake pid=%d ppid=%d pdeath=%d\n",
+-                     slot + 1, (int)getpid(), (int)getppid(), parentSignal);
+-            pid_t retained = fork();
+-            if (retained == 0) continue;
+-            if (retained < 0)
+-                am2rStateSend(AM2R_STATE_SNAPSHOT_ERROR, slot, runner->frameCount, errno);
+-            break;
+-        }
+-        logError("AM2R save state %d resume stage=gpu-begin pid=%d\n", slot + 1, (int)getpid());
+-        MisterGpu_afterSaveStateRestore();
+-        logError("AM2R save state %d resume stage=gpu-done pid=%d\n", slot + 1, (int)getpid());
++    // External endpoints and audio threads must not be captured. DMTCP saves
++    // this process while it is blocked below, then both the live and restored
++    // timelines reconnect to whichever native wrapper is currently running.
++    am2rStateClose();
++    int checkpointError = am2rStateWaitForResume();
++    MisterGpu_afterSaveStateRestore();
+ #ifdef USE_MINIAUDIO
+-        if (!MaAudioSystem_restoreSaveState(runner->audioSystem)) {
+-            am2rStateSend(AM2R_STATE_SNAPSHOT_ERROR, slot, runner->frameCount, EIO);
+-            _exit(125);
+-        }
++    bool audioRestored = MaAudioSystem_restoreSaveState(runner->audioSystem);
+ #else
+-        runner->audioSystem->vtable->resume(runner->audioSystem);
++    runner->audioSystem->vtable->resume(runner->audioSystem);
++    bool audioRestored = true;
+ #endif
+-        logError("AM2R save state %d resume stage=audio-done pid=%d\n", slot + 1, (int)getpid());
+-        am2rStateSend(AM2R_STATE_RESTORED, slot, runner->frameCount, 0);
+-        logInfo("AM2R save state %d restored at frame %d\n", slot + 1, runner->frameCount);
++    bool endpointRestored = am2rStateOpen();
++    if (checkpointError != 0 || !audioRestored || !endpointRestored) {
++        int savedError = checkpointError != 0 ? checkpointError : EIO;
++        am2rStateSend(AM2R_STATE_SNAPSHOT_ERROR, slot, runner->frameCount, savedError);
++        logWarn("AM2R save state %d failed after quiesce: %s\n",
++                slot + 1, strerror(savedError));
+         return true;
+     }
+-
+-#ifdef USE_MINIAUDIO
+-    if (!MaAudioSystem_restoreSaveState(runner->audioSystem)) {
+-        am2rStateSend(AM2R_STATE_SNAPSHOT_ERROR, slot, runner->frameCount, EIO);
+-        return false;
+-    }
+-#else
+-    runner->audioSystem->vtable->resume(runner->audioSystem);
+-#endif
+-    logInfo("AM2R save state %d captured at frame %d (snapshot pid %d)\n",
+-            slot + 1, runner->frameCount, (int)snapshot);
+-    return false;
++    am2rStateSend(AM2R_STATE_RESTORED, slot, runner->frameCount, 0);
++    logInfo("AM2R save state %d timeline resumed at frame %d\n",
++            slot + 1, runner->frameCount);
++    return true;
+ }
+ 
+ static void am2rStateLoad(Runner* runner, int slot) {
+     runner->audioSystem->vtable->suspend(runner->audioSystem);
+     if (!MisterGpu_prepareSaveState() ||
+         !am2rStateSend(AM2R_STATE_REQUEST_LOAD, slot, runner->frameCount, 0)) {
++        MisterGpu_afterSaveStateRestore();
+         runner->audioSystem->vtable->resume(runner->audioSystem);
+         logWarn("AM2R save state %d load request failed\n", slot + 1);
+         return;
+@@ -628,18 +659,20 @@ static void am2rStateLoad(Runner* runner, int slot) {
+         Am2rStateMessage response = {0};
+         if (am2rStateReceive(&response) && response.type == AM2R_STATE_LOAD_MISSING &&
+             response.slot == slot) {
++            MisterGpu_afterSaveStateRestore();
+             runner->audioSystem->vtable->resume(runner->audioSystem);
+             logWarn("AM2R save state %d is empty\n", slot + 1);
+             return;
+         }
+         usleep(1000);
+     }
++    MisterGpu_afterSaveStateRestore();
+     runner->audioSystem->vtable->resume(runner->audioSystem);
+     logWarn("AM2R save state %d load request timed out\n", slot + 1);
+ }
+ 
+ static bool am2rStatePoll(Runner* runner) {
+-    if (am2rStateFd < 0) return false;
++    if (am2rStateFd < 0 && !am2rStateOpen()) return false;
+ 
+     int action = 0;
+     int slot = -1;
+

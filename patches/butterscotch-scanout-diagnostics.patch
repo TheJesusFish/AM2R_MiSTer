@@ -1,0 +1,23 @@
+diff --git a/src/backends/mister.c b/src/backends/mister.c
+--- a/src/backends/mister.c
++++ b/src/backends/mister.c
+@@ -90,6 +90,7 @@ static uint32_t g_gpu_pending_sequence = 0;
+ static uint32_t g_gpu_last_completed_cycles = 0;
+ static uint8_t g_gpu_last_presented_buffer = 0;
+ static bool g_gpu_last_presented_valid = false;
++static bool g_gpu_scanout_underflow = false;
+ static bool g_gpu_pending = false;
+ static bool g_gpu_available = false;
+ static bool g_gpu_presented = false;
+@@ -153,7 +154,10 @@ static bool waitGpuCompletion(uint32_t* cycles) {
+             uint32_t completion = g_gpu_control[7];
+             g_gpu_last_presented_buffer = (uint8_t)(completion >> 31);
+             g_gpu_last_presented_valid = true;
+-            g_gpu_last_completed_cycles = completion & 0x7fffffffu;
++            g_gpu_scanout_underflow = (completion & 0x40000000u) != 0;
++            g_gpu_last_completed_cycles = completion & 0x3fffffffu;
++            if (g_gpu_scanout_underflow)
++                logWarn("MiSTer scanout FIFO underflow detected\n");
+             if (cycles != NULL) *cycles = g_gpu_last_completed_cycles;
+             g_gpu_pending = false;
+             return true;

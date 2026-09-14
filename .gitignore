@@ -1,0 +1,72 @@
+# Machine-local settings and credentials
+/.local/
+/.agents/
+/.codex/
+.DS_Store
+._*
+__MACOSX/
+/.idea/
+/.vscode/
+
+# Local data
+/data/
+
+# Machine-specific engineering instructions, target inventory, and test logs
+/AGENTS.md
+/bootstrap.md
+/config/
+/docs/environment.md
+/docs/hardware.md
+/docs/state.md
+/docs/user-test.md
+/reports/
+/scripts/mister_ssh.py
+
+# Fetched dependencies
+/third_party/*
+!/third_party/README.md
+
+# Local reference checkouts and ad-hoc synthesis workspaces
+/_reference_3s_mister_arm/
+/work_am2r_gpu/
+/work_am2r_sdram/
+
+# Release assets belong on the GitHub Releases page, not in source control
+/releases/*.zip
+/releases/*.rbf
+/releases/SHA256SUMS.txt
+
+# Common generated FPGA/Python products
+**/db/
+**/incremental_db/
+**/output_files/
+**/__pycache__/
+*.pyc
+*.rbf
+*.sof
+*.pof
+*.jic
+*.smsg
+*.qws
+*.wlf
+*.qdb
+*.qdf
+*.cdf
+*.vcd
+*.fst
+
+# Quartus/ModelSim root products
+/build_id.v
+/c5_pin_model_dump.txt
+/jtag.cdf
+/transcript
+/vsim.wlf
+/*.done
+/*.jdi
+/*.rpt
+/*.summary
+/*.bak
+/*.srf
+/.qsys_edit/
+/greybox_tmp/
+/simulation/

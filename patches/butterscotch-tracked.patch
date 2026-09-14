@@ -1,0 +1,424 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index f0081f3..0aad226 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -125,6 +125,7 @@ if(PLATFORM STREQUAL "switch")
+     set(ENABLE_LEGACY_GL OFF CACHE BOOL "Enable the legacy OpenGL renderer" FORCE)
+ endif()
+ option(ENABLE_MODERN_GL "Enable the modern OpenGL renderer" ON)
++option(ENABLE_SW_RENDERER "Enable the portable software renderer" OFF)
+ option(ENABLE_NOOP_RENDERER "Enable the no-op renderer (headless stub, no drawing)" OFF)
+ # Noop renderer is exclusive to the noop desktop backend (no window, no GL).
+ # Auto-enable for BACKEND=noop and reject otherwise.
+@@ -133,6 +134,12 @@ if(BACKEND STREQUAL "noop")
+     set(ENABLE_LEGACY_GL OFF CACHE BOOL "Enable the legacy OpenGL renderer" FORCE)
+     set(ENABLE_MODERN_GL OFF CACHE BOOL "Enable the modern OpenGL renderer" FORCE)
+ endif()
++if(BACKEND STREQUAL "mister")
++    set(ENABLE_SW_RENDERER ON CACHE BOOL "Enable the portable software renderer" FORCE)
++    set(ENABLE_NOOP_RENDERER OFF CACHE BOOL "Enable the no-op renderer (headless stub, no drawing)" FORCE)
++    set(ENABLE_LEGACY_GL OFF CACHE BOOL "Enable the legacy OpenGL renderer" FORCE)
++    set(ENABLE_MODERN_GL OFF CACHE BOOL "Enable the modern OpenGL renderer" FORCE)
++endif()
+ if(ENABLE_NOOP_RENDERER AND NOT BACKEND STREQUAL "noop")
+     message(FATAL_ERROR "ENABLE_NOOP_RENDERER is exclusive to BACKEND=noop")
+ endif()
+@@ -154,6 +161,9 @@ endif()
+ if(ENABLE_MODERN_GL)
+     add_compile_definitions(ENABLE_MODERN_GL)
+ endif()
++if(ENABLE_SW_RENDERER)
++    add_compile_definitions(ENABLE_SW_RENDERER)
++endif()
+ if(ENABLE_NOOP_RENDERER)
+     add_compile_definitions(ENABLE_NOOP_RENDERER)
+ endif()
+@@ -292,7 +302,7 @@ if(PLATFORM STREQUAL "cli" OR PLATFORM STREQUAL "vita" OR PLATFORM STREQUAL "swi
+     # Matches the GitHub Actions container flags (FORTIFY requires building with optimizations enabled!)
+     target_compile_options(butterscotch PRIVATE "$<$<CONFIG:Release,RelWithDebInfo>:-U_FORTIFY_SOURCE;-D_FORTIFY_SOURCE=2>")
+ 
+-    if(NOT ENABLE_LEGACY_GL AND NOT ENABLE_MODERN_GL AND NOT ENABLE_NOOP_RENDERER)
++    if(NOT ENABLE_LEGACY_GL AND NOT ENABLE_MODERN_GL AND NOT ENABLE_SW_RENDERER AND NOT ENABLE_NOOP_RENDERER)
+         message(FATAL_ERROR "You must enable at least one renderer!")
+     endif()
+     file(GLOB GL_SOURCES src/image/*.c src/gl_common/*.c)
+@@ -419,6 +429,11 @@ if(PLATFORM STREQUAL "cli" OR PLATFORM STREQUAL "vita" OR PLATFORM STREQUAL "swi
+         endif()
+         add_compile_definitions(USE_NOOP)
+         set(BACKEND_LIBRARIES "")
++    elseif(BACKEND STREQUAL "mister")
++        add_compile_definitions(USE_MISTER)
++        set(BACKEND_LIBRARIES "")
++    else()
++        message(FATAL_ERROR "Unknown desktop backend: ${BACKEND}")
+     endif()
+     if (PLATFORM STREQUAL "vita")
+         target_link_libraries(butterscotch PRIVATE
+diff --git a/src/audio/miniaudio/ma_audio_system.c b/src/audio/miniaudio/ma_audio_system.c
+index f05db54..acda180 100644
+--- a/src/audio/miniaudio/ma_audio_system.c
++++ b/src/audio/miniaudio/ma_audio_system.c
+@@ -95,18 +95,41 @@ static char* resolveExternalPath(MaAudioSystem* ma, Sound* sound) {
+ 
+ // ===[ Vtable Implementations ]===
+ 
++static void measuredAudioCallback(ma_device* device, void* output,
++                                  const void* input, ma_uint32 frameCount) {
++    (void)input;
++    MaAudioSystem* ma = (MaAudioSystem*)device->pUserData;
++    ma_engine_read_pcm_frames(&ma->engine, output, frameCount, NULL);
++    const float* samples = (const float*)output;
++    float peak = 0.0f;
++    for (ma_uint32 i = 0; i < frameCount * 2; ++i) {
++        float magnitude = samples[i] < 0.0f ? -samples[i] : samples[i];
++        if (magnitude > peak) peak = magnitude;
++    }
++    uint32_t scaled = peak >= 1.0f ? 1000000u : (uint32_t)(peak * 1000000.0f);
++    __atomic_fetch_add(&ma->outputFrames, frameCount, __ATOMIC_RELAXED);
++    if (scaled != 0) __atomic_fetch_add(&ma->nonSilentCallbacks, 1, __ATOMIC_RELAXED);
++    uint32_t previous = __atomic_load_n(&ma->peakMicrounits, __ATOMIC_RELAXED);
++    while (scaled > previous && !__atomic_compare_exchange_n(&ma->peakMicrounits,
++           &previous, scaled, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
++}
++
+ static void maInit(AudioSystem* audio, DataWin* dataWin, FileSystem* fileSystem) {
+     MaAudioSystem* ma = (MaAudioSystem*) audio;
+     arrput(ma->base.audioGroups, dataWin);
+     ma->fileSystem = fileSystem;
++    ma->outputFrames = 0;
++    ma->nonSilentCallbacks = 0;
++    ma->peakMicrounits = 0;
++    ma->outputLogElapsed = 0.0f;
+ 
+     ma_device_config deviceConfig = ma_device_config_init(ma_device_type_playback);
+     deviceConfig.playback.format   = ma_format_f32;
+     deviceConfig.playback.channels = 2;
+     deviceConfig.periods           = 3;
+     deviceConfig.periodSizeInMilliseconds = 10;
+-    deviceConfig.dataCallback = ma_engine_data_callback_internal;
+-    deviceConfig.pUserData    = &ma->engine;
++    deviceConfig.dataCallback = measuredAudioCallback;
++    deviceConfig.pUserData    = ma;
+     ma_result deviceResult = ma_device_init(NULL, &deviceConfig, &ma->device);
+     if (deviceResult != MA_SUCCESS) {
+         logError("Audio: Failed to initialize playback device (error %d)\n", deviceResult);
+@@ -174,6 +197,15 @@ static void maDestroy(AudioSystem* audio) {
+ 
+ static void maUpdate(AudioSystem* audio, float deltaTime) {
+     MaAudioSystem* ma = (MaAudioSystem*) audio;
++    ma->outputLogElapsed += deltaTime;
++    if (ma->outputLogElapsed >= 5.0f) {
++        uint64_t frames = __atomic_load_n(&ma->outputFrames, __ATOMIC_RELAXED);
++        uint32_t active = __atomic_load_n(&ma->nonSilentCallbacks, __ATOMIC_RELAXED);
++        uint32_t peak = __atomic_exchange_n(&ma->peakMicrounits, 0, __ATOMIC_RELAXED);
++        logInfo("Audio output: %llu frames, non-silent callbacks=%u, peak=%.4f\n",
++                (unsigned long long)frames, active, peak / 1000000.0f);
++        ma->outputLogElapsed = 0.0f;
++    }
+ 
+     repeat(MAX_SOUND_INSTANCES, i) {
+         SoundInstance* inst = &ma->instances[i];
+diff --git a/src/audio/miniaudio/ma_audio_system.h b/src/audio/miniaudio/ma_audio_system.h
+index a7620cc..b005fef 100644
+--- a/src/audio/miniaudio/ma_audio_system.h
++++ b/src/audio/miniaudio/ma_audio_system.h
+@@ -45,6 +45,10 @@ typedef struct {
+     AudioStreamEntry streams[MAX_AUDIO_STREAMS];
+     ma_sound_group listenerGroups[MAX_LISTENERS];
+     float listenerGains[MAX_LISTENERS];
++    volatile uint64_t outputFrames;
++    volatile uint32_t nonSilentCallbacks;
++    volatile uint32_t peakMicrounits;
++    float outputLogElapsed;
+ } MaAudioSystem;
+ 
+ MaAudioSystem* MaAudioSystem_create(DataWin* dataWin);
+diff --git a/src/runner.c b/src/runner.c
+index 8a92af2..acb9ce6 100644
+--- a/src/runner.c
++++ b/src/runner.c
+@@ -2123,6 +2123,7 @@ void Runner_reset(Runner* runner) {
+     runner->pendingRoom = -1;
+     runner->asyncLoadMapId = -1;
+     runner->asyncBufferNextRequestId = 1;
++    runner->dialogAsyncIdCounter = 1;
+     runner->xboxAccountPickerPendingId = -1;
+     runner->xboxAccountPickerPadIndex = 0;
+     runner->xboxAsyncIdCounter = 1;
+diff --git a/src/runner.h b/src/runner.h
+index 1a7fbef..4982b56 100644
+--- a/src/runner.h
++++ b/src/runner.h
+@@ -740,6 +740,9 @@ struct Runner {
+     AsyncSaveLoadCompletion* asyncSaveLoadQueue;  // stb_ds array of completions waiting to fire their event
+     int32_t asyncBufferNextRequestId;             // monotonic request id handed out per kicked group/op
+ 
++    // Monotonic ID returned by non-interactive dialog fallbacks.
++    int32_t dialogAsyncIdCounter;
++
+     // Pending Xbox One account-picker async result.
+     int32_t xboxAccountPickerPendingId; // -1 when nothing is pending
+     int32_t xboxAccountPickerPadIndex; // pad index reported back in the async map
+diff --git a/src/vm_builtins.c b/src/vm_builtins.c
+index 424fa26..413f27f 100644
+--- a/src/vm_builtins.c
++++ b/src/vm_builtins.c
+@@ -33,6 +33,7 @@
+ #include "sha1.h"
+ #include "base64.h"
+ #include "gettime.h"
++#include "stb_image_write.h"
+ 
+ #if defined(__GNUC__) || defined(__clang__)
+ #pragma GCC diagnostic ignored "-Wunused-parameter"
+@@ -4385,7 +4386,15 @@ static RValue builtin_os_get_region(MAYBE_UNUSED VMContext* ctx, MAYBE_UNUSED RV
+     return RValue_makeOwnedString(safeStrdup("US"));
+ }
+ 
++#ifdef USE_MISTER
++static RValue builtin_os_is_paused(MAYBE_UNUSED VMContext* ctx,
++                                   MAYBE_UNUSED RValue* args,
++                                   MAYBE_UNUSED int32_t argCount) {
++    return RValue_makeBool(false);
++}
++#else
+ STUB_RETURN_FALSE(os_is_paused)
++#endif
+ 
+ // ===[ XBOX ONE FUNCTIONS ]===
+ 
+@@ -7459,6 +7468,32 @@ static RValue builtin_file_text_open_write(VMContext* ctx, RValue* args, int32_t
+     return RValue_makeReal((GMLReal) slot);
+ }
+ 
++static RValue builtin_gamepad_set_vibration(MAYBE_UNUSED VMContext* ctx,
++                                             MAYBE_UNUSED RValue* args,
++                                             MAYBE_UNUSED int32_t argCount) {
++    // MiSTer's framebuffer virtual controller does not expose force feedback.
++    return RValue_makeUndefined();
++}
++
++static RValue builtin_file_text_open_append(VMContext* ctx, RValue* args, int32_t argCount) {
++    if (argCount < 1) return RValue_makeReal(-1.0);
++    const char* path = (args[0].type == RVALUE_STRING ? args[0].string : "");
++    Runner* runner = ctx->runner;
++    int32_t slot = findFreeTextFileSlot(runner);
++    if (slot < 0) {
++        logError("Too many open text files!\n");
++        abort();
++    }
++    char* existing = runner->fileSystem->vtable->readFileText(runner->fileSystem, path);
++    OpenTextFile file = {0};
++    file.writeBuffer = existing != nullptr ? existing : safeStrdup("");
++    file.filePath = safeStrdup(path);
++    file.isWriteMode = true;
++    file.isOpen = true;
++    runner->openTextFiles[slot] = file;
++    return RValue_makeReal((GMLReal)slot);
++}
++
+ static RValue builtin_file_text_close(VMContext* ctx, RValue* args, int32_t argCount) {
+     if (1 > argCount) return RValue_makeUndefined();
+     Runner* runner = ctx->runner;
+@@ -7634,6 +7669,38 @@ static RValue builtin_file_delete(VMContext* ctx, RValue* args, int32_t argCount
+     return RValue_makeUndefined();
+ }
+ 
++// MiSTer has no window-system dialog. Preserve the game-visible call and
++// request ID while sending the message to the launch log/terminal.
++static RValue builtin_show_message(VMContext* ctx, RValue* args, int32_t argCount) {
++    if (argCount > 0) {
++        char* message = RValue_toString(args[0], ctx->runner->dataWin);
++        logInfo("Game message: %s\n", message);
++        free(message);
++    }
++    return RValue_makeUndefined();
++}
++
++static RValue builtin_show_message_async(VMContext* ctx, RValue* args, int32_t argCount) {
++    builtin_show_message(ctx, args, argCount);
++    return RValue_makeReal((GMLReal) ctx->runner->dialogAsyncIdCounter++);
++}
++
++static RValue builtin_file_copy(VMContext* ctx, RValue* args, int32_t argCount) {
++    if (argCount < 2) return RValue_makeUndefined();
++    char* source = RValue_toString(args[0], ctx->runner->dataWin);
++    char* destination = RValue_toString(args[1], ctx->runner->dataWin);
++    FileSystem* fs = ctx->runner->fileSystem;
++    uint8_t* data = nullptr;
++    int32_t size = 0;
++    if (fs->vtable->readFileBinary(fs, source, &data, &size)) {
++        fs->vtable->writeFileBinary(fs, destination, data, size);
++        free(data);
++    }
++    free(source);
++    free(destination);
++    return RValue_makeUndefined();
++}
++
+ // ===[ File Find Functions ]===
+ 
+ // Case-sensitive `*` / `?` wildcard match:
+@@ -8079,9 +8146,23 @@ static RValue builtin_joystick_axes(VMContext* ctx, RValue* args, MAYBE_UNUSED i
+     return RValue_makeReal(RunnerGamepad_getAxisCount(runner->gamepads, id));
+ }
+ 
+-// Window stubs
++// MiSTer owns the physical display mode. Report its fixed fullscreen state
++// without warning games which harmlessly reapply their desktop preferences.
++#ifdef USE_MISTER
++static RValue builtin_window_get_fullscreen(MAYBE_UNUSED VMContext* ctx,
++                                            MAYBE_UNUSED RValue* args,
++                                            MAYBE_UNUSED int32_t argCount) {
++    return RValue_makeBool(true);
++}
++static RValue builtin_window_set_fullscreen(MAYBE_UNUSED VMContext* ctx,
++                                            MAYBE_UNUSED RValue* args,
++                                            MAYBE_UNUSED int32_t argCount) {
++    return RValue_makeUndefined();
++}
++#else
+ STUB_RETURN_ZERO(window_get_fullscreen)
+ STUB_RETURN_UNDEFINED(window_set_fullscreen)
++#endif
+ static RValue builtin_window_get_width(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
+     Runner* runner = ctx->runner;
+     if (runner != nullptr && runner->getWindowSize != nullptr) {
+@@ -10918,6 +10999,57 @@ static RValue builtin_surface_exists(VMContext* ctx, RValue* args, MAYBE_UNUSED
+     return RValue_makeReal(0.0);
+ }
+ 
++typedef struct {
++    uint8_t* data;
++    size_t size;
++    size_t capacity;
++} SurfacePngBuffer;
++
++static void surfacePngWrite(void* context, void* data, int size) {
++    SurfacePngBuffer* png = (SurfacePngBuffer*)context;
++    if (size <= 0) return;
++    size_t required = png->size + (size_t)size;
++    if (required > png->capacity) {
++        size_t capacity = png->capacity != 0 ? png->capacity : 4096;
++        while (capacity < required) capacity *= 2;
++        png->data = (uint8_t*)safeRealloc(png->data, capacity);
++        png->capacity = capacity;
++    }
++    memcpy(png->data + png->size, data, (size_t)size);
++    png->size = required;
++}
++
++static RValue builtin_surface_save(VMContext* ctx, RValue* args, int32_t argCount) {
++    if (argCount < 2 || args[1].type != RVALUE_STRING) return RValue_makeUndefined();
++    Runner* runner = ctx->runner;
++    Renderer* renderer = runner != nullptr ? runner->renderer : nullptr;
++    int32_t surfaceId = RValue_toInt32(args[0]);
++    if (renderer == nullptr || renderer->vtable->surfaceGetPixels == nullptr ||
++        !Renderer_surfaceExists(renderer, surfaceId)) return RValue_makeUndefined();
++
++    int32_t width = (int32_t)Renderer_getSurfaceWidth(renderer, surfaceId);
++    int32_t height = (int32_t)Renderer_getSurfaceHeight(renderer, surfaceId);
++    if (width <= 0 || height <= 0) return RValue_makeUndefined();
++
++    size_t pixelBytes = (size_t)width * (size_t)height * 4u;
++    uint8_t* pixels = (uint8_t*)safeMalloc(pixelBytes);
++    if (!renderer->vtable->surfaceGetPixels(renderer, surfaceId, pixels)) {
++        free(pixels);
++        return RValue_makeUndefined();
++    }
++
++    SurfacePngBuffer png = {0};
++    int encoded = stbi_write_png_to_func(surfacePngWrite, &png, width, height, 4,
++                                         pixels, width * 4);
++    free(pixels);
++    if (encoded && png.size <= INT32_MAX) {
++        FileSystem* fs = runner->fileSystem;
++        fs->vtable->writeFileBinary(fs, args[1].string, png.data, (int32_t)png.size);
++    }
++    free(png.data);
++    return RValue_makeUndefined();
++}
++
+ static RValue builtin_surface_set_target(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+     int32_t surfaceId = (int32_t) RValue_toReal(args[0]);
+ 
+@@ -11542,9 +11674,29 @@ static RValue builtin_color_get_value(MAYBE_UNUSED VMContext* ctx, RValue* args,
+     return RValue_makeReal(v);
+ }
+ 
+-// Display stubs
++// MiSTer is a fixed 320x240 fullscreen target; display_reset therefore has no
++// host mode to restore. Desktop backends retain their existing stub behavior.
++#ifdef USE_MISTER
++static RValue builtin_display_get_width(MAYBE_UNUSED VMContext* ctx,
++                                        MAYBE_UNUSED RValue* args,
++                                        MAYBE_UNUSED int32_t argCount) {
++    return RValue_makeReal(320.0);
++}
++static RValue builtin_display_get_height(MAYBE_UNUSED VMContext* ctx,
++                                         MAYBE_UNUSED RValue* args,
++                                         MAYBE_UNUSED int32_t argCount) {
++    return RValue_makeReal(240.0);
++}
++static RValue builtin_display_reset(MAYBE_UNUSED VMContext* ctx,
++                                    MAYBE_UNUSED RValue* args,
++                                    MAYBE_UNUSED int32_t argCount) {
++    return RValue_makeUndefined();
++}
++#else
+ STUB_RETURN_VALUE(display_get_width, 640.0)
+ STUB_RETURN_VALUE(display_get_height, 480.0)
++STUB_RETURN_UNDEFINED(display_reset)
++#endif
+ 
+ static int32_t resolveGuiWidth(Runner* runner) {
+     if (runner->guiWidth > 0) return runner->guiWidth;
+@@ -18539,6 +18691,8 @@ void VMBuiltins_registerAll(VMContext* ctx) {
+ 
+     // Core output
+     VM_registerBuiltin(ctx, "show_debug_message", builtin_show_debug_message);
++    VM_registerBuiltin(ctx, "show_message", builtin_show_message);
++    VM_registerBuiltin(ctx, "show_message_async", builtin_show_message_async);
+ 
+     // String functions
+     VM_registerBuiltin(ctx, "string_length", builtin_string_length);
+@@ -18949,6 +19103,7 @@ void VMBuiltins_registerAll(VMContext* ctx) {
+     VM_registerBuiltin(ctx, "gamepad_button_count", builtin_gamepad_button_count);
+     VM_registerBuiltin(ctx, "gamepad_hat_count", builtin_gamepad_hat_count);
+     VM_registerBuiltin(ctx, "gamepad_hat_value", builtin_gamepad_hat_value);
++    VM_registerBuiltin(ctx, "gamepad_set_vibration", builtin_gamepad_set_vibration);
+ 
+     // INI
+     VM_registerBuiltin(ctx, "ini_open", builtin_ini_open);
+@@ -18968,6 +19123,7 @@ void VMBuiltins_registerAll(VMContext* ctx) {
+     // File
+     VM_registerBuiltin(ctx, "file_exists", builtin_file_exists);
+     VM_registerBuiltin(ctx, "file_text_open_write", builtin_file_text_open_write);
++    VM_registerBuiltin(ctx, "file_text_open_append", builtin_file_text_open_append);
+     VM_registerBuiltin(ctx, "file_text_open_read", builtin_file_text_open_read);
+     VM_registerBuiltin(ctx, "file_text_close", builtin_file_text_close);
+     VM_registerBuiltin(ctx, "file_text_write_string", builtin_file_text_write_string);
+@@ -18975,6 +19131,7 @@ void VMBuiltins_registerAll(VMContext* ctx) {
+     VM_registerBuiltin(ctx, "file_text_write_real", builtin_file_text_write_real);
+     VM_registerBuiltin(ctx, "file_text_eof", builtin_file_text_eof);
+     VM_registerBuiltin(ctx, "file_delete", builtin_file_delete);
++    VM_registerBuiltin(ctx, "file_copy", builtin_file_copy);
+     VM_registerBuiltin(ctx, "file_find_first", builtin_file_find_first);
+     VM_registerBuiltin(ctx, "file_find_next", builtin_file_find_next);
+     VM_registerBuiltin(ctx, "file_find_close", builtin_file_find_close);
+@@ -19241,6 +19398,7 @@ void VMBuiltins_registerAll(VMContext* ctx) {
+     VM_registerBuiltin(ctx, "surface_resize", builtin_surface_resize);
+     VM_registerBuiltin(ctx, "surface_copy", builtin_surface_copy);
+     VM_registerBuiltin(ctx, "surface_copy_part", builtin_surface_copy_part);
++    VM_registerBuiltin(ctx, "surface_save", builtin_surface_save);
+ 
+     // Sprite info
+     VM_registerBuiltin(ctx, "sprite_add", builtin_sprite_add);
+@@ -19287,6 +19445,7 @@ void VMBuiltins_registerAll(VMContext* ctx) {
+     // Display
+     VM_registerBuiltin(ctx, "display_get_width", builtin_display_get_width);
+     VM_registerBuiltin(ctx, "display_get_height", builtin_display_get_height);
++    VM_registerBuiltin(ctx, "display_reset", builtin_display_reset);
+     VM_registerBuiltin(ctx, "display_get_gui_width", builtin_display_get_gui_width);
+     VM_registerBuiltin(ctx, "display_get_gui_height", builtin_display_get_gui_height);
+     VM_registerBuiltin(ctx, "display_set_gui_size", builtin_display_set_gui_size);

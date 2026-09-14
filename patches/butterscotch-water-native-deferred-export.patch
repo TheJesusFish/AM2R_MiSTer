@@ -1,0 +1,857 @@
+diff --git a/src/backends/mister.c b/src/backends/mister.c
+index c74e717..5676e73 100644
+--- a/src/backends/mister.c
++++ b/src/backends/mister.c
+@@ -45,6 +45,8 @@
+ #define GPU_TEXTURE_RECORDS 64
+ #define GPU_FUSED_PREFIX_COMMANDS 12u
+ #define GPU_FUSED_BASE_SOURCES 8u
++#define GPU_WATER_ROWS MISTER_HEIGHT
++#define GPU_WATER_MIN_RUN 8u
+ #define AM2R_JOY_SHM_PATH "/dev/shm/am2r-joy"
+ #define AM2R_JOY_SHM_ENV "AM2R_JOY_SHM"
+ #define AM2R_JOY_SHM_MAGIC 0x524a3241u
+@@ -106,6 +108,12 @@ static bool g_gpu_presented = false;
+ static bool g_gpu_software_frame = false;
+ static uint32_t g_gpu_submitted_frames = 0;
+ static uint32_t g_gpu_texture_generation = 0;
++static uint32_t g_gpu_deferred_exports[GPU_TEXTURE_RECORDS];
++static uint32_t g_gpu_deferred_export_count = 0;
++static bool g_gpu_frame_open = false;
++static uint32_t g_gpu_water_table_physical[GPU_COMMAND_BUFFER_COUNT] = { 0, 0 };
++static uint32_t g_gpu_water_table_rows = 0;
++static uint32_t g_gpu_water_direct_rows = 0;
+ static uint32_t *g_gpu_fused_base_pixels = NULL;
+ static MisterGpuCommand g_gpu_fused_base_commands[GPU_FUSED_PREFIX_COMMANDS];
+ static uint32_t g_gpu_fused_base_command_count = 0;
+@@ -325,6 +333,20 @@ void MisterGpu_beginFrame(void) {
+     g_gpu_frame_serial++;
+     if (g_gpu_frame_serial == 0) g_gpu_frame_serial = 1;
+     g_gpu_command_count = 0;
++    g_gpu_frame_open = true;
++    // GameMaker Step events run before the renderer opens the next frame.
++    // AM2R's water effect snapshots application_surface there, while the FPGA
++    // render target still contains the completed prior frame.  Preserve those
++    // requests and execute them before this frame's clear/draw commands.
++    for (uint32_t i = 0; i < g_gpu_deferred_export_count; ++i) {
++        MisterGpuCommand* command = &g_gpu_commands[g_gpu_command_count++];
++        memset(command, 0, sizeof(*command));
++        command->word[0] = 6u;
++        command->word[1] = g_gpu_deferred_exports[i];
++    }
++    g_gpu_deferred_export_count = 0;
++    g_gpu_water_table_rows = 0;
++    g_gpu_water_direct_rows = 0;
+     g_gpu_presented = false;
+     g_gpu_software_frame = false;
+ }
+@@ -793,6 +815,166 @@ static int32_t gpuFixedFloor(int32_t value) {
+     return (int32_t)(-((-(int64_t)value + 65535) / 65536));
+ }
+ 
++typedef struct {
++    int16_t destination_x;
++    int16_t destination_y;
++    uint16_t width;
++    uint16_t source_x;
++    uint16_t source_y;
++    uint32_t source;
++    uint32_t stride;
++    uint32_t tint;
++} MisterGpuWaterRow;
++
++static bool decodeFusibleWaterRow(const MisterGpuCommand *command,
++                                  MisterGpuWaterRow *row) {
++    if (command == NULL || row == NULL ||
++        (command->word[0] & 0x1ffu) != 2u ||
++        (uint16_t)(command->word[0] >> 32) != 1u ||
++        command->word[3] != 0 || command->word[7] != 0)
++        return false;
++
++    uint16_t width = (uint16_t)(command->word[0] >> 16);
++    int16_t destinationX = (int16_t)command->word[2];
++    int16_t destinationY = (int16_t)(command->word[2] >> 16);
++    uint32_t source = (uint32_t)command->word[1];
++    uint32_t stride = (uint32_t)(command->word[1] >> 32);
++    int32_t uStart = (int32_t)command->word[4];
++    int32_t vStart = (int32_t)(command->word[4] >> 32);
++    int32_t uStep = (int32_t)command->word[5];
++    uint32_t tint = (uint32_t)command->word[6];
++    int32_t sourceX = gpuFixedFloor(uStart);
++    int32_t sourceY = gpuFixedFloor(vStart);
++
++    // This command is deliberately narrow: it represents the full-screen
++    // white-alpha scanline copies produced by AM2R's water shader substitute.
++    // The FPGA batch engine consumes complete 320-pixel source rows, so reject
++    // anything with clipping, another blend mode, or a different source layout.
++    if (width == 0 || width > MISTER_WIDTH || stride != MISTER_WIDTH * 4u ||
++        tint != 0x33ffffffu ||
++        destinationX < 0 || destinationY < 0 ||
++        destinationX + (int32_t)width > MISTER_WIDTH ||
++        destinationY >= MISTER_HEIGHT ||
++        sourceX < 0 || sourceY < 0 ||
++        sourceX + (int32_t)width > MISTER_WIDTH)
++        return false;
++
++    uint64_t firstByte = (uint64_t)source + (uint64_t)sourceY * stride;
++    uint64_t lastByte = firstByte + MISTER_WIDTH * 4u;
++    if (source < GPU_TEXTURE_PHYS || firstByte < GPU_TEXTURE_PHYS ||
++        lastByte > (uint64_t)GPU_TEXTURE_PHYS + GPU_TEXTURE_BYTES)
++        return false;
++
++    // The compact hardware engine assumes one consecutive source pixel per
++    // destination pixel. Verify the exact 16.16 floors rather than assuming a
++    // nearly-unit derivative is harmless; exceptional rows retain opcode 2.
++    for (uint32_t x = 0; x < width; ++x) {
++        int64_t coordinate = (int64_t)uStart + (int64_t)x * uStep;
++        if (coordinate < INT32_MIN || coordinate > INT32_MAX ||
++            gpuFixedFloor((int32_t)coordinate) != sourceX + (int32_t)x)
++            return false;
++    }
++
++    row->destination_x = destinationX;
++    row->destination_y = destinationY;
++    row->width = width;
++    row->source_x = (uint16_t)sourceX;
++    row->source_y = (uint16_t)sourceY;
++    row->source = source;
++    row->stride = stride;
++    row->tint = tint;
++    return true;
++}
++
++static uint32_t tryFuseWaterEffect(void) {
++    uint32_t readIndex = 0;
++    uint32_t writeIndex = 0;
++    uint32_t tableRows = g_gpu_water_table_rows;
++    uint32_t fusedRows = g_gpu_water_direct_rows;
++
++    while (readIndex < g_gpu_command_count) {
++        MisterGpuWaterRow first;
++        if (!decodeFusibleWaterRow(&g_gpu_commands[readIndex], &first)) {
++            if (writeIndex != readIndex)
++                g_gpu_commands[writeIndex] = g_gpu_commands[readIndex];
++            writeIndex++;
++            readIndex++;
++            continue;
++        }
++
++        uint32_t runEnd = readIndex + 1u;
++        MisterGpuWaterRow previous = first;
++        while (runEnd < g_gpu_command_count) {
++            MisterGpuWaterRow next;
++            if (!decodeFusibleWaterRow(&g_gpu_commands[runEnd], &next) ||
++                next.source != first.source || next.stride != first.stride ||
++                next.tint != first.tint ||
++                next.destination_y != previous.destination_y + 1)
++                break;
++            previous = next;
++            runEnd++;
++        }
++
++        uint32_t runRows = runEnd - readIndex;
++        if (runRows < GPU_WATER_MIN_RUN ||
++            runRows > GPU_WATER_ROWS - tableRows) {
++            while (readIndex < runEnd) {
++                if (writeIndex != readIndex)
++                    g_gpu_commands[writeIndex] = g_gpu_commands[readIndex];
++                writeIndex++;
++                readIndex++;
++            }
++            continue;
++        }
++
++        if (g_gpu_water_table_physical[g_gpu_write_buffer] == 0) {
++            uint32_t physical = reserveGpuTexture(GPU_WATER_ROWS * sizeof(uint64_t));
++            if (physical == 0) {
++                while (readIndex < g_gpu_command_count) {
++                    if (writeIndex != readIndex)
++                        g_gpu_commands[writeIndex] = g_gpu_commands[readIndex];
++                    writeIndex++;
++                    readIndex++;
++                }
++                break;
++            }
++            g_gpu_water_table_physical[g_gpu_write_buffer] = physical;
++        }
++
++        uint32_t tablePhysical =
++            g_gpu_water_table_physical[g_gpu_write_buffer] +
++            tableRows * (uint32_t)sizeof(uint64_t);
++        uint64_t *table = (uint64_t *)(g_gpu_textures +
++            (tablePhysical - GPU_TEXTURE_PHYS));
++        for (uint32_t i = 0; i < runRows; ++i) {
++            MisterGpuWaterRow row;
++            if (!decodeFusibleWaterRow(&g_gpu_commands[readIndex + i], &row))
++                return fusedRows;
++            table[i] = (uint16_t)row.destination_x |
++                       ((uint64_t)row.width << 16) |
++                       ((uint64_t)row.source_x << 32) |
++                       ((uint64_t)row.source_y << 48);
++        }
++
++        MisterGpuCommand fused;
++        memset(&fused, 0, sizeof(fused));
++        fused.word[0] = 7u | ((uint64_t)runRows << 16);
++        fused.word[1] = first.source | ((uint64_t)first.stride << 32);
++        fused.word[2] = tablePhysical |
++                        ((uint64_t)(uint16_t)first.destination_y << 32);
++        fused.word[6] = first.tint;
++        g_gpu_commands[writeIndex++] = fused;
++        tableRows += runRows;
++        fusedRows += runRows;
++        readIndex = runEnd;
++    }
++
++    g_gpu_command_count = writeIndex;
++    g_gpu_water_table_rows = tableRows;
++    if (fusedRows != 0) __sync_synchronize();
++    return fusedRows;
++}
++
+ #if defined(__ARM_NEON)
+ static uint8x8_t neonScaleFloor255(uint8x8_t values, uint8_t multiplier) {
+     uint16x8_t product = vmull_u8(values, vdup_n_u8(multiplier));
+@@ -1786,8 +1968,16 @@ bool MisterGpu_addAffineBlit(uint32_t source, uint32_t stride,
+ }
+ 
+ bool MisterGpu_addFramebufferExport(uint32_t destination) {
+-    if (!g_gpu_available || destination == 0 ||
+-        g_gpu_command_count >= GPU_COMMAND_CAPACITY) return false;
++    if (!g_gpu_available || destination == 0) return false;
++    if (!g_gpu_frame_open) {
++        for (uint32_t i = 0; i < g_gpu_deferred_export_count; ++i) {
++            if (g_gpu_deferred_exports[i] == destination) return true;
++        }
++        if (g_gpu_deferred_export_count >= GPU_TEXTURE_RECORDS) return false;
++        g_gpu_deferred_exports[g_gpu_deferred_export_count++] = destination;
++        return true;
++    }
++    if (g_gpu_command_count >= GPU_COMMAND_CAPACITY) return false;
+     MisterGpuCommand* command = &g_gpu_commands[g_gpu_command_count++];
+     memset(command, 0, sizeof(*command));
+     command->word[0] = 6u;
+@@ -1795,13 +1985,55 @@ bool MisterGpu_addFramebufferExport(uint32_t destination) {
+     return true;
+ }
+ 
++bool MisterGpu_addWaterRows(uint32_t source, uint32_t stride,
++                            int16_t firstDestinationY,
++                            const uint64_t* packedRows, uint16_t rowCount,
++                            uint32_t tint) {
++    if (!g_gpu_available || source == 0 || packedRows == NULL || rowCount == 0 ||
++        rowCount > GPU_WATER_ROWS - g_gpu_water_table_rows ||
++        g_gpu_command_count >= GPU_COMMAND_CAPACITY)
++        return false;
++
++    if (g_gpu_water_table_physical[g_gpu_write_buffer] == 0) {
++        uint32_t physical = reserveGpuTexture(GPU_WATER_ROWS * sizeof(uint64_t));
++        if (physical == 0) return false;
++        g_gpu_water_table_physical[g_gpu_write_buffer] = physical;
++    }
++
++    uint32_t tablePhysical =
++        g_gpu_water_table_physical[g_gpu_write_buffer] +
++        g_gpu_water_table_rows * (uint32_t)sizeof(uint64_t);
++    memcpy(g_gpu_textures + (tablePhysical - GPU_TEXTURE_PHYS), packedRows,
++           (size_t)rowCount * sizeof(uint64_t));
++
++    MisterGpuCommand* command = &g_gpu_commands[g_gpu_command_count++];
++    memset(command, 0, sizeof(*command));
++    command->word[0] = 7u | ((uint64_t)rowCount << 16);
++    command->word[1] = source | ((uint64_t)stride << 32);
++    command->word[2] = tablePhysical |
++                       ((uint64_t)(uint16_t)firstDestinationY << 32);
++    command->word[6] = tint;
++    g_gpu_water_table_rows += rowCount;
++    g_gpu_water_direct_rows += rowCount;
++    __sync_synchronize();
++    return true;
++}
++
+ bool MisterGpu_finishFrame(uint32_t* cycles) {
+-    if (!appendGpuEnd()) return false;
+-    // While the FPGA rendered the previous command buffer, the ARM built this
+-    // one in the other buffer. There is only one hardware mailbox, so retire
+-    // the prior job immediately before publishing the newly completed list.
+-    if (!waitGpuCompletion(cycles)) return false;
++    if (!appendGpuEnd()) {
++        g_gpu_frame_open = false;
++        return false;
++    }
++    // Retire the prior job before reusing its dynamic texture/command buffers,
++    // then launch this input tick immediately. Rendering overlaps the next ARM
++    // game step; readback paths explicitly retire the job when they need it.
++    if (!waitGpuCompletion(NULL)) {
++        g_gpu_frame_open = false;
++        return false;
++    }
++    if (cycles != NULL) *cycles = g_gpu_last_completed_cycles;
+     bool ok = submitGpuCommandsAsync();
++    g_gpu_frame_open = false;
+     g_gpu_presented = ok;
+     return ok;
+ }
+@@ -1850,6 +2082,7 @@ void MisterGpu_continueFrame(void) {
+     // the shared scanout buffer; start a fresh list that draws on that result.
+     if (!g_gpu_available || g_gpu_pending) return;
+     g_gpu_command_count = 0;
++    g_gpu_frame_open = true;
+     g_gpu_software_frame = false;
+ }
+ 
+@@ -1857,6 +2090,7 @@ void MisterGpu_useSoftwareFrame(void) {
+     // A software fallback writes the same scanout framebuffer as the GPU DMA.
+     // Do not let the two producers overlap.
+     waitGpuCompletion(NULL);
++    g_gpu_frame_open = false;
+     g_gpu_presented = false;
+     g_gpu_software_frame = true;
+ }
+@@ -1908,6 +2142,8 @@ void MisterGpu_afterSaveStateRestore(void) {
+     g_gpu_sequence = g_gpu_control[6];
+     g_gpu_pending_sequence = 0;
+     g_gpu_last_presented_valid = false;
++    g_gpu_frame_open = false;
++    g_gpu_deferred_export_count = 0;
+ 
+     // Fused/map surfaces are derived into reserved FPGA DDR addresses rather
+     // than texture records with their own CPU shadows.  Their cache metadata
+@@ -2225,6 +2461,7 @@ void platformSwapBuffers(void) {
+     }
+ 
+     if (!softwareFrame && g_gpu_command_count != 0) {
++        uint32_t waterRows = tryFuseWaterEffect();
+         tryFuseMapBackground();
+         cullFullyCoveredPrefix();
+         uint32_t cycles = 0;
+@@ -2234,8 +2471,9 @@ void platformSwapBuffers(void) {
+             double waitMs = (int64_t)(nowNanos() - waitStart) / 1000000.0;
+             g_gpu_submitted_frames++;
+             if (g_runner != NULL && (g_runner->frameCount % 300) == 0)
+-                logInfo("MiSTer GPU submit frame %d: %u commands, previous=%u cycles, submitted=%u\n",
+-                        g_runner->frameCount, commandCount, cycles, g_gpu_submitted_frames);
++                logInfo("MiSTer GPU submit frame %d: %u commands, water=%u rows, previous=%u cycles, submitted=%u\n",
++                        g_runner->frameCount, commandCount, waterRows, cycles,
++                        g_gpu_submitted_frames);
+             if (cycles > 1500000u || waitMs > 18.0) {
+                 static uint32_t slowGpuLogs = 0;
+                 if (slowGpuLogs < 400) {
+diff --git a/src/backends/mister_gpu.h b/src/backends/mister_gpu.h
+index e1a1b36..c630ca1 100644
+--- a/src/backends/mister_gpu.h
++++ b/src/backends/mister_gpu.h
+@@ -35,6 +35,10 @@ bool MisterGpu_addAffineBlit(uint32_t source, uint32_t stride,
+                        int32_t uDx, int32_t vDx, int32_t uDy, int32_t vDy,
+                        uint32_t tint, bool additive);
+ bool MisterGpu_addFramebufferExport(uint32_t destination);
++bool MisterGpu_addWaterRows(uint32_t source, uint32_t stride,
++                            int16_t firstDestinationY,
++                            const uint64_t* packedRows, uint16_t rowCount,
++                            uint32_t tint);
+ bool MisterGpu_finishFrame(uint32_t* cycles);
+ void MisterGpu_readbackRgba(uint8_t* rgba, int32_t width, int32_t height);
+ bool MisterGpu_readbackLastPresentedRgba(uint8_t* rgba, int32_t width, int32_t height);
+diff --git a/src/runner.c b/src/runner.c
+index c42588a..6da2513 100644
+--- a/src/runner.c
++++ b/src/runner.c
+@@ -6,6 +6,9 @@
+ #include "utils.h"
+ #include "json_writer.h"
+ #include "collision.h"
++#ifdef USE_MISTER
++#include "sw_renderer.h"
++#endif
+ 
+ #include <stdint.h>
+ #include "stdio_compat.h"
+@@ -441,6 +444,106 @@ static bool isEventBlockedByPendingRoom(Runner* runner, Instance* instance, int3
+     return true;
+ }
+ 
++#ifdef USE_MISTER
++// AM2R 1.1 implements its water distortion as a 240-iteration interpreted
++// Draw event.  Each iteration computes one sine offset and submits a one-row
++// surface copy.  The MiSTer renderer already recognizes and batches that exact
++// command sequence for the FPGA; executing the loop natively removes the much
++// larger VM dispatch/stack cost without changing the generated draw calls.
++//
++// Keep this deliberately tied to the exact object and CODE entry.  Any other
++// game, AM2R revision, inherited handler, or incomplete instance state falls
++// back to the ordinary bytecode interpreter.
++static bool Runner_tryExecuteAm2rWaterDraw(Runner* runner, Instance* instance,
++                                           int32_t eventType, int32_t eventSubtype,
++                                           int32_t codeId, int32_t ownerObjectIndex) {
++    static const char objectName[] = "oWaterFXV2";
++    static const char codeName[] = "gml_Object_oWaterFXV2_Draw_0";
++    static const char* const variableNames[] = {
++        "AMP", "THETA", "FREQ", "y_bottom", "y_top", "mysurf", "xx", "yy"
++    };
++    int32_t variableIds[sizeof(variableNames) / sizeof(variableNames[0])];
++
++    if (eventType != EVENT_DRAW || eventSubtype != DRAW_NORMAL ||
++        instance == nullptr || runner->renderer == nullptr ||
++        runner->renderer->vtable == nullptr ||
++        runner->renderer->vtable->drawSurface == nullptr ||
++        runner->renderer->vtable->surfaceExists == nullptr ||
++        codeId < 0 || (uint32_t)codeId >= runner->dataWin->code.count ||
++        ownerObjectIndex < 0 ||
++        (uint32_t)ownerObjectIndex >= runner->dataWin->objt.count)
++        return false;
++
++    const CodeEntry* code = &runner->dataWin->code.entries[codeId];
++    const GameObject* owner = &runner->dataWin->objt.objects[ownerObjectIndex];
++    if (code->name == nullptr || owner->name == nullptr ||
++        strcmp(code->name, codeName) != 0 || strcmp(owner->name, objectName) != 0)
++        return false;
++
++    VMContext* vm = runner->vmContext;
++    for (size_t i = 0; i < sizeof(variableNames) / sizeof(variableNames[0]); ++i) {
++        ptrdiff_t slot = shgeti(vm->varNameMap, (char*)variableNames[i]);
++        if (slot < 0) return false;
++        variableIds[i] = vm->varNameMap[slot].value;
++    }
++
++    // The six inputs must have been initialized by AM2R's Create/Step events.
++    // xx and yy are outputs, so Instance_setSelfVar may create their slots.
++    for (size_t i = 0; i < 6; ++i) {
++        if (!IntRValueHashMap_contains(&instance->selfVars, variableIds[i]))
++            return false;
++    }
++
++    GMLReal amp = RValue_toReal(Instance_getSelfVar(instance, variableIds[0]));
++    GMLReal theta = RValue_toReal(Instance_getSelfVar(instance, variableIds[1]));
++    GMLReal freq = RValue_toReal(Instance_getSelfVar(instance, variableIds[2]));
++    GMLReal yBottom = RValue_toReal(Instance_getSelfVar(instance, variableIds[3]));
++    GMLReal yTop = RValue_toReal(Instance_getSelfVar(instance, variableIds[4]));
++    int32_t surfaceId = RValue_toInt32(Instance_getSelfVar(instance, variableIds[5]));
++    GMLCamera* camera = Runner_getCameraForView(runner, 0);
++    if (camera == nullptr || yBottom == 0.0)
++        return false;
++
++    bool surfaceExists = runner->renderer->vtable->surfaceExists(
++        runner->renderer, surfaceId);
++    GMLReal xOffsets[240];
++    GMLReal angleStep = freq / yBottom;
++    GMLReal sine = GMLReal_sin(theta);
++    GMLReal cosine = GMLReal_cos(theta);
++    GMLReal sineStep = GMLReal_sin(angleStep);
++    GMLReal cosineStep = GMLReal_cos(angleStep);
++    for (int32_t yy = 0; yy < 240; ++yy) {
++        xOffsets[yy] = amp * sine;
++        GMLReal nextSine = sine * cosineStep + cosine * sineStep;
++        cosine = cosine * cosineStep - sine * sineStep;
++        sine = nextSine;
++    }
++
++    bool submittedWater = surfaceExists && SWRenderer_misterDrawAm2rWater(
++        runner->renderer, surfaceId, xOffsets, yTop,
++        camera->viewX, camera->viewY, camera->viewWidth);
++    if (!submittedWater) {
++        for (int32_t yy = 0; yy < 240; ++yy) {
++            if ((GMLReal)yy < yTop || !surfaceExists) continue;
++            runner->renderer->vtable->drawSurface(
++                runner->renderer, surfaceId,
++                0, yy, camera->viewWidth, 1,
++                (float)(xOffsets[yy] + camera->viewX),
++                (float)(yy + camera->viewY),
++                1.0f, 1.0f, 0.0f, 0xffffffffu, 0.2f);
++        }
++    }
++
++    // The bytecode leaves xx set to the exact final evaluation. Keep that
++    // observable value independent from the tiny recurrence round-off used
++    // only to choose water scanline offsets.
++    GMLReal finalX = amp * GMLReal_sin(theta + angleStep * 239.0);
++    Instance_setSelfVar(instance, variableIds[6], RValue_makeReal(finalX));
++    Instance_setSelfVar(instance, variableIds[7], RValue_makeInt32(240));
++    return true;
++}
++#endif
++
+ // Executes an already-resolved event handler (see findEventCodeIdAndOwner) and verified codeId >= 0.
+ static void Runner_executeResolvedEvent(Runner* runner, Instance* instance, int32_t eventType, int32_t eventSubtype, int32_t codeId, int32_t ownerObjectIndex) {
+     if (isEventBlockedByPendingRoom(runner, instance, eventType) || runner->shouldExit)
+@@ -474,7 +577,11 @@ static void Runner_executeResolvedEvent(Runner* runner, Instance* instance, int3
+     }
+ #endif
+ 
+-    executeCode(runner, instance, codeId);
++#ifdef USE_MISTER
++    if (!Runner_tryExecuteAm2rWaterDraw(runner, instance, eventType,
++                                        eventSubtype, codeId, ownerObjectIndex))
++#endif
++        executeCode(runner, instance, codeId);
+ 
+     vm->currentEventType = savedEventType;
+     vm->currentEventSubtype = savedEventSubtype;
+diff --git a/src/sw_renderer.c b/src/sw_renderer.c
+index 91e8c75..337eb5a 100644
+--- a/src/sw_renderer.c
++++ b/src/sw_renderer.c
+@@ -123,6 +123,38 @@ static bool swGpuIsOutputTarget(const SWRenderer* sw) {
+            (sw->gpuHostContinuation && sw->currentSurface == RENDER_TARGET_HOST_FRAMEBUFFER);
+ }
+ 
++static void swResetSurfaceContentBounds(SWRenderer* sw, int32_t id, bool full) {
++    if (id < 0 || (uint32_t)id >= sw->surfaceCount) return;
++    sw->surfaceContentMinX[id] = 0;
++    sw->surfaceContentMinY[id] = 0;
++    sw->surfaceContentMaxX[id] = full ? sw->surfaceWidths[id] : 0;
++    sw->surfaceContentMaxY[id] = full ? sw->surfaceHeights[id] : 0;
++}
++
++static void swExtendSurfaceContentBounds(SWRenderer* sw, int32_t minX, int32_t minY,
++                                         int32_t maxX, int32_t maxY) {
++    int32_t id = sw->currentSurface;
++    if (id < 0 || (uint32_t)id >= sw->surfaceCount ||
++        !sw->surfaceExistsFlags[id]) return;
++    if (minX < 0) minX = 0;
++    if (minY < 0) minY = 0;
++    if (maxX > sw->surfaceWidths[id]) maxX = sw->surfaceWidths[id];
++    if (maxY > sw->surfaceHeights[id]) maxY = sw->surfaceHeights[id];
++    if (minX >= maxX || minY >= maxY) return;
++    if (sw->surfaceContentMaxX[id] <= sw->surfaceContentMinX[id] ||
++        sw->surfaceContentMaxY[id] <= sw->surfaceContentMinY[id]) {
++        sw->surfaceContentMinX[id] = minX;
++        sw->surfaceContentMinY[id] = minY;
++        sw->surfaceContentMaxX[id] = maxX;
++        sw->surfaceContentMaxY[id] = maxY;
++        return;
++    }
++    if (minX < sw->surfaceContentMinX[id]) sw->surfaceContentMinX[id] = minX;
++    if (minY < sw->surfaceContentMinY[id]) sw->surfaceContentMinY[id] = minY;
++    if (maxX > sw->surfaceContentMaxX[id]) sw->surfaceContentMaxX[id] = maxX;
++    if (maxY > sw->surfaceContentMaxY[id]) sw->surfaceContentMaxY[id] = maxY;
++}
++
+ static void swGpuFallback(SWRenderer* sw, const char* reason) {
+     if (!sw->gpuFrameEligible) return;
+     unsigned reasonIndex = 6;
+@@ -464,6 +496,9 @@ static void rasterizeTriangle(SWRenderer* sw, SWVertex v0, SWVertex v1, SWVertex
+     if (maxY > sw->fbHeight) maxY = sw->fbHeight;
+ 
+     if (minX >= maxX || minY >= maxY) return;
++#ifdef USE_MISTER
++    swExtendSurfaceContentBounds(sw, minX, minY, maxX, maxY);
++#endif
+     sw->frameTrianglePixels += (uint64_t)(maxX-minX)*(uint64_t)(maxY-minY);
+ 
+     // Triangle area (2x, for barycentric normalization)
+@@ -712,32 +747,23 @@ static bool rasterizeAxisAlignedQuad(SWRenderer* sw, SWVertex v[4], const uint8_
+             fabsf(v[2].u - 1.0f) < 0.0001f && fabsf(v[2].v - 1.0f) < 0.0001f &&
+             fabsf(v[3].u) < 0.0001f && fabsf(v[3].v - 1.0f) < 0.0001f &&
+             tint == 0xffffffffu) {
+-            bool isSurface = false;
++            int32_t sourceSurface = -1;
+             for (uint32_t surface = 0; surface < sw->surfaceCount; ++surface) {
+                 if (sw->surfaceExistsFlags[surface] &&
+                     sw->surfacePixels[surface] == texPixels) {
+-                    isSurface = true;
++                    sourceSurface = (int32_t)surface;
+                     break;
+                 }
+             }
+-            if (isSurface) {
+-                int32_t minSourceX = 320, minSourceY = 240;
+-                int32_t maxSourceX = 0, maxSourceY = 0;
+-                for (int32_t py = 0; py < 240; ++py) {
+-                    const uint8_t* row = texPixels + (size_t)py * 320u * 4u;
+-                    for (int32_t px = 0; px < 320; ++px) {
+-                        if (row[(size_t)px * 4u + 3u] == 0) continue;
+-                        if (px < minSourceX) minSourceX = px;
+-                        if (px + 1 > maxSourceX) maxSourceX = px + 1;
+-                        if (py < minSourceY) minSourceY = py;
+-                        if (py + 1 > maxSourceY) maxSourceY = py + 1;
+-                    }
+-                }
++            if (sourceSurface >= 0) {
++                int32_t minSourceX = sw->surfaceContentMinX[sourceSurface];
++                int32_t minSourceY = sw->surfaceContentMinY[sourceSurface];
++                int32_t maxSourceX = sw->surfaceContentMaxX[sourceSurface];
++                int32_t maxSourceY = sw->surfaceContentMaxY[sourceSurface];
+                 int32_t cropHeight = maxSourceY - minSourceY;
+                 if (minSourceX < maxSourceX && cropHeight > 0 && cropHeight <= 64) {
+                     if (sw->gpuHudScratch == nullptr)
+                         sw->gpuHudScratch = (uint8_t*)safeCalloc(320u * 64u, 4u);
+-                    memset(sw->gpuHudScratch, 0, 320u * 64u * 4u);
+                     for (int32_t py = 0; py < cropHeight; ++py)
+                         memcpy(sw->gpuHudScratch + (size_t)py * 320u * 4u,
+                                texPixels + (size_t)(minSourceY + py) * 320u * 4u,
+@@ -792,6 +818,9 @@ static bool rasterizeAxisAlignedQuad(SWRenderer* sw, SWVertex v[4], const uint8_
+                         (long long)stepX, stepYDouble, texW, texH, maxX-minX, maxY-minY);
+         }
+         swGpuFallbackIfOutput(sw, "textured blit not recordable");
++#endif
++#ifdef USE_MISTER
++        swExtendSurfaceContentBounds(sw, minX, minY, maxX, maxY);
+ #endif
+         for(int32_t y=minY;y<maxY;++y){
+             int32_t sy=(int32_t)(srcY0+(((double)y+0.5)-v[0].y)*srcDy);
+@@ -840,6 +869,7 @@ static bool rasterizeAxisAlignedQuad(SWRenderer* sw, SWVertex v[4], const uint8_
+         gpuRejectLogs++;
+     }
+     swGpuFallbackIfOutput(sw, "unsupported axis quad state");
++    swExtendSurfaceContentBounds(sw, minX, minY, maxX, maxY);
+ #endif
+     for(int32_t y=minY;y<maxY;++y){
+         float ty=((float)y+0.5f-v[0].y)*invDy;if(ty<0.0f||ty>=1.0f)continue;
+@@ -915,12 +945,24 @@ static void swEnsureSurfaceCapacity(SWRenderer* sw, uint32_t needed) {
+     sw->surfaceHeights = (int32_t*)safeRealloc(sw->surfaceHeights, newCapacity * sizeof(int32_t));
+     sw->surfaceExistsFlags = (bool*)safeRealloc(sw->surfaceExistsFlags, newCapacity * sizeof(bool));
+     sw->surfaceRevisions = (uint32_t*)safeRealloc(sw->surfaceRevisions, newCapacity * sizeof(uint32_t));
++#ifdef USE_MISTER
++    sw->surfaceContentMinX = (int32_t*)safeRealloc(sw->surfaceContentMinX, newCapacity * sizeof(int32_t));
++    sw->surfaceContentMinY = (int32_t*)safeRealloc(sw->surfaceContentMinY, newCapacity * sizeof(int32_t));
++    sw->surfaceContentMaxX = (int32_t*)safeRealloc(sw->surfaceContentMaxX, newCapacity * sizeof(int32_t));
++    sw->surfaceContentMaxY = (int32_t*)safeRealloc(sw->surfaceContentMaxY, newCapacity * sizeof(int32_t));
++#endif
+     for (uint32_t i = sw->surfaceCapacity; i < newCapacity; ++i) {
+         sw->surfacePixels[i] = nullptr;
+         sw->surfaceWidths[i] = 0;
+         sw->surfaceHeights[i] = 0;
+         sw->surfaceExistsFlags[i] = false;
+         sw->surfaceRevisions[i] = 0;
++#ifdef USE_MISTER
++        sw->surfaceContentMinX[i] = 0;
++        sw->surfaceContentMinY[i] = 0;
++        sw->surfaceContentMaxX[i] = 0;
++        sw->surfaceContentMaxY[i] = 0;
++#endif
+     }
+     sw->surfaceCapacity = newCapacity;
+ }
+@@ -996,6 +1038,10 @@ static void swDestroy(Renderer* renderer) {
+     free(sw->gpuTextureAddresses);
+     for (uint32_t i = 0; i < 8; ++i) free(sw->gpuDynamicScratch[i]);
+     free(sw->gpuHudScratch);
++    free(sw->surfaceContentMinX);
++    free(sw->surfaceContentMinY);
++    free(sw->surfaceContentMaxX);
++    free(sw->surfaceContentMaxY);
+ #endif
+     for (uint32_t i = 0; i < sw->surfaceCount; ++i) free(sw->surfacePixels[i]);
+     free(sw->surfacePixels);
+@@ -1791,6 +1837,8 @@ static void swClearScreen(Renderer* renderer, uint32_t color, float alpha) {
+     uint8_t r = BGR_R(color), g = BGR_G(color), b = BGR_B(color);
+     uint8_t a = clampByte((int32_t)(alpha * 255.0f + 0.5f));
+ #ifdef USE_MISTER
++    if (sw->currentSurface >= 0)
++        swResetSurfaceContentBounds(sw, sw->currentSurface, a != 0);
+     if (sw->gpuFrameEligible) {
+         if (swGpuIsOutputTarget(sw) && sw->fbWidth == 320 && sw->fbHeight == 240 &&
+             MisterGpu_addClear((uint32_t)r | ((uint32_t)g << 8) |
+@@ -1967,6 +2015,9 @@ static int32_t swCreateSurface(Renderer* renderer, int32_t width, int32_t height
+     sw->surfaceWidths[id] = width;
+     sw->surfaceHeights[id] = height;
+     sw->surfaceExistsFlags[id] = true;
++#ifdef USE_MISTER
++    swResetSurfaceContentBounds(sw, (int32_t)id, false);
++#endif
+     swMarkSurfaceWrite(sw, (int32_t)id);
+     return (int32_t)id;
+ }
+@@ -1988,6 +2039,9 @@ static int32_t swEnsureApplicationSurface(Renderer* renderer, int32_t width, int
+         sw->surfacePixels[id] = pixels;
+         sw->surfaceWidths[id] = width;
+         sw->surfaceHeights[id] = height;
++#ifdef USE_MISTER
++        swResetSurfaceContentBounds(sw, id, false);
++#endif
+         swMarkSurfaceWrite(sw, id);
+     }
+     return id;
+@@ -2016,6 +2070,9 @@ static void swSurfaceResize(Renderer* renderer, int32_t id, int32_t width, int32
+     free(sw->surfacePixels[id]);
+     sw->surfacePixels[id]=(uint8_t*)safeCalloc((size_t)width*(size_t)height,4);
+     sw->surfaceWidths[id]=width; sw->surfaceHeights[id]=height;
++#ifdef USE_MISTER
++    swResetSurfaceContentBounds(sw, id, false);
++#endif
+     swMarkSurfaceWrite(sw,id);
+     if (current) swUseSurfaceTarget(sw,id);
+ }
+@@ -2036,6 +2093,9 @@ static void swSurfaceFree(Renderer* renderer, int32_t id) {
+     free(sw->surfacePixels[id]); sw->surfacePixels[id]=nullptr;
+     sw->surfaceWidths[id]=sw->surfaceHeights[id]=0; sw->surfaceExistsFlags[id]=false;
+     sw->surfaceRevisions[id]=0;
++#ifdef USE_MISTER
++    swResetSurfaceContentBounds(sw, id, false);
++#endif
+ }
+ 
+ #ifdef USE_MISTER
+@@ -2085,6 +2145,117 @@ void SWRenderer_misterCommitAm2rMapSurface(
+     sw->am2rMapSurfaceRetained = false;
+     sw->am2rMapSurfaceReused = false;
+ }
++
++bool SWRenderer_misterDrawAm2rWater(
++        Renderer* renderer, int32_t surfaceId, const GMLReal* xOffsets,
++        GMLReal yTop, GMLReal viewX, GMLReal viewY, int32_t viewWidth) {
++    SWRenderer* sw = (SWRenderer*)renderer;
++    if (renderer == nullptr || xOffsets == nullptr ||
++        !swSurfaceExists(renderer, surfaceId) ||
++        sw->surfaceWidths[surfaceId] != 320 ||
++        sw->surfaceHeights[surfaceId] != 240 || viewWidth != 320 ||
++        !sw->gpuFrameEligible || !sw->gpuSawClear ||
++        !swGpuIsOutputTarget(sw) || !sw->blendEnable ||
++        sw->blendMode != bm_normal || sw->base.currentShader >= 0 ||
++        sw->alphaTestEnable || sw->fogEnable ||
++        !sw->colorWriteR || !sw->colorWriteG ||
++        !sw->colorWriteB || !sw->colorWriteA)
++        return false;
++
++    uint64_t packedRows[240];
++    uint16_t rowCount = 0;
++    int32_t firstDestinationY = -1;
++    uint64_t pixelCount = 0;
++
++    for (int32_t yy = 0; yy < 240; ++yy) {
++        if ((GMLReal)yy < yTop) continue;
++
++        // Match swDrawPixelBuffer + rasterizeAxisAlignedQuad exactly, including
++        // the float conversion at the Renderer vtable boundary and the
++        // half-open pixel-centre coverage rule.
++        float worldX = (float)(xOffsets[yy] + viewX);
++        float worldY = (float)((GMLReal)yy + viewY);
++        float x0, y0, x1, y1;
++        worldToScreen(sw, worldX, worldY, &x0, &y0);
++        worldToScreen(sw, worldX + 320.0f, worldY + 1.0f, &x1, &y1);
++        float dx = x1 - x0;
++        float dy = y1 - y0;
++        if (fabsf(dx - 320.0f) > 0.01f || fabsf(dy - 1.0f) > 0.01f)
++            return false;
++
++        int32_t minX = swPixelCoverageEdge(fminf(x0, x1));
++        int32_t maxX = swPixelCoverageEdge(fmaxf(x0, x1));
++        int32_t minY = swPixelCoverageEdge(fminf(y0, y1));
++        int32_t maxY = swPixelCoverageEdge(fmaxf(y0, y1));
++        if (minX < sw->scissorX) minX = sw->scissorX;
++        if (minY < sw->scissorY) minY = sw->scissorY;
++        if (maxX > sw->scissorX + sw->scissorW) maxX = sw->scissorX + sw->scissorW;
++        if (maxY > sw->scissorY + sw->scissorH) maxY = sw->scissorY + sw->scissorH;
++        if (minX < 0) minX = 0;
++        if (minY < 0) minY = 0;
++        if (maxX > sw->fbWidth) maxX = sw->fbWidth;
++        if (maxY > sw->fbHeight) maxY = sw->fbHeight;
++        if (minX >= maxX || minY >= maxY || maxY - minY != 1)
++            return false;
++        if (firstDestinationY < 0)
++            firstDestinationY = minY;
++        else if (minY != firstDestinationY + rowCount)
++            return false;
++
++        double srcDx = 320.0 / (double)dx;
++        double srcDy = 1.0 / (double)dy;
++        int64_t uStart = (int64_t)((((double)minX + 0.5 - x0) * srcDx) * 65536.0);
++        int64_t vStart = (int64_t)(((double)yy +
++            (((double)minY + 0.5 - y0) * srcDy)) * 65536.0);
++        int64_t uStep = (int64_t)(srcDx * 65536.0);
++        if (uStart < INT32_MIN || uStart > INT32_MAX ||
++            vStart < INT32_MIN || vStart > INT32_MAX ||
++            uStep <= 0 || uStep >= 131072)
++            return false;
++
++        int32_t sourceX = (int32_t)((int32_t)uStart >= 0 ?
++            (int32_t)uStart / 65536 :
++            -(int32_t)((-(int64_t)(int32_t)uStart + 65535) / 65536));
++        int32_t sourceY = (int32_t)((int32_t)vStart >= 0 ?
++            (int32_t)vStart / 65536 :
++            -(int32_t)((-(int64_t)(int32_t)vStart + 65535) / 65536));
++        int32_t width = maxX - minX;
++        if (sourceX < 0 || sourceY < 0 || sourceY >= 240 ||
++            sourceX + width > 320)
++            return false;
++        // The monotonic near-unit step can only advance the source floor by
++        // zero, one, or two texels at each pixel. Matching the first and last
++        // floors therefore proves the same consecutive-sample property as the
++        // former 320-iteration validation, without repeating it for every row.
++        int64_t lastCoordinate = uStart + (int64_t)(width - 1) * uStep;
++        if (lastCoordinate < INT32_MIN || lastCoordinate > INT32_MAX)
++            return false;
++        int32_t lastFixed = (int32_t)lastCoordinate;
++        int32_t lastSourceX = lastFixed >= 0 ? lastFixed / 65536 :
++            -(int32_t)((-(int64_t)lastFixed + 65535) / 65536);
++        if (lastSourceX != sourceX + width - 1) return false;
++        packedRows[rowCount++] = (uint16_t)minX |
++            ((uint64_t)(uint16_t)width << 16) |
++            ((uint64_t)(uint16_t)sourceX << 32) |
++            ((uint64_t)(uint16_t)sourceY << 48);
++        pixelCount += (uint32_t)width;
++    }
++
++    if (rowCount == 0) return true;
++    uint32_t source = MisterGpu_uploadDynamicTextureRevision(
++        sw->surfacePixels[surfaceId], 320u * 240u * 4u,
++        sw->surfaceRevisions[surfaceId]);
++    if (source == 0 ||
++        !MisterGpu_addWaterRows(source, 320u * 4u,
++                                (int16_t)firstDestinationY,
++                                packedRows, rowCount, 0x33ffffffu))
++        return false;
++
++    sw->frameAxisQuads += rowCount;
++    sw->frameAxisPixels += pixelCount;
++    sw->gpuHasSkippedDraws = true;
++    return true;
++}
+ #endif
+ 
+ static void swDrawPixelBuffer(SWRenderer* sw, const uint8_t* pixels, int32_t texW, int32_t texH,
+@@ -2190,6 +2361,10 @@ static void swSurfaceCopy(Renderer* renderer, int32_t dstId, int32_t dx, int32_t
+             sw->surfacePixels[dstId], 320u * 240u * 4u,
+             sw->surfaceRevisions[dstId]);
+         if (destination != 0 && MisterGpu_addFramebufferExport(destination)) {
++            sw->surfaceContentMinX[dstId] = sw->surfaceContentMinX[srcId];
++            sw->surfaceContentMinY[dstId] = sw->surfaceContentMinY[srcId];
++            sw->surfaceContentMaxX[dstId] = sw->surfaceContentMaxX[srcId];
++            sw->surfaceContentMaxY[dstId] = sw->surfaceContentMaxY[srcId];
+             static uint32_t exportLogs = 0;
+             if (exportLogs < 16) {
+                 logInfo("MiSTer application surface export frame=%d dst=%d address=%08x\n",
+@@ -2220,6 +2395,12 @@ static void swSurfaceCopy(Renderer* renderer, int32_t dstId, int32_t dx, int32_t
+     for(int32_t row=0;row<sheight;++row)memcpy(temp+(size_t)row*swidth*4,sw->surfacePixels[srcId]+((size_t)(sy+row)*sw->surfaceWidths[srcId]+sx)*4,(size_t)swidth*4);
+     for(int32_t row=0;row<sheight;++row)memcpy(sw->surfacePixels[dstId]+((size_t)(dy+row)*sw->surfaceWidths[dstId]+dx)*4,temp+(size_t)row*swidth*4,(size_t)swidth*4);
+     free(temp);
++#ifdef USE_MISTER
++    int32_t previousSurface = sw->currentSurface;
++    sw->currentSurface = dstId;
++    swExtendSurfaceContentBounds(sw, dx, dy, dx + swidth, dy + sheight);
++    sw->currentSurface = previousSurface;
++#endif
+     swMarkSurfaceWrite(sw,dstId);
+ }
+ 
+diff --git a/src/sw_renderer.h b/src/sw_renderer.h
+index 9341004..ba2de86 100644
+--- a/src/sw_renderer.h
++++ b/src/sw_renderer.h
+@@ -101,6 +101,15 @@ typedef struct {
+     uint8_t* gpuHudScratch;
+     uint32_t gpuHudCropLogs;
+ 
++    // Conservative bounds for pixels which may be non-transparent in each
++    // CPU-rendered surface. AM2R clears and rebuilds its HUD surface every
++    // frame; retaining these bounds avoids rescanning all 76,800 alpha bytes
++    // before the final composite. An empty surface has max <= min.
++    int32_t* surfaceContentMinX;
++    int32_t* surfaceContentMinY;
++    int32_t* surfaceContentMaxX;
++    int32_t* surfaceContentMaxY;
++
+     // AM2R rebuilds its 2048x1024 map surface whenever rm_subscreen is
+     // entered. Keep the completed surface allocation outside GameMaker's
+     // visible lifecycle so an unchanged map can be reused on the next visit.
+@@ -124,4 +133,10 @@ SWAm2rMapCacheMode SWRenderer_misterPrepareAm2rMapSurface(
+     bool incrementalEligible);
+ void SWRenderer_misterCommitAm2rMapSurface(
+     Renderer* renderer, uint64_t topologyHash, uint64_t discoveryHash);
++// Submit AM2R 1.1's exact 320x240 one-row water distortion directly to the
++// FPGA batch engine. Returns false when renderer state is not an exact match,
++// allowing the caller to retain the ordinary draw_surface_part_ext path.
++bool SWRenderer_misterDrawAm2rWater(
++    Renderer* renderer, int32_t surfaceId, const GMLReal* xOffsets,
++    GMLReal yTop, GMLReal viewX, GMLReal viewY, int32_t viewWidth);
+ #endif

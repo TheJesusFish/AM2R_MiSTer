@@ -1,0 +1,21 @@
+diff --git a/src/overlay_file_system.c b/src/overlay_file_system.c
+index c1cde45..937c32a 100644
+--- a/src/overlay_file_system.c
++++ b/src/overlay_file_system.c
+@@ -59,8 +59,16 @@ static char* joinPath(const char* basePath, const char* normalizedPath) {
+ }
+ 
+ static bool pathExists(const char* fullPath) {
++#ifdef _WIN32
+     struct stat st;
+     return stat(fullPath, &st) == 0;
++#else
++    // A 32-bit stat() reports EOVERFLOW for otherwise ordinary files on CIFS
++    // when the server supplies an inode number wider than ino_t. Existence
++    // checks do not need metadata, and access(F_OK) is not subject to that ABI
++    // conversion, so network saves remain visible without changing file I/O.
++    return access(fullPath, F_OK) == 0;
++#endif
+ }
+ 
+ // Returns a heap-allocated full path for reads. Absolute inputs pass through as-is.

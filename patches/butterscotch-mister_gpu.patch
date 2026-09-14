@@ -1,0 +1,39 @@
+diff --git a/src/backends/mister_gpu.h b/src/backends/mister_gpu.h
+new file mode 100644
+index 0000000..c426a0d
+--- /dev/null
++++ b/src/backends/mister_gpu.h
+@@ -0,0 +1,33 @@
++#ifndef _BS_MISTER_GPU_H_
++#define _BS_MISTER_GPU_H_
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++bool MisterGpu_isAvailable(void);
++void MisterGpu_beginFrame(void);
++uint32_t MisterGpu_uploadTexture(const void* rgbaPixels, size_t bytes);
++uint32_t MisterGpu_uploadDynamicTexture(const void* rgbaPixels, size_t bytes);
++bool MisterGpu_addClear(uint32_t rgba);
++bool MisterGpu_addFill(int16_t x, int16_t y, uint16_t width, uint16_t height,
++                       uint32_t rgba, bool additive);
++bool MisterGpu_addBlit(uint32_t source, uint32_t stride,
++                       int16_t x, int16_t y, uint16_t width, uint16_t height,
++                       int32_t u, int32_t v, int32_t du, int32_t dv,
++                       uint32_t tint, bool additive);
++bool MisterGpu_addBlitVGradient(uint32_t source, uint32_t stride,
++                       int16_t x, int16_t y, uint16_t width, uint16_t height,
++                       int32_t u, int32_t v, int32_t du, int32_t dv,
++                       uint32_t tintStart, int16_t dr, int16_t dg,
++                       int16_t db, int16_t da, bool additive);
++bool MisterGpu_addAffineBlit(uint32_t source, uint32_t stride,
++                       int16_t x, int16_t y, uint16_t width, uint16_t height,
++                       int32_t uMin, int32_t uMax, int32_t vMin, int32_t vMax,
++                       int32_t uStart, int32_t vStart,
++                       int32_t uDx, int32_t vDx, int32_t uDy, int32_t vDy);
++bool MisterGpu_finishFrame(uint32_t* cycles);
++void MisterGpu_readbackRgba(uint8_t* rgba, int32_t width, int32_t height);
++void MisterGpu_useSoftwareFrame(void);
++
++#endif

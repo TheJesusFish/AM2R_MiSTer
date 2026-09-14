@@ -1,0 +1,728 @@
+diff --git a/src/backends/mister.c b/src/backends/mister.c
+new file mode 100644
+index 0000000..11910e8
+--- /dev/null
++++ b/src/backends/mister.c
+@@ -0,0 +1,722 @@
++#include "common.h"
++#include "platformdefs.h"
++#include "gettime.h"
++#include "runner_gamepad.h"
++#include "runner_keyboard.h"
++#include "runner_mouse.h"
++#include "backends/mister_gpu.h"
++
++#include <errno.h>
++#include <fcntl.h>
++#include <linux/input.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++#include <sys/ioctl.h>
++#include <sys/mman.h>
++#include <time.h>
++#include <unistd.h>
++
++#define MISTER_WIDTH 320
++#define MISTER_HEIGHT 240
++#define MISTER_FB_BYTES ((size_t)MISTER_WIDTH * MISTER_HEIGHT * 4)
++#define GPU_CONTROL_PHYS 0x23ff0000u
++#define GPU_COMMAND_PHYS 0x23fe0000u
++#define GPU_COMMAND2_PHYS 0x23fd0000u
++#define GPU_TEXTURE_PHYS 0x24000000u
++#define GPU_FRAMEBUFFER_PHYS 0x22001000u
++#define GPU_CONTROL_MAGIC 0x50473241u
++#define GPU_CONTROL_BYTES 4096u
++#define GPU_COMMAND_BYTES 65536u
++#define GPU_COMMAND_CAPACITY (GPU_COMMAND_BYTES / sizeof(MisterGpuCommand))
++#define GPU_COMMAND_BUFFER_COUNT 2u
++#define GPU_TEXTURE_BYTES (128u * 1024u * 1024u)
++#define GPU_TEXTURE_RECORDS 64
++#define AM2R_JOY_SHM_PATH "/dev/shm/am2r-joy"
++#define AM2R_JOY_SHM_ENV "AM2R_JOY_SHM"
++#define AM2R_JOY_SHM_MAGIC 0x524a3241u
++#define AM2R_JOY_SHM_VERSION 1u
++
++typedef struct {
++    uint32_t magic;
++    uint32_t version;
++    uint32_t joy_mask[2];
++} Am2rJoyShm;
++
++typedef struct { uint64_t word[8]; } MisterGpuCommand;
++typedef struct {
++    const void* pixels;
++    size_t bytes;
++    uint32_t physical[2];
++    uint32_t last_upload_frame;
++    uint8_t active;
++    bool dynamic;
++} MisterGpuTexture;
++
++static Runner *g_runner = NULL;
++static int g_fb_fd = -1;
++static int g_input_fd = -1;
++static int g_joy_fd = -1;
++static int g_mem_fd = -1;
++static const volatile Am2rJoyShm *g_joy_shm = NULL;
++static bool g_keyboard_pad[GP_BUTTON_COUNT];
++static uint32_t *g_fb = NULL;
++static volatile uint32_t *g_gpu_control = NULL;
++static MisterGpuCommand *g_gpu_command_buffers[GPU_COMMAND_BUFFER_COUNT] = { NULL, NULL };
++static MisterGpuCommand *g_gpu_commands = NULL;
++static uint8_t *g_gpu_textures = NULL;
++static MisterGpuTexture g_gpu_texture_records[GPU_TEXTURE_RECORDS];
++static uint32_t g_gpu_texture_record_count = 0;
++static size_t g_gpu_texture_offset = 0;
++static uint32_t g_gpu_command_count = 0;
++static uint32_t g_gpu_frame_serial = 0;
++static uint32_t g_gpu_write_buffer = 0;
++static uint32_t g_gpu_sequence = 0;
++static uint32_t g_gpu_pending_sequence = 0;
++static uint32_t g_gpu_last_completed_cycles = 0;
++static bool g_gpu_pending = false;
++static bool g_gpu_available = false;
++static bool g_gpu_presented = false;
++static bool g_gpu_software_frame = false;
++static uint32_t g_gpu_submitted_frames = 0;
++static uint32_t *g_next_frame = NULL;
++static int32_t g_next_width = 0;
++static int32_t g_next_height = 0;
++static bool g_initialized = false;
++
++static void* mapPhysical(int fd, uint32_t address, size_t bytes) {
++    void* result = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, address);
++    return result == MAP_FAILED ? NULL : result;
++}
++
++static bool waitGpuCompletion(uint32_t* cycles) {
++    if (cycles != NULL) *cycles = g_gpu_last_completed_cycles;
++    if (!g_gpu_available) return false;
++    if (!g_gpu_pending) return true;
++
++    for (unsigned wait = 0; wait < 10000; ++wait) {
++        __sync_synchronize();
++        if (g_gpu_control[6] == g_gpu_pending_sequence) {
++            g_gpu_last_completed_cycles = g_gpu_control[7];
++            if (cycles != NULL) *cycles = g_gpu_last_completed_cycles;
++            g_gpu_pending = false;
++            return true;
++        }
++        usleep(100);
++    }
++    logError("MiSTer GPU timeout: submitted=%u completed=%u\n",
++             g_gpu_pending_sequence, g_gpu_control[6]);
++    g_gpu_pending = false;
++    g_gpu_available = false;
++    return false;
++}
++
++static bool submitGpuCommandsAsync(void) {
++    static const uint32_t commandPhysical[GPU_COMMAND_BUFFER_COUNT] = {
++        GPU_COMMAND_PHYS, GPU_COMMAND2_PHYS
++    };
++    if (!g_gpu_available || g_gpu_pending || g_gpu_command_count == 0) return false;
++    uint32_t next = g_gpu_sequence + 1;
++    if (next == 0) next = 1;
++
++    g_gpu_control[0] = 0;
++    __sync_synchronize();
++    g_gpu_control[2] = commandPhysical[g_gpu_write_buffer];
++    g_gpu_control[3] = g_gpu_command_count;
++    g_gpu_control[4] = GPU_FRAMEBUFFER_PHYS;
++    g_gpu_control[5] = 0;
++    g_gpu_control[6] = 0;
++    g_gpu_control[7] = 0;
++    g_gpu_control[1] = next;
++    __sync_synchronize();
++    g_gpu_control[0] = GPU_CONTROL_MAGIC;
++    __sync_synchronize();
++    g_gpu_sequence = next;
++    g_gpu_pending_sequence = next;
++    g_gpu_pending = true;
++    g_gpu_write_buffer ^= 1u;
++    g_gpu_commands = g_gpu_command_buffers[g_gpu_write_buffer];
++    return true;
++}
++
++static bool appendGpuEnd(void) {
++    if (g_gpu_command_count >= GPU_COMMAND_CAPACITY) return false;
++    memset(&g_gpu_commands[g_gpu_command_count++], 0, sizeof(MisterGpuCommand));
++    __sync_synchronize();
++    return true;
++}
++
++static void initGpu(void) {
++    g_mem_fd = open("/dev/mem", O_RDWR | O_SYNC | O_CLOEXEC);
++    if (g_mem_fd < 0) {
++        logWarn("MiSTer GPU: cannot open /dev/mem: %s\n", strerror(errno));
++        return;
++    }
++    g_gpu_control = mapPhysical(g_mem_fd, GPU_CONTROL_PHYS, GPU_CONTROL_BYTES);
++    g_gpu_command_buffers[0] = mapPhysical(g_mem_fd, GPU_COMMAND_PHYS, GPU_COMMAND_BYTES);
++    g_gpu_command_buffers[1] = mapPhysical(g_mem_fd, GPU_COMMAND2_PHYS, GPU_COMMAND_BYTES);
++    g_gpu_commands = g_gpu_command_buffers[0];
++    g_gpu_textures = mapPhysical(g_mem_fd, GPU_TEXTURE_PHYS, GPU_TEXTURE_BYTES);
++    if (g_gpu_control == NULL || g_gpu_command_buffers[0] == NULL ||
++        g_gpu_command_buffers[1] == NULL || g_gpu_textures == NULL) {
++        logWarn("MiSTer GPU: cannot map shared DDR command/texture regions\n");
++        return;
++    }
++
++    g_gpu_sequence = g_gpu_control[6];
++    g_gpu_write_buffer = 0;
++    g_gpu_pending = false;
++    g_gpu_last_completed_cycles = 0;
++    g_gpu_available = true;
++    MisterGpu_beginFrame();
++    MisterGpu_addClear(0xff000000u);
++    appendGpuEnd();
++    uint32_t cycles = 0;
++    if (submitGpuCommandsAsync() && waitGpuCompletion(&cycles))
++        logInfo("MiSTer FPGA GPU: online (probe %u cycles)\n", cycles);
++    g_gpu_presented = false;
++}
++
++bool MisterGpu_isAvailable(void) { return g_gpu_available; }
++
++void MisterGpu_beginFrame(void) {
++    g_gpu_frame_serial++;
++    if (g_gpu_frame_serial == 0) g_gpu_frame_serial = 1;
++    g_gpu_command_count = 0;
++    g_gpu_presented = false;
++    g_gpu_software_frame = false;
++}
++
++static uint32_t reserveGpuTexture(size_t bytes) {
++    size_t offset = (g_gpu_texture_offset + 63u) & ~(size_t)63u;
++    if (offset > GPU_TEXTURE_BYTES || bytes > GPU_TEXTURE_BYTES - offset) {
++        logWarn("MiSTer GPU: texture pool exhausted (%zu-byte request, %zu used)\n",
++                bytes, g_gpu_texture_offset);
++        return 0;
++    }
++    uint32_t physical = GPU_TEXTURE_PHYS + (uint32_t)offset;
++    g_gpu_texture_offset = offset + bytes;
++    return physical;
++}
++
++uint32_t MisterGpu_uploadTexture(const void* rgbaPixels, size_t bytes) {
++    if (!g_gpu_available || rgbaPixels == NULL || bytes == 0) return 0;
++    for (uint32_t i = 0; i < g_gpu_texture_record_count; ++i) {
++        if (g_gpu_texture_records[i].pixels == rgbaPixels &&
++            g_gpu_texture_records[i].bytes == bytes)
++            return g_gpu_texture_records[i].physical[g_gpu_texture_records[i].active];
++    }
++    if (g_gpu_texture_record_count >= GPU_TEXTURE_RECORDS) {
++        logWarn("MiSTer GPU: texture record table exhausted\n");
++        return 0;
++    }
++    uint32_t physical = reserveGpuTexture(bytes);
++    if (physical == 0) return 0;
++    memcpy(g_gpu_textures + (physical - GPU_TEXTURE_PHYS), rgbaPixels, bytes);
++    __sync_synchronize();
++    MisterGpuTexture* record = &g_gpu_texture_records[g_gpu_texture_record_count++];
++    record->pixels = rgbaPixels;
++    record->bytes = bytes;
++    record->physical[0] = physical;
++    record->physical[1] = 0;
++    record->last_upload_frame = 0;
++    record->active = 0;
++    record->dynamic = false;
++    logInfo("MiSTer GPU: uploaded texture %u (%zu bytes at 0x%08x)\n",
++            g_gpu_texture_record_count - 1, bytes, physical);
++    return physical;
++}
++
++uint32_t MisterGpu_uploadDynamicTexture(const void* rgbaPixels, size_t bytes) {
++    if (!g_gpu_available || rgbaPixels == NULL || bytes == 0) return 0;
++    for (uint32_t i = 0; i < g_gpu_texture_record_count; ++i) {
++        if (g_gpu_texture_records[i].pixels == rgbaPixels &&
++            g_gpu_texture_records[i].bytes == bytes) {
++            MisterGpuTexture* record = &g_gpu_texture_records[i];
++            if (!record->dynamic) {
++                record->physical[1] = reserveGpuTexture(bytes);
++                if (record->physical[1] == 0) return 0;
++                record->dynamic = true;
++                record->active = 1;
++            } else if (record->last_upload_frame != g_gpu_frame_serial) {
++                // A GPU job may still sample the prior allocation. Alternate
++                // allocations so dynamic surfaces can be updated while that
++                // job runs, just as command descriptors alternate buffers.
++                record->active ^= 1u;
++            }
++            uint32_t physical = record->physical[record->active];
++            uint32_t offset = physical - GPU_TEXTURE_PHYS;
++            memcpy(g_gpu_textures + offset, rgbaPixels, bytes);
++            __sync_synchronize();
++            record->last_upload_frame = g_gpu_frame_serial;
++            return physical;
++        }
++    }
++    if (g_gpu_texture_record_count >= GPU_TEXTURE_RECORDS) {
++        logWarn("MiSTer GPU: texture record table exhausted\n");
++        return 0;
++    }
++    uint32_t physical0 = reserveGpuTexture(bytes);
++    uint32_t physical1 = reserveGpuTexture(bytes);
++    if (physical0 == 0 || physical1 == 0) return 0;
++    memcpy(g_gpu_textures + (physical0 - GPU_TEXTURE_PHYS), rgbaPixels, bytes);
++    __sync_synchronize();
++    MisterGpuTexture* record = &g_gpu_texture_records[g_gpu_texture_record_count++];
++    record->pixels = rgbaPixels;
++    record->bytes = bytes;
++    record->physical[0] = physical0;
++    record->physical[1] = physical1;
++    record->last_upload_frame = g_gpu_frame_serial;
++    record->active = 0;
++    record->dynamic = true;
++    logInfo("MiSTer GPU: uploaded dynamic texture %u (%zu bytes at 0x%08x/0x%08x)\n",
++            g_gpu_texture_record_count - 1, bytes, physical0, physical1);
++    return physical0;
++}
++
++bool MisterGpu_addClear(uint32_t rgba) {
++    if (!g_gpu_available || g_gpu_command_count >= GPU_COMMAND_CAPACITY - 1) return false;
++    MisterGpuCommand* command = &g_gpu_commands[g_gpu_command_count++];
++    memset(command, 0, sizeof(*command));
++    command->word[0] = 1;
++    command->word[1] = rgba;
++    return true;
++}
++
++bool MisterGpu_addFill(int16_t x, int16_t y, uint16_t width, uint16_t height,
++                       uint32_t rgba, bool additive) {
++    if (!g_gpu_available || g_gpu_command_count >= GPU_COMMAND_CAPACITY - 1) return false;
++    MisterGpuCommand* command = &g_gpu_commands[g_gpu_command_count++];
++    memset(command, 0, sizeof(*command));
++    command->word[0] = 3u | ((uint64_t)additive << 8) |
++                       ((uint64_t)width << 16) | ((uint64_t)height << 32);
++    command->word[1] = rgba;
++    command->word[2] = (uint16_t)x | ((uint64_t)(uint16_t)y << 16);
++    return true;
++}
++
++bool MisterGpu_addBlit(uint32_t source, uint32_t stride,
++                       int16_t x, int16_t y, uint16_t width, uint16_t height,
++                       int32_t u, int32_t v, int32_t du, int32_t dv,
++                       uint32_t tint, bool additive) {
++    if (!g_gpu_available || source == 0 || g_gpu_command_count >= GPU_COMMAND_CAPACITY - 1) return false;
++    MisterGpuCommand* command = &g_gpu_commands[g_gpu_command_count++];
++    memset(command, 0, sizeof(*command));
++    command->word[0] = 2u | ((uint64_t)additive << 8) |
++                       ((uint64_t)width << 16) | ((uint64_t)height << 32);
++    command->word[1] = source | ((uint64_t)stride << 32);
++    command->word[2] = (uint16_t)x | ((uint64_t)(uint16_t)y << 16);
++    command->word[4] = (uint32_t)u | ((uint64_t)(uint32_t)v << 32);
++    command->word[5] = (uint32_t)du | ((uint64_t)(uint32_t)dv << 32);
++    command->word[6] = tint;
++    command->word[7] = 0;
++    return true;
++}
++
++bool MisterGpu_addBlitVGradient(uint32_t source, uint32_t stride,
++                       int16_t x, int16_t y, uint16_t width, uint16_t height,
++                       int32_t u, int32_t v, int32_t du, int32_t dv,
++                       uint32_t tintStart, int16_t dr, int16_t dg,
++                       int16_t db, int16_t da, bool additive) {
++    if (!MisterGpu_addBlit(source, stride, x, y, width, height,
++                          u, v, du, dv, tintStart, additive)) return false;
++    g_gpu_commands[g_gpu_command_count - 1].word[7] =
++        (uint16_t)dr | ((uint64_t)(uint16_t)dg << 16) |
++        ((uint64_t)(uint16_t)db << 32) | ((uint64_t)(uint16_t)da << 48);
++    return true;
++}
++
++bool MisterGpu_addAffineBlit(uint32_t source, uint32_t stride,
++                       int16_t x, int16_t y, uint16_t width, uint16_t height,
++                       int32_t uMin, int32_t uMax, int32_t vMin, int32_t vMax,
++                       int32_t uStart, int32_t vStart,
++                       int32_t uDx, int32_t vDx, int32_t uDy, int32_t vDy) {
++    if (!g_gpu_available || source == 0 || g_gpu_command_count >= GPU_COMMAND_CAPACITY - 1) return false;
++    MisterGpuCommand* command = &g_gpu_commands[g_gpu_command_count++];
++    memset(command, 0, sizeof(*command));
++    command->word[0] = 4u | ((uint64_t)width << 16) | ((uint64_t)height << 32);
++    command->word[1] = source | ((uint64_t)stride << 32);
++    command->word[2] = (uint16_t)x | ((uint64_t)(uint16_t)y << 16);
++    command->word[3] = (uint32_t)uMin | ((uint64_t)(uint32_t)uMax << 32);
++    command->word[4] = (uint32_t)vMin | ((uint64_t)(uint32_t)vMax << 32);
++    command->word[5] = (uint32_t)uStart | ((uint64_t)(uint32_t)vStart << 32);
++    command->word[6] = (uint32_t)uDx | ((uint64_t)(uint32_t)vDx << 32);
++    command->word[7] = (uint32_t)uDy | ((uint64_t)(uint32_t)vDy << 32);
++    return true;
++}
++
++bool MisterGpu_finishFrame(uint32_t* cycles) {
++    if (!appendGpuEnd()) return false;
++    // While the FPGA rendered the previous command buffer, the ARM built this
++    // one in the other buffer. There is only one hardware mailbox, so retire
++    // the prior job immediately before publishing the newly completed list.
++    if (!waitGpuCompletion(cycles)) return false;
++    bool ok = submitGpuCommandsAsync();
++    g_gpu_presented = ok;
++    return ok;
++}
++
++void MisterGpu_readbackRgba(uint8_t* rgba, int32_t width, int32_t height) {
++    if (rgba == NULL || g_fb == NULL || width != MISTER_WIDTH || height != MISTER_HEIGHT) return;
++    if (!waitGpuCompletion(NULL)) return;
++    for (size_t i = 0; i < (size_t)width * height; ++i) {
++        uint32_t xrgb = g_fb[i];
++        rgba[i * 4 + 0] = (uint8_t)(xrgb >> 16);
++        rgba[i * 4 + 1] = (uint8_t)(xrgb >> 8);
++        rgba[i * 4 + 2] = (uint8_t)xrgb;
++        rgba[i * 4 + 3] = 255;
++    }
++}
++
++void MisterGpu_useSoftwareFrame(void) {
++    // A software fallback writes the same scanout framebuffer as the GPU DMA.
++    // Do not let the two producers overlap.
++    waitGpuCompletion(NULL);
++    g_gpu_presented = false;
++    g_gpu_software_frame = true;
++}
++
++static int linuxKeyToGml(uint16_t code) {
++    switch (code) {
++        case KEY_A: return 'A'; case KEY_B: return 'B'; case KEY_C: return 'C';
++        case KEY_D: return 'D'; case KEY_E: return 'E'; case KEY_F: return 'F';
++        case KEY_G: return 'G'; case KEY_H: return 'H'; case KEY_I: return 'I';
++        case KEY_J: return 'J'; case KEY_K: return 'K'; case KEY_L: return 'L';
++        case KEY_M: return 'M'; case KEY_N: return 'N'; case KEY_O: return 'O';
++        case KEY_P: return 'P'; case KEY_Q: return 'Q'; case KEY_R: return 'R';
++        case KEY_S: return 'S'; case KEY_T: return 'T'; case KEY_U: return 'U';
++        case KEY_V: return 'V'; case KEY_W: return 'W'; case KEY_X: return 'X';
++        case KEY_Y: return 'Y'; case KEY_Z: return 'Z';
++        case KEY_0: return '0'; case KEY_1: return '1'; case KEY_2: return '2';
++        case KEY_3: return '3'; case KEY_4: return '4'; case KEY_5: return '5';
++        case KEY_6: return '6'; case KEY_7: return '7'; case KEY_8: return '8';
++        case KEY_9: return '9';
++        case KEY_BACKSPACE: return VK_BACKSPACE;
++        case KEY_ENTER: case KEY_KPENTER: return VK_ENTER;
++        case KEY_LEFTALT: case KEY_RIGHTALT: return VK_ALT;
++        case KEY_PAGEUP: return VK_PAGEUP;
++        case KEY_PAGEDOWN: return VK_PAGEDOWN;
++        case KEY_TAB: return VK_TAB;
++        case KEY_LEFTSHIFT: case KEY_RIGHTSHIFT: return VK_SHIFT;
++        case KEY_LEFTCTRL: case KEY_RIGHTCTRL: return VK_CONTROL;
++        case KEY_ESC: return VK_ESCAPE;
++        case KEY_SPACE: return VK_SPACE;
++        case KEY_END: return VK_END;
++        case KEY_HOME: return VK_HOME;
++        case KEY_LEFT: return VK_LEFT;
++        case KEY_UP: return VK_UP;
++        case KEY_RIGHT: return VK_RIGHT;
++        case KEY_DOWN: return VK_DOWN;
++        case KEY_INSERT: return VK_INSERT;
++        case KEY_DELETE: return VK_DELETE;
++        case KEY_F1: return VK_F1; case KEY_F2: return VK_F2;
++        case KEY_F3: return VK_F3; case KEY_F4: return VK_F4;
++        case KEY_F5: return VK_F5; case KEY_F6: return VK_F6;
++        case KEY_F7: return VK_F7; case KEY_F8: return VK_F8;
++        case KEY_F9: return VK_F9; case KEY_F10: return VK_F10;
++        case KEY_F11: return VK_F11; case KEY_F12: return VK_F12;
++        default: return -1;
++    }
++}
++
++static int virtualPadButton(uint16_t code) {
++    switch (code) {
++        case KEY_ENTER: return 0;     // MiSTer framebuffer JOY_A
++        case KEY_ESC: return 1;       // MiSTer framebuffer JOY_B
++        case KEY_PAGEUP: return 4;    // JOY_L
++        case KEY_PAGEDOWN: return 5;  // JOY_R
++        case KEY_SPACE: return 8;     // JOY_SELECT
++        case KEY_TAB: return 9;       // JOY_START
++        case KEY_UP: return 12;
++        case KEY_DOWN: return 13;
++        case KEY_LEFT: return 14;
++        case KEY_RIGHT: return 15;
++        default: return -1;
++    }
++}
++
++static void openVirtualInput(void) {
++    char path[64];
++    char name[256];
++    for (int i = 0; i < 32; ++i) {
++        snprintf(path, sizeof(path), "/dev/input/event%d", i);
++        int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
++        if (fd < 0) continue;
++        memset(name, 0, sizeof(name));
++        if (ioctl(fd, EVIOCGNAME(sizeof(name) - 1), name) >= 0 &&
++            strcmp(name, "MiSTer virtual input") == 0) {
++            g_input_fd = fd;
++            logInfo("MiSTer input backend: %s (%s)\n", path, name);
++            return;
++        }
++        close(fd);
++    }
++    logWarn("MiSTer: virtual input device not found; keyboard/gamepad disabled\n");
++}
++
++static bool openJoyShared(void) {
++    const char *path = getenv(AM2R_JOY_SHM_ENV);
++    if (path == NULL || path[0] == '\0') path = AM2R_JOY_SHM_PATH;
++    g_joy_fd = open(path, O_RDONLY | O_CLOEXEC);
++    if (g_joy_fd < 0) {
++        logError("MiSTer input: cannot open %s: %s\n", path, strerror(errno));
++        return false;
++    }
++    g_joy_shm = (const volatile Am2rJoyShm *)mmap(NULL, sizeof(Am2rJoyShm),
++        PROT_READ, MAP_SHARED, g_joy_fd, 0);
++    if (g_joy_shm == MAP_FAILED) {
++        g_joy_shm = NULL;
++        close(g_joy_fd);
++        g_joy_fd = -1;
++        logError("MiSTer input: cannot map %s: %s\n", path, strerror(errno));
++        return false;
++    }
++    __sync_synchronize();
++    if (g_joy_shm->magic != AM2R_JOY_SHM_MAGIC ||
++        g_joy_shm->version != AM2R_JOY_SHM_VERSION) {
++        logError("MiSTer input: invalid shared joystick protocol\n");
++        munmap((void *)g_joy_shm, sizeof(Am2rJoyShm));
++        close(g_joy_fd);
++        g_joy_shm = NULL;
++        g_joy_fd = -1;
++        return false;
++    }
++    logInfo("MiSTer input backend: shared controller state from %s\n", path);
++    return true;
++}
++
++bool platformInit(int32_t reqW, int32_t reqH, const char *title, bool headless) {
++    (void)reqW;
++    (void)reqH;
++    (void)title;
++    (void)headless;
++
++    g_fb_fd = open("/dev/fb0", O_RDWR | O_SYNC);
++    if (g_fb_fd < 0) {
++        logError("MiSTer: cannot open /dev/fb0: %s\n", strerror(errno));
++        return false;
++    }
++    g_fb = (uint32_t *)mmap(NULL, MISTER_FB_BYTES, PROT_READ | PROT_WRITE, MAP_SHARED, g_fb_fd, 0);
++    if (g_fb == MAP_FAILED) {
++        logError("MiSTer: cannot map /dev/fb0: %s\n", strerror(errno));
++        g_fb = NULL;
++        close(g_fb_fd);
++        g_fb_fd = -1;
++        return false;
++    }
++    memset(g_fb, 0, MISTER_FB_BYTES);
++    openVirtualInput();
++    if (!openJoyShared()) {
++        if (g_input_fd >= 0) { close(g_input_fd); g_input_fd = -1; }
++        munmap(g_fb, MISTER_FB_BYTES);
++        g_fb = NULL;
++        close(g_fb_fd);
++        g_fb_fd = -1;
++        return false;
++    }
++    initGpu();
++    g_initialized = true;
++    logInfo("MiSTer framebuffer backend: %dx%d XRGB8888\n", MISTER_WIDTH, MISTER_HEIGHT);
++    return true;
++}
++
++void platformExit(void) {
++    if (g_gpu_available) waitGpuCompletion(NULL);
++    if (g_input_fd >= 0) {
++        close(g_input_fd);
++        g_input_fd = -1;
++    }
++    if (g_joy_shm != NULL) {
++        munmap((void *)g_joy_shm, sizeof(Am2rJoyShm));
++        g_joy_shm = NULL;
++    }
++    if (g_joy_fd >= 0) {
++        close(g_joy_fd);
++        g_joy_fd = -1;
++    }
++    if (g_gpu_textures != NULL) { munmap(g_gpu_textures, GPU_TEXTURE_BYTES); g_gpu_textures = NULL; }
++    for (uint32_t i = 0; i < GPU_COMMAND_BUFFER_COUNT; ++i) {
++        if (g_gpu_command_buffers[i] != NULL) {
++            munmap(g_gpu_command_buffers[i], GPU_COMMAND_BYTES);
++            g_gpu_command_buffers[i] = NULL;
++        }
++    }
++    g_gpu_commands = NULL;
++    if (g_gpu_control != NULL) { munmap((void*)g_gpu_control, GPU_CONTROL_BYTES); g_gpu_control = NULL; }
++    if (g_mem_fd >= 0) { close(g_mem_fd); g_mem_fd = -1; }
++    g_gpu_available = false;
++    if (g_fb != NULL) {
++        munmap(g_fb, MISTER_FB_BYTES);
++        g_fb = NULL;
++    }
++    if (g_fb_fd >= 0) {
++        close(g_fb_fd);
++        g_fb_fd = -1;
++    }
++    g_initialized = false;
++}
++
++void platformInitFunctions(Runner *runner) {
++    g_runner = runner;
++    runner->setCursor = NULL;
++    runner->currentCursor = GML_CR_DEFAULT;
++    GamepadSlot *pad = &runner->gamepads->slots[0];
++    pad->connected = true;
++    pad->jid = 0;
++    snprintf(pad->description, sizeof(pad->description), "MiSTer virtual gamepad");
++    snprintf(pad->guid, sizeof(pad->guid), "mister-framebuffer-pad");
++}
++
++bool platformGetWindowSize(int32_t *outW, int32_t *outH) {
++    if (!g_initialized || outW == NULL || outH == NULL) return false;
++    *outW = MISTER_WIDTH;
++    *outH = MISTER_HEIGHT;
++    return true;
++}
++
++bool platformGetScaledWindowSize(int32_t *outW, int32_t *outH) {
++    return platformGetWindowSize(outW, outH);
++}
++
++void platformSetWindowSize(int32_t width, int32_t height) {
++    (void)width;
++    (void)height;
++}
++
++void platformSetWindowTitle(const char *title) {
++    (void)title;
++}
++
++void platformGetMousePos(double *xPos, double *yPos) {
++    if (xPos != NULL) *xPos = 0.0;
++    if (yPos != NULL) *yPos = 0.0;
++}
++
++void Runner_setNextFrame(uint32_t *framebuffer, int width, int height) {
++    g_next_frame = framebuffer;
++    g_next_width = width;
++    g_next_height = height;
++}
++
++static void reportPresentRate(void) {
++    static uint64_t reportStart = 0;
++    static uint32_t reportFrames = 0;
++    uint64_t now = nowNanos();
++    if (reportStart == 0) reportStart = now;
++    reportFrames++;
++    if (now - reportStart >= 1000000000ULL) {
++        logInfo("MiSTer present rate: %.1f fps\n",
++                (double)reportFrames * 1000000000.0 / (double)(now - reportStart));
++        reportStart = now;
++        reportFrames = 0;
++    }
++}
++
++void platformSwapBuffers(void) {
++    if (g_fb == NULL || g_next_frame == NULL || g_next_width != MISTER_WIDTH || g_next_height != MISTER_HEIGHT) return;
++
++    if (!g_gpu_software_frame && g_gpu_command_count != 0) {
++        uint32_t cycles = 0;
++        uint32_t commandCount = g_gpu_command_count;
++        if (MisterGpu_finishFrame(&cycles)) {
++            g_gpu_submitted_frames++;
++            if (g_runner != NULL && (g_runner->frameCount % 300) == 0)
++                logInfo("MiSTer GPU submit frame %d: %u commands, previous=%u cycles, submitted=%u\n",
++                        g_runner->frameCount, commandCount, cycles, g_gpu_submitted_frames);
++        }
++    }
++    if (g_gpu_presented) {
++        g_gpu_presented = false;
++        reportPresentRate();
++        return;
++    }
++
++    const uint8_t *src = (const uint8_t *)g_next_frame;
++    for (size_t i = 0; i < (size_t)MISTER_WIDTH * MISTER_HEIGHT; ++i) {
++        const uint8_t r = src[i * 4 + 0];
++        const uint8_t g = src[i * 4 + 1];
++        const uint8_t b = src[i * 4 + 2];
++        g_fb[i] = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
++    }
++    reportPresentRate();
++}
++
++void *platformGetProcAddress(const char *name) {
++    (void)name;
++    return NULL;
++}
++
++bool platformHandleEvents(void) {
++    if (g_runner == NULL) return false;
++
++    RunnerGamepadState *gamepads = g_runner->gamepads;
++    GamepadSlot *pad = &gamepads->slots[0];
++    memcpy(pad->buttonDownPrev, pad->buttonDown, sizeof(pad->buttonDown));
++    memset(pad->buttonPressed, 0, sizeof(pad->buttonPressed));
++    memset(pad->buttonReleased, 0, sizeof(pad->buttonReleased));
++    pad->connected = true;
++    gamepads->connectedCount = 1;
++
++    struct input_event events[32];
++    ssize_t count;
++    while (g_input_fd >= 0 && (count = read(g_input_fd, events, sizeof(events))) > 0) {
++        size_t eventCount = (size_t)count / sizeof(events[0]);
++        for (size_t i = 0; i < eventCount; ++i) {
++            const struct input_event *ev = &events[i];
++            if (ev->type != EV_KEY || ev->value == 2) continue;
++            if (InputRecording_isPlaybackActive(globalInputRecording)) continue;
++
++            int key = linuxKeyToGml(ev->code);
++            if (key >= 0) {
++                if (ev->value) RunnerKeyboard_onKeyDown(g_runner->keyboard, key);
++                else RunnerKeyboard_onKeyUp(g_runner->keyboard, key);
++            }
++
++            int button = virtualPadButton(ev->code);
++            if (button >= 0) g_keyboard_pad[button] = ev->value != 0;
++        }
++    }
++
++    memcpy(pad->buttonDown, g_keyboard_pad, sizeof(pad->buttonDown));
++    if (g_joy_shm != NULL && g_joy_shm->magic == AM2R_JOY_SHM_MAGIC &&
++        g_joy_shm->version == AM2R_JOY_SHM_VERSION) {
++        __sync_synchronize();
++        uint32_t mask = g_joy_shm->joy_mask[0];
++        pad->buttonDown[15] |= (mask & (1u << 0)) != 0; // Right
++        pad->buttonDown[14] |= (mask & (1u << 1)) != 0; // Left
++        pad->buttonDown[13] |= (mask & (1u << 2)) != 0; // Down
++        pad->buttonDown[12] |= (mask & (1u << 3)) != 0; // Up
++        pad->buttonDown[0]  |= (mask & (1u << 4)) != 0; // A
++        pad->buttonDown[1]  |= (mask & (1u << 5)) != 0; // B
++        pad->buttonDown[8]  |= (mask & (1u << 6)) != 0; // Select
++        pad->buttonDown[9]  |= (mask & (1u << 7)) != 0; // Start
++        pad->buttonDown[4]  |= (mask & (1u << 8)) != 0; // L
++        pad->buttonDown[5]  |= (mask & (1u << 9)) != 0; // R
++    }
++
++    for (int button = 0; button < GP_BUTTON_COUNT; ++button) {
++        bool wasDown = pad->buttonDownPrev[button];
++        bool isDown = pad->buttonDown[button];
++        pad->buttonPressed[button] = isDown && !wasDown;
++        pad->buttonReleased[button] = !isDown && wasDown;
++        pad->buttonValue[button] = isDown ? 1.0f : 0.0f;
++    }
++    pad->axisValue[0] = (pad->buttonDown[15] ? 1.0f : 0.0f) - (pad->buttonDown[14] ? 1.0f : 0.0f);
++    pad->axisValue[1] = (pad->buttonDown[13] ? 1.0f : 0.0f) - (pad->buttonDown[12] ? 1.0f : 0.0f);
++    // A menu-launched hybrid cannot rely on the FPGA OSD to terminate its HPS
++    // companion. Select+Start exits the runner; the launcher trap restores the
++    // normal MiSTer menu core.
++    return pad->buttonDown[8] && pad->buttonDown[9];
++}
++
++void platformSleepUntil(uint64_t target) {
++    int64_t remaining = (int64_t)target - (int64_t)nowNanos();
++    if (remaining > 2000000) {
++        struct timespec ts;
++        remaining -= 1000000;
++        ts.tv_sec = (time_t)(remaining / 1000000000);
++        ts.tv_nsec = (long)(remaining % 1000000000);
++        nanosleep(&ts, NULL);
++    }
++    while (nowNanos() < target) YIELD();
++}

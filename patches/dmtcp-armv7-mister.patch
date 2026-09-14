@@ -1,0 +1,386 @@
+diff --git a/configure b/configure
+index 9ab54e6..b056c26 100755
+--- a/configure
++++ b/configure
+@@ -8415,10 +8415,8 @@ CFLAGS_orig="$CFLAGS"
+ CFLAGS="$CFLAGS -pthread"
+ if test "$cross_compiling" = yes
+ then :
+-  { { printf "%s\n" "$as_me:${as_lineno-$LINENO}: error: in '$ac_pwd':" >&5
+-printf "%s\n" "$as_me: error: in '$ac_pwd':" >&2;}
+-as_fn_error $? "cannot run test program while cross compiling
+-See 'config.log' for more details" "$LINENO" 5; }
++  { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: assumed yes for ARM target" >&5
++printf "%s\n" "assumed yes for ARM target" >&6; }
+ else case e in #(
+   e) cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+ /* end confdefs.h.  */
+@@ -9990,10 +9988,7 @@ printf "%s\n" "$is_wsl" >&6; }
+ printf %s "checking whether GNU_HASH is supported for ELF... " >&6; }
+ if test "$cross_compiling" = yes
+ then :
+-  { { printf "%s\n" "$as_me:${as_lineno-$LINENO}: error: in '$ac_pwd':" >&5
+-printf "%s\n" "$as_me: error: in '$ac_pwd':" >&2;}
+-as_fn_error $? "cannot run test program while cross compiling
+-See 'config.log' for more details" "$LINENO" 5; }
++  has_gnu_hash='yes'
+ else case e in #(
+   e) cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+ /* end confdefs.h.  */
+@@ -10030,10 +10025,7 @@ printf "%s\n" "$has_gnu_hash" >&6; }
+ printf %s "checking whether PR_SET_PTRACER is an option for prctl()... " >&6; }
+ if test "$cross_compiling" = yes
+ then :
+-  { { printf "%s\n" "$as_me:${as_lineno-$LINENO}: error: in '$ac_pwd':" >&5
+-printf "%s\n" "$as_me: error: in '$ac_pwd':" >&2;}
+-as_fn_error $? "cannot run test program while cross compiling
+-See 'config.log' for more details" "$LINENO" 5; }
++  has_pr_set_ptracer='yes'
+ else case e in #(
+   e) cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+ /* end confdefs.h.  */
+@@ -10070,10 +10062,7 @@ printf "%s\n" "$has_pr_set_ptracer" >&6; }
+ printf %s "checking if process_vm_readv/process_vm_writev (CMA) available... " >&6; }
+ if test "$cross_compiling" = yes
+ then :
+-  { { printf "%s\n" "$as_me:${as_lineno-$LINENO}: error: in '$ac_pwd':" >&5
+-printf "%s\n" "$as_me: error: in '$ac_pwd':" >&2;}
+-as_fn_error $? "cannot run test program while cross compiling
+-See 'config.log' for more details" "$LINENO" 5; }
++  has_cma='no'
+ else case e in #(
+   e) cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+ /* end confdefs.h.  */
+@@ -10145,7 +10134,7 @@ printf "%s\n" "$has_cma" >&6; }
+ { printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking if FSGSBASE for x86_64 (setting fs in user space) is available" >&5
+ printf %s "checking if FSGSBASE for x86_64 (setting fs in user space) is available... " >&6; }
+ has_fsgsbase='no'
+-if test `uname -m` == x86_64; then
++if test "$host_cpu" == x86_64; then
+   if test "$cross_compiling" = yes
+ then :
+   { { printf "%s\n" "$as_me:${as_lineno-$LINENO}: error: in '$ac_pwd':" >&5
+@@ -11825,7 +11814,9 @@ fi
+ 
+ 
+ 
+-if test "$use_m32" = "yes"; then
++if test "$host_cpu" = "arm"; then
++  interp=/lib/ld-linux-armhf.so.3
++elif test "$use_m32" = "yes"; then
+   interp=/lib/ld-linux.so.2
+ elif test -x /usr/bin/readelf -a -r /usr/bin/readelf; then
+   interp=`/usr/bin/readelf -aW /usr/bin/readelf | grep 'interpreter.*]' | \
+@@ -11876,7 +11867,11 @@ ac_link='$CXX -o conftest$ac_exeext $CXXFLAGS $CPPFLAGS $LDFLAGS conftest.$ac_ex
+ ac_compiler_gnu=$ac_cv_cxx_compiler_gnu
+ 
+ CXXFLAGS_orig="$CXXFLAGS"
+-CXXFLAGS="$CXXFLAGS -march=native"
++if test "$host_cpu" = "arm"; then
++  CXXFLAGS="$CXXFLAGS -mcpu=cortex-a9"
++else
++  CXXFLAGS="$CXXFLAGS -march=native"
++fi
+ cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+ /* end confdefs.h.  */
+ 
+@@ -12093,21 +12088,15 @@ printf "%s\n" "#define HAS_128_ATOMIC 1" >>confdefs.h
+ 
+ fi
+ if test "$gccAtomicBuiltins" = "no"; then
+-  { { printf "%s\n" "$as_me:${as_lineno-$LINENO}: error: in '$ac_pwd':" >&5
+-printf "%s\n" "$as_me: error: in '$ac_pwd':" >&2;}
+-as_fn_error $? "Using C++14, which should support both sync and atomic
+-                  built-ins.  Will default to using slower mutexes in jalloc.cpp
+-See 'config.log' for more details" "$LINENO" 5; }
++  { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: using futex fallback for 128-bit operations" >&5
++printf "%s\n" "using futex fallback for 128-bit operations" >&6; }
+ fi
+ 
+ { printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking value of page size (sysconf(_SC_PAGESIZE))" >&5
+ printf %s "checking value of page size (sysconf(_SC_PAGESIZE))... " >&6; }
+ if test "$cross_compiling" = yes
+ then :
+-  { { printf "%s\n" "$as_me:${as_lineno-$LINENO}: error: in '$ac_pwd':" >&5
+-printf "%s\n" "$as_me: error: in '$ac_pwd':" >&2;}
+-as_fn_error $? "cannot run test program while cross compiling
+-See 'config.log' for more details" "$LINENO" 5; }
++  sysconf_pagesize='4096'
+ else case e in #(
+   e) cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+ /* end confdefs.h.  */
+@@ -13713,5 +13702,3 @@ if test -n "$ac_unrecognized_opts" && test "$enable_option_checking" != no; then
+   { printf "%s\n" "$as_me:${as_lineno-$LINENO}: WARNING: unrecognized options: $ac_unrecognized_opts" >&5
+ printf "%s\n" "$as_me: WARNING: unrecognized options: $ac_unrecognized_opts" >&2;}
+ fi
+-
+-
+diff --git a/include/dmtcpalloc.h b/include/dmtcpalloc.h
+index 58e3332..baa8d0a 100644
+--- a/include/dmtcpalloc.h
++++ b/include/dmtcpalloc.h
+@@ -262,7 +262,20 @@ struct std::hash<dmtcp::string>
+ {
+     std::size_t operator()(dmtcp::string const& s) const noexcept
+     {
+-        return std::_Hash_impl::hash(s.data(), s.length());
++        // libc++ does not expose libstdc++'s private _Hash_impl.  Use the
++        // allocation-free FNV-1a hash so the checkpoint runtime stays
++        // independent of either standard library's internals.
++        std::size_t hash = sizeof(std::size_t) == 8
++                         ? static_cast<std::size_t>(1469598103934665603ULL)
++                         : static_cast<std::size_t>(2166136261U);
++        const std::size_t prime = sizeof(std::size_t) == 8
++                                ? static_cast<std::size_t>(1099511628211ULL)
++                                : static_cast<std::size_t>(16777619U);
++        for (char c : s) {
++            hash ^= static_cast<unsigned char>(c);
++            hash *= prime;
++        }
++        return hash;
+     }
+ };
+ 
+diff --git a/jalib/jalloc.cpp b/jalib/jalloc.cpp
+index 8ae86f1..987a67a 100644
+--- a/jalib/jalloc.cpp
++++ b/jalib/jalloc.cpp
+@@ -186,16 +186,19 @@ bool_atomic_dwcas(void volatile *dst, void *oldValue, void *newValue)
+       futex_wait(&atomic_compare_futex, 1); // Wait if futex is 1
+     }
+   }
+-  // 16-byte object is the same as a 128-bit object
++  // StackHead is two machine words: 16 bytes on 64-bit targets and 8 bytes
++  // on ARM32.  The original fixed 16-byte copy overwrote the allocator's
++  // adjacent fields on 32-bit targets.
++  const size_t atomicWidth = 2 * sizeof(void *);
+   // This is slower, and might affect codes with _very_ frequent
+   //   DMTCP-internal operations (e.g., thread create/destroy).
+   //   See: https://en.wikipedia.org/wiki/ABA_problem
+   //   for other workarounds, but if a CPU truly is missing dwcas
+   //   assembly instructions, then maybe it's not yet widely used, and
+   //   a future version of the CPU architecture will support dwcas.
+-  if (memcmp((void *)dst, oldValue, 16) == 0) {
++  if (memcmp((void *)dst, oldValue, atomicWidth) == 0) {
+     result = true;
+-    memcpy((void *)dst, newValue, 16);
++    memcpy((void *)dst, newValue, atomicWidth);
+   } else {
+     result = false;
+   }
+diff --git a/src/Makefile.am b/src/Makefile.am
+index 4495296..d472016 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -204,6 +204,7 @@ __d_libdir__libdmtcp_so_LDFLAGS = -shared -Xlinker -znow
+ __d_libdir__libdmtcp_so_LDADD = libdmtcpinternal.a 		\
+ 				 libjalib.a 			\
+ 				 libsyscallsreal.a 		\
++				 mtcp/syscall-arm.o 		\
+ 				 -ldl -lpthread -lrt
+ 
+ 
+diff --git a/src/Makefile.in b/src/Makefile.in
+index ce21dbe..a7d51ec 100644
+--- a/src/Makefile.in
++++ b/src/Makefile.in
+@@ -218,7 +218,7 @@ am___d_libdir__libdmtcp_so_OBJECTS = alarm.$(OBJEXT) \
+ __d_libdir__libdmtcp_so_OBJECTS =  \
+ 	$(am___d_libdir__libdmtcp_so_OBJECTS)
+ __d_libdir__libdmtcp_so_DEPENDENCIES = libdmtcpinternal.a libjalib.a \
+-	libsyscallsreal.a $(am__DEPENDENCIES_1)
++	libsyscallsreal.a mtcp/syscall-arm.o $(am__DEPENDENCIES_1)
+ __d_libdir__libdmtcp_so_LINK = $(CXXLD) $(AM_CXXFLAGS) $(CXXFLAGS) \
+ 	$(__d_libdir__libdmtcp_so_LDFLAGS) $(LDFLAGS) -o $@
+ AM_V_P = $(am__v_P_@AM_V@)
+@@ -677,7 +677,7 @@ libjalib_a_SOURCES = $(jalibdir)/jalib.cpp			\
+ 
+ 
+ # This is required for jalib/jalloc.cpp:__sync_bool_compare_and_swap()
+-libjalib_a_CFLAGS = -march=native
++libjalib_a_CFLAGS = -mcpu=cortex-a9
+ 
+ # FIXME:  Rename libsyscallsreal.a to libhijack.a
+ # An executable should use either libsyscallsreal.a or libnohijack.a -- not both
+@@ -719,7 +719,7 @@ __d_libdir__libdmtcp_so_LDFLAGS = -shared -Xlinker -znow
+ # Note that an ELF object uses libsyscallsreal.a or libnohijack.a
+ #  but not both.  libnohijack.a has stub definitions for same symbols.
+ __d_libdir__libdmtcp_so_LDADD = libdmtcpinternal.a libjalib.a \
+-	libsyscallsreal.a -ldl -lpthread -lrt $(am__append_2)
++	libsyscallsreal.a mtcp/syscall-arm.o -ldl -lpthread -lrt $(am__append_2)
+ __d_bindir__dmtcp_nocheckpoint_SOURCES = dmtcp_nocheckpoint.c
+ __d_bindir__dmtcp_get_libc_offset_SOURCES = dmtcp_get_libc_offset.c
+ __d_bindir__dmtcp_get_libc_offset_LDADD = -ldl
+diff --git a/src/dmtcpplugin.cpp b/src/dmtcpplugin.cpp
+index ea0aeab..826a9bf 100644
+--- a/src/dmtcpplugin.cpp
++++ b/src/dmtcpplugin.cpp
+@@ -477,7 +477,7 @@ dmtcp_add_to_ckpt_header(const char *key, const char *value)
+ }
+ 
+ EXTERNC void
+-dmtcp_set_restore_buf_addr(void *new_addr, size_t len)
++dmtcp_set_restore_buf_addr(void *new_addr, uint64_t len)
+ {
+   ProcessInfo::instance().updateRestoreBufAddr(new_addr, len);
+ }
+diff --git a/src/mtcp/mtcp_sys.h b/src/mtcp/mtcp_sys.h
+index 12a0aac..ddafaf2 100644
+--- a/src/mtcp/mtcp_sys.h
++++ b/src/mtcp/mtcp_sys.h
+@@ -236,7 +236,18 @@ struct linux_dirent {
+ /* USAGE:  mtcp_inline_syscall:  second arg is number of args of system call */
+ # define mtcp_sys_read(args ...)  mtcp_inline_syscall(read, 3, args)
+ # define mtcp_sys_write(args ...) mtcp_inline_syscall(write, 3, args)
+-# define mtcp_sys_lseek(args ...) mtcp_inline_syscall(lseek, 3, args)
++# if defined(__arm__)
++/* musl uses a 64-bit off_t on 32-bit ARM.  The legacy lseek syscall still
++ * takes a single 32-bit offset word; passing off_t through the unprototyped
++ * mtcp_syscall shim shifts SEEK_CUR into the fourth argument register and the
++ * kernel silently treats the request as SEEK_SET.  Checkpoint files used by
++ * this port are constrained below 2 GiB, so make that ABI conversion
++ * explicit. */
++#  define mtcp_sys_lseek(fd, offset, whence) \
++    ((off_t)mtcp_inline_syscall(lseek, 3, fd, (long)(offset), whence))
++# else
++#  define mtcp_sys_lseek(args ...) mtcp_inline_syscall(lseek, 3, args)
++# endif
+ 
+ /*
+  * As of glibc-2.18, open() has been replaced by openat(). glibc converts
+@@ -317,7 +328,14 @@ struct linux_dirent {
+                               prot,                            \
+                               flags,                           \
+                               fd,                              \
+-                              offset / 4096)
++                              /* mmap2's final ARM EABI argument is a       \
++                               * 32-bit page offset.  off_t is 64 bits in  \
++                               * the musl restorer, and passing it through \
++                               * the unprototyped syscall shim causes AAPCS\
++                               * to add an alignment word on the stack.    \
++                               * The assembly shim then reads that padding \
++                               * as the offset and maps file page zero. */ \
++                              (unsigned long)(offset / 4096))
+ # elif defined(__aarch64__) || defined(__riscv)
+ #  define mtcp_sys_mmap(args ...) (void *)mtcp_inline_syscall(mmap, 6, args)
+ # else // if defined(__i386__) || defined(__x86_64__) || defined(__aarch64__)
+@@ -567,7 +585,10 @@ extern unsigned int mtcp_syscall();
+ extern unsigned long mtcp_syscall();
+ #  endif // if defined(__arm__)
+ # endif
+-# ifdef MTCP_SYS_ERRNO_ON_STACK
++# if defined(MTCP_SYS_ERRNO_ON_STACK) || defined(__arm__)
++/* The ARM syscall shim is built once by src/mtcp and is also linked into
++ * libdmtcp.so.  Its assembly ABI always includes &mtcp_sys_errno as the
++ * second argument, so every ARM caller must use that convention too. */
+ #  define mtcp_inline_syscall(name, num_args, ...) \
+   mtcp_syscall(SYS_ ## name, &mtcp_sys_errno, ##__VA_ARGS__)
+ #  define INLINE_SYSCALL_RAW(name, nr, ...) \
+@@ -577,5 +598,5 @@ extern unsigned long mtcp_syscall();
+   mtcp_syscall(SYS_ ## name, ##__VA_ARGS__)
+ #  define INLINE_SYSCALL_RAW(name, nr, ...) \
+   mtcp_syscall(name, ##__VA_ARGS__)
+-# endif // ifdef MTCP_SYS_ERRNO_ON_STACK
++# endif // defined(MTCP_SYS_ERRNO_ON_STACK) || defined(__arm__)
+ #endif // if defined(__arm__) || defined(__aarch64__)
+diff --git a/src/plugin/ipc/file/fileconnlist.cpp b/src/plugin/ipc/file/fileconnlist.cpp
+index 111bc62..31978d5 100644
+--- a/src/plugin/ipc/file/fileconnlist.cpp
++++ b/src/plugin/ipc/file/fileconnlist.cpp
+@@ -596,8 +596,12 @@ FileConnList::scanForPreExisting()
+     if (dmtcp_is_protected_fd(fd)) {
+       continue;
+     }
+-    struct stat statbuf;
+-    JASSERT(fstat(fd, &statbuf) == 0);
++    // On 32-bit ARM, CIFS may expose server inode numbers that overflow the
++    // legacy struct stat even for small, otherwise ordinary files.  DMTCP's
++    // connection metadata is already stored in 64-bit fields, so classify
++    // descriptors through the explicit large-file ABI.
++    struct stat64 statbuf;
++    JASSERT(fstat64(fd, &statbuf) == 0);
+     bool isRegularFile = (S_ISREG(statbuf.st_mode) || S_ISDIR(statbuf.st_mode));
+ 
+     string device = jalib::Filesystem::GetDeviceName(fd);
+@@ -702,8 +706,11 @@ FileConnList::processFileConnection(int fd,
+     }
+   }
+ 
+-  struct stat statbuf;
+-  JASSERT(fstat(fd, &statbuf) == 0);
++  // A network file may have an inode that does not fit in the 32-bit ARM
++  // struct stat ABI.  Using fstat64 here prevents an EOVERFLOW assertion while
++  // preserving the existing FileConnection/checkpoint representation.
++  struct stat64 statbuf;
++  JASSERT(fstat64(fd, &statbuf) == 0);
+ 
+   if (strstr(device.c_str(), "infiniband/uverbs") ||
+       strstr(device.c_str(), "uverbs-event")) {
+diff --git a/src/mtcp/mtcp_util.c b/src/mtcp/mtcp_util.c
+index 75f0288..189edfb 100644
+--- a/src/mtcp/mtcp_util.c
++++ b/src/mtcp/mtcp_util.c
+@@ -461,7 +461,11 @@ int mtcp_readmapsline (int mapsfd, Area *area)
+   int mtcp_sys_errno __attribute__((unused));
+   char c, rflag, sflag, wflag, xflag;
+   int i;
+-  off_t offset;
++  /* mtcp_readhex() stores one pointer-sized value through the historical
++   * VA * API.  On 32-bit ARM, musl's off_t is 64 bits, so the upper word
++   * would otherwise retain stack garbage and produce an invalid mmap2 file
++   * offset when mtcp_restart relocates itself. */
++  off_t offset = 0;
+   unsigned int long devmajor, devminor, inodenum;
+   VA startaddr, endaddr;
+ 
+diff --git a/src/plugin/Makefile.am b/src/plugin/Makefile.am
+index c5bd9c4..b73885a 100644
+--- a/src/plugin/Makefile.am
++++ b/src/plugin/Makefile.am
+@@ -20,7 +20,7 @@ endif
+ AM_CPPFLAGS  = -I$(top_srcdir)/include
+ AM_CPPFLAGS += -I$(top_srcdir)/jalib
+ 
+-dmtcp_ldflags = -shared -Xlinker -znow -Wl,--unresolved-symbols=ignore-all
++dmtcp_ldflags = -shared -nostdlib++ -Xlinker -znow -Wl,--allow-shlib-undefined
+ LDADD = -ldl -lpthread
+ 
+ libdmtcpdir = $(pkglibdir)
+diff --git a/src/plugin/Makefile.in b/src/plugin/Makefile.in
+index 77c5b92..eb77988 100644
+--- a/src/plugin/Makefile.in
++++ b/src/plugin/Makefile.in
+@@ -531,7 +531,7 @@ AM_LDFLAGS = $(PICFLAGS)
+ #HEADERS
+ #set the include path found by configure
+ AM_CPPFLAGS = -I$(top_srcdir)/include -I$(top_srcdir)/jalib
+-dmtcp_ldflags = -shared -Xlinker -znow -Wl,--unresolved-symbols=ignore-all
++dmtcp_ldflags = -shared -nostdlib++ -Xlinker -znow -Wl,--allow-shlib-undefined
+ LDADD = -ldl -lpthread
+ libdmtcpdir = $(pkglibdir)
+ bin_SCRIPTS = 
+diff --git a/src/tls.cpp b/src/tls.cpp
+index b039928..aeba827 100644
+--- a/src/tls.cpp
++++ b/src/tls.cpp
+@@ -293,9 +293,9 @@ static void
+ tls_set_thread_area(Thread *thread)
+ {
+   int mtcp_sys_errno __attribute__((unused));
+-  if (mtcp_syscall(__ARM_NR_set_thread_area,
+-                   &mtcp_sys_errno,
+-                   thread->tlsInfo.tlsAddr) != 0) {
++  // ARM32 exposes the private set_tls syscall, not set_thread_area.  The
++  // saved value is the struct-pthread base, while CP15 holds its end.
++  if (mtcp_sys_kernel_set_tls(thread->tlsInfo.tlsAddr + 1216) != 0) {
+     printf("\n*** DMTCP: Error restoring TLS.\n\n");
+     abort();
+   };
+@@ -486,6 +486,7 @@ TLSInfo_SetThreadSysinfo(void *sysinfo)
+   asm volatile (CLEAN_FOR_64_BIT(mov %0, %%gs:) DEFAULT_SYSINFO_OFFSET "\n\t"
+                 : : "r" (sysinfo));
+ #elif defined(__arm__)
++  int mtcp_sys_errno __attribute__((unused));
+   mtcp_sys_kernel_set_tls(sysinfo);
+ #elif defined(__aarch64__)
+   asm volatile ("msr     tpidr_el0, %[gs]" : :[gs] "r" (sysinfo));

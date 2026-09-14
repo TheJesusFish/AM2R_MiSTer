@@ -1,0 +1,122 @@
+diff --git a/src/backends/mister.c b/src/backends/mister.c
+--- a/src/backends/mister.c
++++ b/src/backends/mister.c
+@@ -1625,6 +1625,28 @@ void MisterGpu_readbackRgba(uint8_t* rgba, int32_t width, int32_t height) {
+         rgba[i * 4 + 3] = 255;
+     }
+ }
+ 
++bool MisterGpu_readbackLastPresentedRgba(uint8_t* rgba, int32_t width, int32_t height) {
++    if (rgba == NULL || width != MISTER_WIDTH || height != MISTER_HEIGHT)
++        return false;
++    // Do not submit the command list currently being assembled.  Retire the
++    // prior asynchronous job, then copy the last completed scanout.  AM2R's
++    // item cutscene snapshots application_surface before the new room/frame is
++    // drawn, so submitting the current list here would capture its black clear
++    // instead of the gameplay image that is still on screen.
++    if (!waitGpuCompletion(NULL) || !g_gpu_last_presented_valid ||
++        g_gpu_native_buffers[g_gpu_last_presented_buffer] == NULL) return false;
++    const uint32_t *completed = g_gpu_native_buffers[g_gpu_last_presented_buffer];
++    __sync_synchronize();
++    for (size_t i = 0; i < (size_t)width * height; ++i) {
++        uint32_t xrgb = completed[i];
++        rgba[i * 4 + 0] = (uint8_t)(xrgb >> 16);
++        rgba[i * 4 + 1] = (uint8_t)(xrgb >> 8);
++        rgba[i * 4 + 2] = (uint8_t)xrgb;
++        rgba[i * 4 + 3] = 255;
++    }
++    return true;
++}
++
+ void MisterGpu_continueFrame(void) {
+     // A readback may be a synchronization point rather than a request to
+     // abandon hardware rendering. The completed command list already updated
+diff --git a/src/backends/mister_gpu.h b/src/backends/mister_gpu.h
+--- a/src/backends/mister_gpu.h
++++ b/src/backends/mister_gpu.h
+@@ -36,6 +36,7 @@ bool MisterGpu_addAffineBlit(uint32_t source, uint32_t stride,
+ bool MisterGpu_addFramebufferExport(uint32_t destination);
+ bool MisterGpu_finishFrame(uint32_t* cycles);
+ void MisterGpu_readbackRgba(uint8_t* rgba, int32_t width, int32_t height);
++bool MisterGpu_readbackLastPresentedRgba(uint8_t* rgba, int32_t width, int32_t height);
+ void MisterGpu_continueFrame(void);
+ void MisterGpu_useSoftwareFrame(void);
+ bool MisterGpu_prepareSaveState(void);
+diff --git a/src/sw_renderer.c b/src/sw_renderer.c
+--- a/src/sw_renderer.c
++++ b/src/sw_renderer.c
+@@ -158,6 +158,37 @@ static void swGpuFallback(SWRenderer* sw, const char* reason) {
+     sw->gpuFallbackFrames++;
+ }
+ 
++static void swGpuFallbackForApplicationSurfaceSnapshot(SWRenderer* sw) {
++    if (!sw->gpuFrameEligible) return;
++    sw->gpuFallbackReasons[5]++;
++    if (sw->gpuFallbackFrames < 20 ||
++        (sw->base.runner->frameCount % 300) == 0) {
++        logInfo("MiSTer GPU fallback frame %d: application surface snapshot "
++                "(clear=%d skipped=%d host=%d)\n",
++                sw->base.runner->frameCount, sw->gpuSawClear,
++                sw->gpuHasSkippedDraws, sw->gpuHostContinuation);
++    }
++    if (sw->gpuHasSkippedDraws) {
++        int32_t app = sw->base.runner->applicationSurfaceId;
++        uint8_t* destination = nullptr;
++        if (app >= 0 && (uint32_t)app < sw->surfaceCount &&
++            sw->surfaceExistsFlags[app]) destination = sw->surfacePixels[app];
++        if (!MisterGpu_readbackLastPresentedRgba(destination, 320, 240)) {
++            // Startup transitions can ask for a snapshot before any frame has
++            // been presented.  In that narrow case the current command list
++            // is the only possible source.
++            bool hostContinuation = sw->gpuHostContinuation;
++            sw->gpuHostContinuation = false;
++            swGpuFallback(sw, "application surface readback");
++            sw->gpuHostContinuation = hostContinuation;
++            return;
++        }
++    }
++    MisterGpu_useSoftwareFrame();
++    sw->gpuFrameEligible = false;
++    sw->gpuFallbackFrames++;
++}
++
+ static void swGpuFallbackIfOutput(SWRenderer* sw, const char* reason) {
+     // CPU rendering into an off-screen surface does not invalidate commands
+     // already recorded for the application/host framebuffer. The surface is
+@@ -1916,7 +1947,15 @@ static int32_t swCreateSurface(Renderer* renderer, int32_t width, int32_t height
+         sw->am2rMapSurfaceReused = true;
+         return sw->am2rMapSurfaceId;
+     }
+ #endif
++    // GameMaker reserves surface ID 0 as the invalid/no-surface sentinel.
++    // AM2R initializes oControl.screen_surface to 0 and creates the 512x256
++    // item-cutscene snapshot only when surface_exists(0) is false. Keep slot
++    // zero permanently unallocated so that contract holds on this backend.
++    if (sw->surfaceCount == 0) {
++        swEnsureSurfaceCapacity(sw, 1);
++        sw->surfaceCount = 1;
++    }
+     uint32_t id;
+-    for (id = 0; id < sw->surfaceCount; ++id) if (!sw->surfaceExistsFlags[id]) break;
++    for (id = 1; id < sw->surfaceCount; ++id) if (!sw->surfaceExistsFlags[id]) break;
+     if (id == sw->surfaceCount) {
+@@ -2073,7 +2112,19 @@ static void swDrawSurfaceColor(Renderer* renderer, int32_t id, int32_t srcLeft,
+     SWRenderer* sw=(SWRenderer*)renderer;
+     if (!swSurfaceExists(renderer,id)) return;
+     if (srcWidth < 0) {srcLeft=srcTop=0;srcWidth=sw->surfaceWidths[id];srcHeight=sw->surfaceHeights[id];}
+ #ifdef USE_MISTER
++    // AM2R snapshots the current gameplay image for item-acquisition scenes
++    // by drawing application_surface into a 512x256 off-screen surface.  FPGA
++    // rendering leaves the application surface's CPU shadow stale until an
++    // explicit synchronization point.  Materialize it before a user surface
++    // samples it; otherwise the item message is composited over solid black.
++    if (id == renderer->runner->applicationSurfaceId &&
++        sw->currentSurface != renderer->runner->applicationSurfaceId &&
++        sw->currentSurface != RENDER_TARGET_HOST_FRAMEBUFFER &&
++        sw->gpuFrameEligible && sw->gpuHasSkippedDraws) {
++        swGpuFallbackForApplicationSurfaceSnapshot(sw);
++    }
++
+     // AM2R disables GameMaker's automatic application-surface presentation and
+     // explicitly draws that surface at 1:1 onto the host framebuffer. While
+     // the FPGA owns the frame, its internal framebuffer already *is* the live

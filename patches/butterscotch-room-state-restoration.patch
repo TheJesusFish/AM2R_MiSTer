@@ -1,0 +1,151 @@
+diff --git a/src/data_win.c b/src/data_win.c
+index b2eac67..cef2de2 100644
+--- a/src/data_win.c
++++ b/src/data_win.c
+@@ -1706,6 +1706,15 @@ static void readRoomTiles(BinaryReader* reader, DataWin* dw, Room* room) {
+     } else {
+         room->tiles = nullptr;
+     }
++    room->initialTileCount = room->tileCount;
++    if (room->initialTileCount > 0) {
++        room->initialTiles = (RoomTile *)safeMalloc(
++            room->initialTileCount * sizeof(RoomTile));
++        memcpy(room->initialTiles, room->tiles,
++               room->initialTileCount * sizeof(RoomTile));
++    } else {
++        room->initialTiles = nullptr;
++    }
+     free(tilePtrs);
+ }
+ 
+@@ -3238,6 +3247,9 @@ void DataWin_freeRoomPayload(Room* room) {
+     free(room->tiles);
+     room->tiles = nullptr;
+     room->tileCount = 0;
++    free(room->initialTiles);
++    room->initialTiles = nullptr;
++    room->initialTileCount = 0;
+     if (room->layerCount != 0 && room->layers != nullptr) {
+         repeat(room->layerCount, j) {
+             RoomLayer* layer = &room->layers[j];
+diff --git a/src/data_win.h b/src/data_win.h
+index 0bbd2e8..753fcb4 100644
+--- a/src/data_win.h
++++ b/src/data_win.h
+@@ -712,6 +712,11 @@ typedef struct {
+     RoomGameObject* gameObjects;
+     uint32_t tileCount;
+     RoomTile* tiles;
++    // Immutable copy of the ROOM chunk's legacy tiles. GML's tile_* builtins
++    // mutate `tiles` at runtime; non-persistent room re-entry must begin from
++    // the file-authored set before creation code reconstructs dynamic tiles.
++    uint32_t initialTileCount;
++    RoomTile* initialTiles;
+     uint32_t layerCount;
+     RoomLayer* layers;
+ } Room;
+diff --git a/src/runner.c b/src/runner.c
+index 127555c..c42588a 100644
+--- a/src/runner.c
++++ b/src/runner.c
+@@ -1509,6 +1509,15 @@ static void copyRoomViewToRuntimeView(RoomView* roomView, RuntimeView* runtimeVi
+     runtimeView->portHeight = roomView->portHeight;
+ }
+ 
++static void replaceRoomTiles(Room* room, const RoomTile* tiles, uint32_t tileCount) {
++    free(room->tiles);
++    room->tiles = nullptr;
++    room->tileCount = tileCount;
++    if (tileCount == 0) return;
++    room->tiles = (RoomTile *)safeMalloc(tileCount * sizeof(RoomTile));
++    memcpy(room->tiles, tiles, tileCount * sizeof(RoomTile));
++}
++
+ static void initRoom(Runner* runner, int32_t roomIndex) {
+     DataWin* dataWin = runner->dataWin;
+     require(roomIndex >= 0 && dataWin->room.count > (uint32_t) roomIndex);
+@@ -1546,6 +1555,9 @@ static void initRoom(Runner* runner, int32_t roomIndex) {
+ 
+     // If this is a persistent room that was previously visited, restore saved state
+     if (room->persistent && savedState->initialized) {
++        // Legacy tile builtins mutate Room.tiles directly. Restore that state
++        // alongside the persistent instances and runtime layer state.
++        replaceRoomTiles(room, savedState->tiles, savedState->tileCount);
+         memcpy(runner->views, savedState->views, sizeof(runner->views));
+         runner->viewsEnabled = savedState->viewsEnabled;
+         // Restore the room-scoped default cameras (whole array); user cameras are global and left untouched.
+@@ -1587,6 +1599,14 @@ static void initRoom(Runner* runner, int32_t roomIndex) {
+ 
+     // === Normal room initialization (first visit, or non-persistent room) ===
+ 
++    // Room.tiles is mutable runtime state even though it lives on the parsed
++    // Room. A non-persistent room must be reconstructed from its file-authored
++    // tile list on every later visit. Creation code below then adds the room's
++    // destructible-block visuals again.
++    if (savedState->initialized) {
++        replaceRoomTiles(room, room->initialTiles, room->initialTileCount);
++    }
++
+     // Initialize the views and their default cameras from scratch.
+     repeat(MAX_VIEWS, vi) {
+         RoomView* roomView = &room->views[vi];
+@@ -1910,6 +1930,9 @@ static void cleanupState(Runner* runner) {
+                 Instance_free(state->instances[j]);
+             }
+             arrfree(state->instances);
++            free(state->tiles);
++            state->tiles = nullptr;
++            state->tileCount = 0;
+             hmfree(state->tileLayerMap);
+             freeRuntimeLayersArray(&state->runtimeLayers);
+         }
+@@ -3639,6 +3662,9 @@ static void persistRoomState(Runner* runner, int32_t roomIndex) {
+     state->instances = nullptr;
+     hmfree(state->tileLayerMap);
+     state->tileLayerMap = nullptr;
++    free(state->tiles);
++    state->tiles = nullptr;
++    state->tileCount = 0;
+     freeRuntimeLayersArray(&state->runtimeLayers);
+ 
+     // Separate persistent instances (travel with player) from room instances (saved)
+@@ -3649,7 +3675,12 @@ static void persistRoomState(Runner* runner, int32_t roomIndex) {
+         Instance* inst = runner->instances[i];
+         if (inst->persistent) {
+             arrput(keptInstances, inst);
+-        } else if (inst->active) {
++        } else if (!inst->destroyed) {
++            // Deactivation is culling state, not destruction. AM2R temporarily
++            // marks a gameplay room persistent while it visits itemroom; any
++            // distant exits and solids are inactive at that instant and must
++            // still be part of the saved room. Dropping them here makes those
++            // room objects disappear permanently when gameplay resumes.
+             arrput(state->instances, inst);
+         } else {
+             hmdel(runner->instancesById, inst->instanceId);
+@@ -3677,5 +3708,12 @@ static void persistRoomState(Runner* runner, int32_t roomIndex) {
+     state->backgroundColor = runner->backgroundColor;
+     state->drawBackgroundColor = runner->drawBackgroundColor;
++    state->tileCount = runner->currentRoom->tileCount;
++    if (state->tileCount > 0) {
++        state->tiles = (RoomTile *)safeMalloc(
++            state->tileCount * sizeof(RoomTile));
++        memcpy(state->tiles, runner->currentRoom->tiles,
++               state->tileCount * sizeof(RoomTile));
++    }
+ 
+     // Transfer tile layer map ownership to saved state
+     state->tileLayerMap = runner->tileLayerMap;
+diff --git a/src/runner.h b/src/runner.h
+index 2a9669d..616a74f 100644
+--- a/src/runner.h
++++ b/src/runner.h
+@@ -544,6 +544,8 @@ typedef struct {
+     uint32_t backgroundColor;
+     bool drawBackgroundColor;
+     TileLayerMapEntry* tileLayerMap; // stb_ds hashmap: depth -> tile layer state
++    RoomTile* tiles; // legacy tile state for a persistent room
++    uint32_t tileCount;
+     RuntimeLayer* runtimeLayers; // stb_ds array, index-parallel to currentRoom->layers
+     RuntimeView views[MAX_VIEWS];
+     bool viewsEnabled;

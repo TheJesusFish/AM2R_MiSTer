@@ -1,0 +1,2496 @@
+diff --git a/src/backends/mister.c b/src/backends/mister.c
+index 466ca9e..735ed45 100644
+--- a/src/backends/mister.c
++++ b/src/backends/mister.c
+@@ -9,6 +9,7 @@
+ #include <errno.h>
+ #include <fcntl.h>
+ #include <linux/input.h>
++#include <pthread.h>
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -18,6 +19,10 @@
+ #include <time.h>
+ #include <unistd.h>
+ 
++#if defined(__ARM_NEON)
++#include <arm_neon.h>
++#endif
++
+ #define MISTER_WIDTH 320
+ #define MISTER_HEIGHT 240
+ #define MISTER_FB_BYTES ((size_t)MISTER_WIDTH * MISTER_HEIGHT * 4)
+@@ -26,6 +31,10 @@
+ #define GPU_COMMAND2_PHYS 0x23fd0000u
+ #define GPU_TEXTURE_PHYS 0x24000000u
+ #define GPU_FRAMEBUFFER_PHYS 0x22001000u
++#define GPU_NATIVE_WINDOW_PHYS 0x3a000000u
++#define GPU_NATIVE_BUFFER_OFFSET 0x100u
++#define GPU_NATIVE_BUFFER_BYTES MISTER_FB_BYTES
++#define GPU_NATIVE_WINDOW_BYTES (GPU_NATIVE_BUFFER_OFFSET + 2u * GPU_NATIVE_BUFFER_BYTES)
+ #define GPU_CONTROL_MAGIC 0x50473241u
+ #define GPU_CONTROL_BYTES 4096u
+ #define GPU_COMMAND_BYTES 65536u
+@@ -33,6 +42,7 @@
+ #define GPU_COMMAND_BUFFER_COUNT 2u
+ #define GPU_TEXTURE_BYTES (128u * 1024u * 1024u)
+ #define GPU_TEXTURE_RECORDS 64
++#define GPU_FUSED_PREFIX_COMMANDS 12u
+ #define AM2R_JOY_SHM_PATH "/dev/shm/am2r-joy"
+ #define AM2R_JOY_SHM_ENV "AM2R_JOY_SHM"
+ #define AM2R_JOY_SHM_MAGIC 0x524a3241u
+@@ -51,6 +61,7 @@ typedef struct {
+     size_t bytes;
+     uint32_t physical[2];
+     uint32_t last_upload_frame;
++    uint32_t generation;
+     uint8_t active;
+     bool dynamic;
+ } MisterGpuTexture;
+@@ -67,6 +78,8 @@ static volatile uint32_t *g_gpu_control = NULL;
+ static MisterGpuCommand *g_gpu_command_buffers[GPU_COMMAND_BUFFER_COUNT] = { NULL, NULL };
+ static MisterGpuCommand *g_gpu_commands = NULL;
+ static uint8_t *g_gpu_textures = NULL;
++static uint8_t *g_gpu_native_mapping = NULL;
++static uint32_t *g_gpu_native_buffers[2] = { NULL, NULL };
+ static MisterGpuTexture g_gpu_texture_records[GPU_TEXTURE_RECORDS];
+ static uint32_t g_gpu_texture_record_count = 0;
+ static size_t g_gpu_texture_offset = 0;
+@@ -76,11 +89,38 @@ static uint32_t g_gpu_write_buffer = 0;
+ static uint32_t g_gpu_sequence = 0;
+ static uint32_t g_gpu_pending_sequence = 0;
+ static uint32_t g_gpu_last_completed_cycles = 0;
++static uint8_t g_gpu_last_presented_buffer = 0;
++static bool g_gpu_last_presented_valid = false;
+ static bool g_gpu_pending = false;
+ static bool g_gpu_available = false;
+ static bool g_gpu_presented = false;
+ static bool g_gpu_software_frame = false;
+ static uint32_t g_gpu_submitted_frames = 0;
++static uint32_t g_gpu_texture_generation = 0;
++static uint32_t *g_gpu_fused_base_pixels = NULL;
++static MisterGpuCommand g_gpu_fused_base_commands[GPU_FUSED_PREFIX_COMMANDS];
++static uint32_t g_gpu_fused_base_command_count = 0;
++static bool g_gpu_fused_base_valid = false;
++static uint32_t *g_gpu_fused_pixels = NULL;
++static MisterGpuCommand g_gpu_fused_source_commands[GPU_FUSED_PREFIX_COMMANDS];
++static uint32_t g_gpu_fused_source_command_count = 0;
++static const MisterGpuTexture *g_gpu_fused_source_record = NULL;
++static uint32_t g_gpu_fused_source_generation = 0;
++static const MisterGpuTexture *g_gpu_fused_overlay_record = NULL;
++static uint32_t g_gpu_fused_overlay_generation = 0;
++static uint32_t *g_gpu_map_overlay_pixels = NULL;
++static MisterGpuCommand g_gpu_map_overlay_geometry[4];
++static const MisterGpuTexture *g_gpu_map_overlay_cache_record = NULL;
++static uint32_t g_gpu_map_overlay_cache_generation = 0;
++static bool g_gpu_map_overlay_cache_valid = false;
++static bool g_gpu_map_overlay_cache_opaque = false;
++static MisterGpuCommand g_gpu_map_base_geometry;
++static const MisterGpuTexture *g_gpu_map_base_cache_record = NULL;
++static uint32_t g_gpu_map_base_cache_generation = 0;
++static bool g_gpu_map_base_cache_valid = false;
++static bool g_gpu_map_base_cache_opaque = false;
++static uint32_t g_gpu_fused_physical = 0;
++static bool g_gpu_fused_valid = false;
+ static uint32_t *g_next_frame = NULL;
+ static int32_t g_next_width = 0;
+ static int32_t g_next_height = 0;
+@@ -108,11 +148,13 @@ static bool waitGpuCompletion(uint32_t* cycles) {
+     if (cycles != NULL) *cycles = g_gpu_last_completed_cycles;
+     if (!g_gpu_available) return false;
+     if (!g_gpu_pending) return true;
+-
+     for (unsigned wait = 0; wait < 10000; ++wait) {
+         __sync_synchronize();
+         if (g_gpu_control[6] == g_gpu_pending_sequence) {
+-            g_gpu_last_completed_cycles = g_gpu_control[7];
++            uint32_t completion = g_gpu_control[7];
++            g_gpu_last_presented_buffer = (uint8_t)(completion >> 31);
++            g_gpu_last_presented_valid = true;
++            g_gpu_last_completed_cycles = completion & 0x7fffffffu;
+             if (cycles != NULL) *cycles = g_gpu_last_completed_cycles;
+             g_gpu_pending = false;
+             return true;
+@@ -172,8 +214,18 @@ static void initGpu(void) {
+     g_gpu_command_buffers[1] = mapPhysical(g_mem_fd, GPU_COMMAND2_PHYS, GPU_COMMAND_BYTES);
+     g_gpu_commands = g_gpu_command_buffers[0];
+     g_gpu_textures = mapPhysical(g_mem_fd, GPU_TEXTURE_PHYS, GPU_TEXTURE_BYTES);
++    g_gpu_native_mapping = mapPhysical(g_mem_fd, GPU_NATIVE_WINDOW_PHYS,
++                                       GPU_NATIVE_WINDOW_BYTES);
++    if (g_gpu_native_mapping != NULL) {
++        g_gpu_native_buffers[0] = (uint32_t *)(g_gpu_native_mapping +
++                                               GPU_NATIVE_BUFFER_OFFSET);
++        g_gpu_native_buffers[1] = (uint32_t *)(g_gpu_native_mapping +
++                                               GPU_NATIVE_BUFFER_OFFSET +
++                                               GPU_NATIVE_BUFFER_BYTES);
++    }
+     if (g_gpu_control == NULL || g_gpu_command_buffers[0] == NULL ||
+-        g_gpu_command_buffers[1] == NULL || g_gpu_textures == NULL) {
++        g_gpu_command_buffers[1] == NULL || g_gpu_textures == NULL ||
++        g_gpu_native_mapping == NULL) {
+         logWarn("MiSTer GPU: cannot map shared DDR command/texture regions\n");
+         return;
+     }
+@@ -182,6 +234,8 @@ static void initGpu(void) {
+     g_gpu_write_buffer = 0;
+     g_gpu_pending = false;
+     g_gpu_last_completed_cycles = 0;
++    g_gpu_last_presented_buffer = 0;
++    g_gpu_last_presented_valid = false;
+     g_gpu_available = true;
+     MisterGpu_beginFrame();
+     MisterGpu_addClear(0xff000000u);
+@@ -214,6 +268,33 @@ static uint32_t reserveGpuTexture(size_t bytes) {
+     return physical;
+ }
+ 
++static bool gpuBuffersEqual(const void* lhs, const void* rhs, size_t bytes) {
++    if ((((uintptr_t)lhs | (uintptr_t)rhs | bytes) & 3u) != 0)
++        return memcmp(lhs, rhs, bytes) == 0;
++
++    const uint32_t* a = (const uint32_t*)lhs;
++    const uint32_t* b = (const uint32_t*)rhs;
++    size_t words = bytes / sizeof(uint32_t);
++    while (words >= 8u) {
++        if (a[0] != b[0] || a[1] != b[1] || a[2] != b[2] || a[3] != b[3] ||
++            a[4] != b[4] || a[5] != b[5] || a[6] != b[6] || a[7] != b[7])
++            return false;
++        a += 8;
++        b += 8;
++        words -= 8u;
++    }
++    while (words-- != 0) {
++        if (*a++ != *b++) return false;
++    }
++    return true;
++}
++
++static uint32_t nextTextureGeneration(void) {
++    g_gpu_texture_generation++;
++    if (g_gpu_texture_generation == 0) g_gpu_texture_generation = 1;
++    return g_gpu_texture_generation;
++}
++
+ uint32_t MisterGpu_uploadTexture(const void* rgbaPixels, size_t bytes) {
+     if (!g_gpu_available || rgbaPixels == NULL || bytes == 0) return 0;
+     for (uint32_t i = 0; i < g_gpu_texture_record_count; ++i) {
+@@ -242,6 +323,7 @@ uint32_t MisterGpu_uploadTexture(const void* rgbaPixels, size_t bytes) {
+     record->physical[0] = physical;
+     record->physical[1] = 0;
+     record->last_upload_frame = 0;
++    record->generation = nextTextureGeneration();
+     record->active = 0;
+     record->dynamic = false;
+     logInfo("MiSTer GPU: uploaded texture %u (%zu bytes at 0x%08x)\n",
+@@ -255,6 +337,11 @@ uint32_t MisterGpu_uploadDynamicTexture(const void* rgbaPixels, size_t bytes) {
+         if (g_gpu_texture_records[i].source == rgbaPixels &&
+             g_gpu_texture_records[i].bytes == bytes) {
+             MisterGpuTexture* record = &g_gpu_texture_records[i];
++            // Most GameMaker surfaces are composited repeatedly even when
++            // their pixels did not change.  Avoid another cached copy plus an
++            // uncached HPS-to-FPGA DDR write in that common case.
++            if (gpuBuffersEqual(record->shadow, rgbaPixels, bytes))
++                return record->physical[record->active];
+             if (!record->dynamic) {
+                 record->physical[1] = reserveGpuTexture(bytes);
+                 if (record->physical[1] == 0) return 0;
+@@ -272,6 +359,7 @@ uint32_t MisterGpu_uploadDynamicTexture(const void* rgbaPixels, size_t bytes) {
+             memcpy(g_gpu_textures + offset, rgbaPixels, bytes);
+             __sync_synchronize();
+             record->last_upload_frame = g_gpu_frame_serial;
++            record->generation = nextTextureGeneration();
+             return physical;
+         }
+     }
+@@ -297,6 +385,7 @@ uint32_t MisterGpu_uploadDynamicTexture(const void* rgbaPixels, size_t bytes) {
+     record->physical[0] = physical0;
+     record->physical[1] = physical1;
+     record->last_upload_frame = g_gpu_frame_serial;
++    record->generation = nextTextureGeneration();
+     record->active = 0;
+     record->dynamic = true;
+     logInfo("MiSTer GPU: uploaded dynamic texture %u (%zu bytes at 0x%08x/0x%08x)\n",
+@@ -304,6 +393,925 @@ uint32_t MisterGpu_uploadDynamicTexture(const void* rgbaPixels, size_t bytes) {
+     return physical0;
+ }
+ 
++static const MisterGpuTexture* textureRecordForPhysical(uint32_t physical,
++                                                         size_t *recordOffset) {
++    for (uint32_t i = 0; i < g_gpu_texture_record_count; ++i) {
++        const MisterGpuTexture *record = &g_gpu_texture_records[i];
++        uint32_t copies = record->dynamic ? 2u : 1u;
++        for (uint32_t copy = 0; copy < copies; ++copy) {
++            uint32_t base = record->physical[copy];
++            if (base != 0 && physical >= base &&
++                (size_t)(physical - base) < record->bytes) {
++                if (recordOffset != NULL) *recordOffset = physical - base;
++                return record;
++            }
++        }
++    }
++    return NULL;
++}
++
++static uint8_t gpuMul255(uint8_t a, uint8_t b) {
++    uint32_t product = (uint32_t)a * b;
++    return (uint8_t)((product + 128u + ((product + 128u) >> 8)) >> 8);
++}
++
++static uint8_t gpuDiv255Floor(uint32_t value) {
++    return (uint8_t)((value + 1u + (value >> 8)) >> 8);
++}
++
++static uint32_t gpuApplyTint(uint32_t pixel, uint32_t tint) {
++    uint32_t result = 0;
++    for (uint32_t shift = 0; shift < 32; shift += 8) {
++        result |= (uint32_t)gpuMul255((uint8_t)(pixel >> shift),
++                                     (uint8_t)(tint >> shift)) << shift;
++    }
++    return result;
++}
++
++static uint32_t gpuAlphaBlend(uint32_t source, uint32_t destination) {
++    uint32_t sourceAlpha = source >> 24;
++    if (sourceAlpha == 0) return destination;
++    if (sourceAlpha == 255) return source;
++
++    uint32_t inverseAlpha = 255u - sourceAlpha;
++    uint32_t result = 0;
++    for (uint32_t shift = 0; shift < 24; shift += 8) {
++        uint32_t sourceChannel = (source >> shift) & 0xffu;
++        uint32_t destinationChannel = (destination >> shift) & 0xffu;
++        result |= (uint32_t)gpuDiv255Floor(sourceChannel * sourceAlpha +
++                                          destinationChannel * inverseAlpha) << shift;
++    }
++    result |= (sourceAlpha + gpuDiv255Floor((destination >> 24) * inverseAlpha)) << 24;
++    return result;
++}
++
++static int32_t gpuFixedFloor(int32_t value) {
++    if (value >= 0) return value / 65536;
++    return (int32_t)(-((-(int64_t)value + 65535) / 65536));
++}
++
++#if defined(__ARM_NEON)
++static uint8x8_t neonScaleFloor255(uint8x8_t values, uint8_t multiplier) {
++    uint16x8_t product = vmull_u8(values, vdup_n_u8(multiplier));
++    uint16x8_t divided = vaddq_u16(product, vdupq_n_u16(1));
++    divided = vaddq_u16(divided, vshrq_n_u16(product, 8));
++    return vmovn_u16(vshrq_n_u16(divided, 8));
++}
++
++static uint8x8_t neonMul255Round(uint8x8_t lhs, uint8x8_t rhs) {
++    uint16x8_t product = vmull_u8(lhs, rhs);
++    uint16x8_t rounded = vaddq_u16(product, vdupq_n_u16(128));
++    rounded = vaddq_u16(rounded, vshrq_n_u16(rounded, 8));
++    return vmovn_u16(vshrq_n_u16(rounded, 8));
++}
++
++static uint8x8_t neonBlendChannel(uint8x8_t source, uint8x8_t destination,
++                                  uint8x8_t sourceAlpha) {
++    uint8x8_t inverseAlpha = vsub_u8(vdup_n_u8(255), sourceAlpha);
++    uint16x8_t sum = vmull_u8(source, sourceAlpha);
++    sum = vmlal_u8(sum, destination, inverseAlpha);
++    uint16x8_t rounded = vaddq_u16(sum, vdupq_n_u16(1));
++    rounded = vaddq_u16(rounded, vshrq_n_u16(sum, 8));
++    return vmovn_u16(vshrq_n_u16(rounded, 8));
++}
++
++static uint8x8_t neonBlendAlpha(uint8x8_t destinationAlpha,
++                                uint8x8_t sourceAlpha) {
++    uint8x8_t inverseAlpha = vsub_u8(vdup_n_u8(255), sourceAlpha);
++    uint16x8_t product = vmull_u8(destinationAlpha, inverseAlpha);
++    uint16x8_t divided = vaddq_u16(product, vdupq_n_u16(1));
++    divided = vaddq_u16(divided, vshrq_n_u16(product, 8));
++    return vadd_u8(sourceAlpha, vmovn_u16(vshrq_n_u16(divided, 8)));
++}
++
++static uint32_t neonReduceOrU32(uint32x4_t values) {
++    uint32x2_t paired = vorr_u32(vget_low_u32(values), vget_high_u32(values));
++    paired = vorr_u32(paired, vrev64_u32(paired));
++    return vget_lane_u32(paired, 0);
++}
++
++static uint32_t neonReduceAndU32(uint32x4_t values) {
++    uint32x2_t paired = vand_u32(vget_low_u32(values), vget_high_u32(values));
++    paired = vand_u32(paired, vrev64_u32(paired));
++    return vget_lane_u32(paired, 0);
++}
++
++static uint8x16_t neonBlendConstantAlphaPacked(uint8x16_t source,
++                                               uint8x16_t destination,
++                                               uint8_t alpha) {
++    if (alpha == 0) return destination;
++    if (alpha == 255) return source;
++    uint8x8_t alphaVector = vdup_n_u8(alpha);
++    uint8x8_t inverseAlpha = vdup_n_u8((((uint8_t)(255u - alpha))));
++    uint16x8_t low = vmull_u8(vget_low_u8(source), alphaVector);
++    uint16x8_t high = vmull_u8(vget_high_u8(source), alphaVector);
++    low = vmlal_u8(low, vget_low_u8(destination), inverseAlpha);
++    high = vmlal_u8(high, vget_high_u8(destination), inverseAlpha);
++    uint16x8_t lowDivided = vaddq_u16(low, vdupq_n_u16(1));
++    uint16x8_t highDivided = vaddq_u16(high, vdupq_n_u16(1));
++    lowDivided = vaddq_u16(lowDivided, vshrq_n_u16(low, 8));
++    highDivided = vaddq_u16(highDivided, vshrq_n_u16(high, 8));
++    return vcombine_u8(vmovn_u16(vshrq_n_u16(lowDivided, 8)),
++                       vmovn_u16(vshrq_n_u16(highDivided, 8)));
++}
++
++static uint8x8x4_t neonBlendTintedPixels(uint8x8x4_t source,
++                                         uint8x8x4_t destination,
++                                         uint8_t tintAlpha) {
++    uint8x8_t sourceAlpha = tintAlpha == 255
++        ? source.val[3]
++        : neonMul255Round(source.val[3], vdup_n_u8(tintAlpha));
++    destination.val[0] = neonBlendChannel(source.val[0], destination.val[0],
++                                          sourceAlpha);
++    destination.val[1] = neonBlendChannel(source.val[1], destination.val[1],
++                                          sourceAlpha);
++    destination.val[2] = neonBlendChannel(source.val[2], destination.val[2],
++                                          sourceAlpha);
++    destination.val[3] = neonBlendAlpha(destination.val[3], sourceAlpha);
++    return destination;
++}
++#endif
++
++static bool compositeAxisCommand(uint32_t *destination,
++                                 const MisterGpuCommand *command,
++                                 const MisterGpuTexture *sourceRecord,
++                                 size_t sourceBaseOffset,
++                                 int32_t clipYStart,
++                                 int32_t clipYEnd) {
++    uint16_t width = (uint16_t)(command->word[0] >> 16);
++    uint16_t height = (uint16_t)(command->word[0] >> 32);
++    int16_t destinationX = (int16_t)command->word[2];
++    int16_t destinationY = (int16_t)(command->word[2] >> 16);
++    uint32_t sourceStride = (uint32_t)(command->word[1] >> 32);
++    int32_t uStart = (int32_t)command->word[4];
++    int32_t vStart = (int32_t)(command->word[4] >> 32);
++    int32_t uStep = (int32_t)command->word[5];
++    int32_t vStep = (int32_t)(command->word[5] >> 32);
++    uint32_t tint = (uint32_t)command->word[6];
++    const uint8_t *source = (const uint8_t *)sourceRecord->shadow;
++
++    if (uStep == 0x00010000 && vStep == 0x00010000) {
++        int32_t sourceX = gpuFixedFloor(uStart);
++        int32_t sourceY = gpuFixedFloor(vStart);
++        int32_t firstX = destinationX < 0 ? -destinationX : 0;
++        int32_t firstY = destinationY < 0 ? -destinationY : 0;
++        int32_t lastX = width;
++        int32_t lastY = height;
++        if (destinationX + lastX > MISTER_WIDTH) lastX = MISTER_WIDTH - destinationX;
++        if (destinationY + lastY > MISTER_HEIGHT) lastY = MISTER_HEIGHT - destinationY;
++        if (destinationY + firstY < clipYStart) firstY = clipYStart - destinationY;
++        if (destinationY + lastY > clipYEnd) lastY = clipYEnd - destinationY;
++        if (firstX >= lastX || firstY >= lastY) return true;
++
++        int32_t clippedSourceX = sourceX + firstX;
++        int32_t clippedSourceY = sourceY + firstY;
++        if (clippedSourceX < 0 || clippedSourceY < 0) return false;
++        size_t lastSourceOffset = sourceBaseOffset +
++            (size_t)(clippedSourceY + lastY - firstY - 1) * sourceStride +
++            (size_t)(clippedSourceX + lastX - firstX - 1) * sizeof(uint32_t);
++        if (lastSourceOffset > sourceRecord->bytes ||
++            sizeof(uint32_t) > sourceRecord->bytes - lastSourceOffset)
++            return false;
++
++        bool alphaOnlyTint = (tint & 0x00ffffffu) == 0x00ffffffu;
++        uint8_t tintAlpha = (uint8_t)(tint >> 24);
++        for (int32_t y = firstY; y < lastY; ++y) {
++            const uint32_t *sourcePixel = (const uint32_t *)(source + sourceBaseOffset +
++                (size_t)(sourceY + y) * sourceStride +
++                (size_t)(sourceX + firstX) * sizeof(uint32_t));
++            uint32_t *destinationPixel = destination +
++                (size_t)(destinationY + y) * MISTER_WIDTH + destinationX + firstX;
++            if (tint == 0xffffffffu) {
++                int32_t x = firstX;
++#if defined(__ARM_NEON)
++                for (; x + 8 <= lastX; x += 8) {
++                    uint32x4_t packed0 = vld1q_u32(sourcePixel);
++                    uint32x4_t packed1 = vld1q_u32(sourcePixel + 4);
++                    uint32x4_t alphaMask = vdupq_n_u32(0xff000000u);
++                    uint32_t alphaOr = neonReduceOrU32(
++                        vandq_u32(vorrq_u32(packed0, packed1), alphaMask));
++                    if (alphaOr == 0) {
++                        sourcePixel += 8;
++                        destinationPixel += 8;
++                        continue;
++                    }
++                    uint32_t alphaAnd = neonReduceAndU32(
++                        vandq_u32(vandq_u32(packed0, packed1), alphaMask));
++                    if (alphaAnd == 0xff000000u) {
++                        vst1q_u32(destinationPixel, packed0);
++                        vst1q_u32(destinationPixel + 4, packed1);
++                        sourcePixel += 8;
++                        destinationPixel += 8;
++                        continue;
++                    }
++                    uint8x8x4_t sourcePixels =
++                        vld4_u8((const uint8_t *)sourcePixel);
++                    uint8x8x4_t destinationPixels =
++                        vld4_u8((const uint8_t *)destinationPixel);
++                    uint8x8_t sourceAlpha = sourcePixels.val[3];
++                    uint8x8x4_t outputPixels;
++                    outputPixels.val[0] = neonBlendChannel(
++                        sourcePixels.val[0], destinationPixels.val[0], sourceAlpha);
++                    outputPixels.val[1] = neonBlendChannel(
++                        sourcePixels.val[1], destinationPixels.val[1], sourceAlpha);
++                    outputPixels.val[2] = neonBlendChannel(
++                        sourcePixels.val[2], destinationPixels.val[2], sourceAlpha);
++                    outputPixels.val[3] = neonBlendAlpha(
++                        destinationPixels.val[3], sourceAlpha);
++                    vst4_u8((uint8_t *)destinationPixel, outputPixels);
++                    sourcePixel += 8;
++                    destinationPixel += 8;
++                }
++#endif
++                for (; x < lastX; ++x) {
++                    uint32_t pixel = *sourcePixel++;
++                    *destinationPixel = gpuAlphaBlend(pixel, *destinationPixel);
++                    destinationPixel++;
++                }
++            } else if (alphaOnlyTint) {
++                int32_t x = firstX;
++#if defined(__ARM_NEON)
++                for (; x + 8 <= lastX; x += 8) {
++                    uint32x4_t packed0 = vld1q_u32(sourcePixel);
++                    uint32x4_t packed1 = vld1q_u32(sourcePixel + 4);
++                    uint32x4_t alphaMask = vdupq_n_u32(0xff000000u);
++                    uint32_t alphaOr = neonReduceOrU32(
++                        vandq_u32(vorrq_u32(packed0, packed1), alphaMask));
++                    if (alphaOr == 0) {
++                        sourcePixel += 8;
++                        destinationPixel += 8;
++                        continue;
++                    }
++                    uint32_t alphaAnd = neonReduceAndU32(
++                        vandq_u32(vandq_u32(packed0, packed1), alphaMask));
++                    if (alphaAnd == 0xff000000u) {
++                        uint32x4_t destination0 = vld1q_u32(destinationPixel);
++                        uint32x4_t destination1 = vld1q_u32(destinationPixel + 4);
++                        uint32x4_t output0 = vreinterpretq_u32_u8(
++                            neonBlendConstantAlphaPacked(
++                                vreinterpretq_u8_u32(packed0),
++                                vreinterpretq_u8_u32(destination0), tintAlpha));
++                        uint32x4_t output1 = vreinterpretq_u32_u8(
++                            neonBlendConstantAlphaPacked(
++                                vreinterpretq_u8_u32(packed1),
++                                vreinterpretq_u8_u32(destination1), tintAlpha));
++                        uint32x4_t rgbMask = vdupq_n_u32(0x00ffffffu);
++                        uint32x4_t opaque = vdupq_n_u32(0xff000000u);
++                        vst1q_u32(destinationPixel,
++                                  vorrq_u32(vandq_u32(output0, rgbMask), opaque));
++                        vst1q_u32(destinationPixel + 4,
++                                  vorrq_u32(vandq_u32(output1, rgbMask), opaque));
++                        sourcePixel += 8;
++                        destinationPixel += 8;
++                        continue;
++                    }
++                    uint8x8x4_t sourcePixels =
++                        vld4_u8((const uint8_t *)sourcePixel);
++                    uint8x8x4_t destinationPixels =
++                        vld4_u8((const uint8_t *)destinationPixel);
++                    uint8x8_t sourceAlpha = neonMul255Round(
++                        sourcePixels.val[3], vdup_n_u8(tintAlpha));
++                    uint8x8x4_t outputPixels;
++                    outputPixels.val[0] = neonBlendChannel(
++                        sourcePixels.val[0], destinationPixels.val[0], sourceAlpha);
++                    outputPixels.val[1] = neonBlendChannel(
++                        sourcePixels.val[1], destinationPixels.val[1], sourceAlpha);
++                    outputPixels.val[2] = neonBlendChannel(
++                        sourcePixels.val[2], destinationPixels.val[2], sourceAlpha);
++                    outputPixels.val[3] = neonBlendAlpha(
++                        destinationPixels.val[3], sourceAlpha);
++                    vst4_u8((uint8_t *)destinationPixel, outputPixels);
++                    sourcePixel += 8;
++                    destinationPixel += 8;
++                }
++#endif
++                for (; x < lastX; ++x) {
++                    uint32_t pixel = *sourcePixel++;
++                    uint32_t alpha = gpuMul255((uint8_t)(pixel >> 24), tintAlpha);
++                    pixel = (pixel & 0x00ffffffu) | (alpha << 24);
++                    *destinationPixel = gpuAlphaBlend(pixel, *destinationPixel);
++                    destinationPixel++;
++                }
++            } else {
++                for (int32_t x = firstX; x < lastX; ++x) {
++                    uint32_t pixel = gpuApplyTint(*sourcePixel++, tint);
++                    *destinationPixel = gpuAlphaBlend(pixel, *destinationPixel);
++                    destinationPixel++;
++                }
++            }
++        }
++        return true;
++    }
++
++    for (uint32_t y = 0; y < height; ++y) {
++        int32_t outputY = destinationY + (int32_t)y;
++        uint32_t vBits = (uint32_t)vStart + (uint32_t)((uint64_t)(uint32_t)vStep * y);
++        int32_t sourceY = gpuFixedFloor((int32_t)vBits);
++        if (outputY < clipYStart || outputY >= clipYEnd) continue;
++        if (sourceY < 0) return false;
++
++        for (uint32_t x = 0; x < width; ++x) {
++            int32_t outputX = destinationX + (int32_t)x;
++            if (outputX < 0 || outputX >= MISTER_WIDTH) continue;
++            uint32_t uBits = (uint32_t)uStart + (uint32_t)((uint64_t)(uint32_t)uStep * x);
++            int32_t sourceX = gpuFixedFloor((int32_t)uBits);
++            if (sourceX < 0) return false;
++            size_t sourceOffset = sourceBaseOffset + (size_t)sourceY * sourceStride +
++                                  (size_t)sourceX * sizeof(uint32_t);
++            if (sourceOffset > sourceRecord->bytes ||
++                sizeof(uint32_t) > sourceRecord->bytes - sourceOffset)
++                return false;
++
++            uint32_t pixel;
++            memcpy(&pixel, source + sourceOffset, sizeof(pixel));
++            if (tint != 0xffffffffu) pixel = gpuApplyTint(pixel, tint);
++            size_t destinationOffset = (size_t)outputY * MISTER_WIDTH + outputX;
++            destination[destinationOffset] = gpuAlphaBlend(pixel, destination[destinationOffset]);
++        }
++    }
++    return true;
++}
++
++static void compositeFillCommand(uint32_t *destination,
++                                 const MisterGpuCommand *command,
++                                 int32_t clipYStart,
++                                 int32_t clipYEnd) {
++    uint16_t width = (uint16_t)(command->word[0] >> 16);
++    uint16_t height = (uint16_t)(command->word[0] >> 32);
++    int16_t destinationX = (int16_t)command->word[2];
++    int16_t destinationY = (int16_t)(command->word[2] >> 16);
++    uint32_t color = (uint32_t)command->word[1];
++    if (destinationX == 0 && destinationY == 0 &&
++        width == MISTER_WIDTH && height == MISTER_HEIGHT && color == 0xcc000000u) {
++        size_t i = (size_t)clipYStart * MISTER_WIDTH;
++        size_t last = (size_t)clipYEnd * MISTER_WIDTH;
++#if defined(__ARM_NEON)
++        for (; i + 8 <= last; i += 8) {
++            uint8x8x4_t pixels = vld4_u8((const uint8_t *)(destination + i));
++            pixels.val[0] = neonScaleFloor255(pixels.val[0], 51);
++            pixels.val[1] = neonScaleFloor255(pixels.val[1], 51);
++            pixels.val[2] = neonScaleFloor255(pixels.val[2], 51);
++            pixels.val[3] = vdup_n_u8(255);
++            vst4_u8((uint8_t *)(destination + i), pixels);
++        }
++#endif
++        for (; i < last; ++i) {
++            uint32_t pixel = destination[i];
++            uint32_t r = gpuDiv255Floor((pixel & 0xffu) * 51u);
++            uint32_t g = gpuDiv255Floor(((pixel >> 8) & 0xffu) * 51u);
++            uint32_t b = gpuDiv255Floor(((pixel >> 16) & 0xffu) * 51u);
++            destination[i] = r | (g << 8) | (b << 16) | 0xff000000u;
++        }
++        return;
++    }
++    for (uint32_t y = 0; y < height; ++y) {
++        int32_t outputY = destinationY + (int32_t)y;
++        if (outputY < clipYStart || outputY >= clipYEnd) continue;
++        for (uint32_t x = 0; x < width; ++x) {
++            int32_t outputX = destinationX + (int32_t)x;
++            if (outputX < 0 || outputX >= MISTER_WIDTH) continue;
++            size_t offset = (size_t)outputY * MISTER_WIDTH + outputX;
++            destination[offset] = gpuAlphaBlend(color, destination[offset]);
++        }
++    }
++}
++
++typedef struct {
++    uint32_t *destination;
++    const MisterGpuCommand *commands;
++    uint32_t commandCount;
++    const MisterGpuTexture *sourceRecord;
++    size_t sourceBaseOffset;
++    const MisterGpuCommand *fill;
++    int32_t clipYStart;
++    int32_t clipYEnd;
++    bool success;
++} MapCompositeBatch;
++
++static void *compositeMapBatch(void *opaque) {
++    MapCompositeBatch *batch = (MapCompositeBatch *)opaque;
++    batch->success = true;
++    for (uint32_t i = 0; i < batch->commandCount; ++i) {
++        if (!compositeAxisCommand(batch->destination, &batch->commands[i],
++                                  batch->sourceRecord, batch->sourceBaseOffset,
++                                  batch->clipYStart, batch->clipYEnd)) {
++            batch->success = false;
++            return NULL;
++        }
++    }
++    if (batch->fill != NULL)
++        compositeFillCommand(batch->destination, batch->fill,
++                             batch->clipYStart, batch->clipYEnd);
++    return NULL;
++}
++
++static bool compositeMapParallel(uint32_t *destination,
++                                 const MisterGpuCommand *commands,
++                                 uint32_t commandCount,
++                                 const MisterGpuTexture *sourceRecord,
++                                 size_t sourceBaseOffset,
++                                 const MisterGpuCommand *fill) {
++    MapCompositeBatch top = {
++        destination, commands, commandCount, sourceRecord, sourceBaseOffset,
++        fill, 0, MISTER_HEIGHT / 2, false
++    };
++    MapCompositeBatch bottom = {
++        destination, commands, commandCount, sourceRecord, sourceBaseOffset,
++        fill, MISTER_HEIGHT / 2, MISTER_HEIGHT, false
++    };
++    pthread_t worker;
++    int created = pthread_create(&worker, NULL, compositeMapBatch, &top);
++    if (created != 0) compositeMapBatch(&top);
++    compositeMapBatch(&bottom);
++    if (created == 0 && pthread_join(worker, NULL) != 0) return false;
++    return top.success && bottom.success;
++}
++
++static bool mapTransitionPatternMatches(const MisterGpuCommand *commands,
++                                        uint32_t blitCount,
++                                        const MisterGpuCommand *fill,
++                                        const MisterGpuCommand *overlays,
++                                        uint32_t overlayCount) {
++    if (blitCount != 5 || overlayCount != 4 ||
++        (uint32_t)fill->word[1] != 0xcc000000u)
++        return false;
++
++    const MisterGpuCommand *base = &commands[0];
++    int32_t baseU = (int32_t)base->word[4];
++    int32_t baseV = (int32_t)(base->word[4] >> 32);
++    if ((uint16_t)(base->word[0] >> 16) != MISTER_WIDTH ||
++        (uint16_t)(base->word[0] >> 32) != MISTER_HEIGHT ||
++        (uint32_t)base->word[2] != 0 ||
++        (uint32_t)base->word[5] != 0x00010000u ||
++        (uint32_t)(base->word[5] >> 32) != 0x00010000u ||
++        (uint32_t)base->word[6] != 0xffffffffu)
++        return false;
++
++    const uint16_t widths[4] = {319, 319, 318, 318};
++    const int16_t xs[4] = {1, 0, 2, 0};
++    const int32_t us[4] = {baseU, baseU + 0x10000,
++                           baseU, baseU + 0x20000};
++    for (uint32_t i = 0; i < 4; ++i) {
++        const MisterGpuCommand *command = &commands[1 + i];
++        if ((uint16_t)(command->word[0] >> 16) != widths[i] ||
++            (uint16_t)(command->word[0] >> 32) != MISTER_HEIGHT ||
++            (int16_t)command->word[2] != xs[i] ||
++            (int16_t)(command->word[2] >> 16) != 0 ||
++            (int32_t)command->word[4] != us[i] ||
++            (int32_t)(command->word[4] >> 32) != baseV ||
++            (uint32_t)command->word[5] != 0x00010000u ||
++            (uint32_t)(command->word[5] >> 32) != 0x00010000u ||
++            ((uint32_t)command->word[6] & 0x00ffffffu) != 0x00ffffffu)
++            return false;
++    }
++    if ((uint8_t)(commands[1].word[6] >> 24) !=
++            (uint8_t)(commands[2].word[6] >> 24) ||
++        (uint8_t)(commands[3].word[6] >> 24) !=
++            (uint8_t)(commands[4].word[6] >> 24))
++        return false;
++
++    const int16_t overlayX[4] = {0, MISTER_WIDTH / 2, 0, MISTER_WIDTH / 2};
++    const int16_t overlayY[4] = {0, 0, MISTER_HEIGHT / 2, MISTER_HEIGHT / 2};
++    const int32_t overlayDu[4] = {0x00010000, -0x00010000,
++                                  0x00010000, -0x00010000};
++    const int32_t overlayDv[4] = {0x00010000, 0x00010000,
++                                  -0x00010000, -0x00010000};
++    uint8_t overlayAlpha = (uint8_t)(overlays[0].word[6] >> 24);
++    for (uint32_t i = 0; i < 4; ++i) {
++        if ((uint16_t)(overlays[i].word[0] >> 16) != MISTER_WIDTH / 2 ||
++            (uint16_t)(overlays[i].word[0] >> 32) != MISTER_HEIGHT / 2 ||
++            (int16_t)overlays[i].word[2] != overlayX[i] ||
++            (int16_t)(overlays[i].word[2] >> 16) != overlayY[i] ||
++            (int32_t)overlays[i].word[5] != overlayDu[i] ||
++            (int32_t)(overlays[i].word[5] >> 32) != overlayDv[i] ||
++            ((uint32_t)overlays[i].word[6] & 0x00ffffffu) != 0x00ffffffu ||
++            (uint8_t)(overlays[i].word[6] >> 24) != overlayAlpha)
++            return false;
++    }
++    return true;
++}
++
++static bool prepareMapBaseRegion(const MisterGpuCommand *base,
++                                 const MisterGpuTexture *record,
++                                 size_t baseOffset) {
++    if (g_gpu_map_base_cache_valid &&
++        g_gpu_map_base_cache_record == record &&
++        g_gpu_map_base_cache_generation == record->generation &&
++        memcmp(&g_gpu_map_base_geometry, base, sizeof(*base)) == 0)
++        return true;
++
++    int32_t sourceX = gpuFixedFloor((int32_t)base->word[4]);
++    int32_t sourceY = gpuFixedFloor((int32_t)(base->word[4] >> 32));
++    uint32_t stride = (uint32_t)(base->word[1] >> 32);
++    bool valid = sourceX >= 0 && sourceY >= 0;
++    bool opaque = true;
++    for (int32_t y = 0; valid && y < MISTER_HEIGHT; ++y) {
++        size_t rowOffset = baseOffset + (size_t)(sourceY + y) * stride +
++                           (size_t)sourceX * sizeof(uint32_t);
++        if (rowOffset > record->bytes ||
++            (size_t)MISTER_WIDTH * sizeof(uint32_t) > record->bytes - rowOffset) {
++            valid = false;
++            break;
++        }
++        const uint32_t *row = (const uint32_t *)((const uint8_t *)record->shadow +
++                                                 rowOffset);
++        for (int32_t x = 0; x < MISTER_WIDTH; ++x) {
++            if ((row[x] >> 24) != 255u) {
++                opaque = false;
++            }
++        }
++    }
++    g_gpu_map_base_geometry = *base;
++    g_gpu_map_base_cache_record = record;
++    g_gpu_map_base_cache_generation = record->generation;
++    g_gpu_map_base_cache_opaque = opaque;
++    g_gpu_map_base_cache_valid = valid;
++    return valid;
++}
++
++static bool prepareMapOverlayPixels(const MisterGpuCommand *overlays,
++                                    const MisterGpuTexture *record,
++                                    size_t baseOffset) {
++    MisterGpuCommand geometry[4];
++    memcpy(geometry, overlays, sizeof(geometry));
++    for (uint32_t i = 0; i < 4; ++i) geometry[i].word[6] = 0xffffffffu;
++    if (g_gpu_map_overlay_cache_valid &&
++        g_gpu_map_overlay_cache_record == record &&
++        g_gpu_map_overlay_cache_generation == record->generation &&
++        memcmp(g_gpu_map_overlay_geometry, geometry, sizeof(geometry)) == 0)
++        return true;
++
++    if (g_gpu_map_overlay_pixels == NULL)
++        g_gpu_map_overlay_pixels = (uint32_t *)malloc(MISTER_FB_BYTES);
++    if (g_gpu_map_overlay_pixels == NULL) return false;
++
++    bool valid = true;
++    bool opaque = true;
++    for (uint32_t i = 0; i < 4 && valid; ++i) {
++        const MisterGpuCommand *command = &overlays[i];
++        uint16_t width = (uint16_t)(command->word[0] >> 16);
++        uint16_t height = (uint16_t)(command->word[0] >> 32);
++        int16_t destinationX = (int16_t)command->word[2];
++        int16_t destinationY = (int16_t)(command->word[2] >> 16);
++        int32_t uStart = (int32_t)command->word[4];
++        int32_t vStart = (int32_t)(command->word[4] >> 32);
++        int32_t uStep = (int32_t)command->word[5];
++        int32_t vStep = (int32_t)(command->word[5] >> 32);
++        uint32_t stride = (uint32_t)(command->word[1] >> 32);
++        for (uint32_t y = 0; y < height && valid; ++y) {
++            int32_t sourceY = gpuFixedFloor((int32_t)((int64_t)vStart +
++                                                       (int64_t)vStep * y));
++            for (uint32_t x = 0; x < width; ++x) {
++                int32_t sourceX = gpuFixedFloor((int32_t)((int64_t)uStart +
++                                                           (int64_t)uStep * x));
++                if (sourceX < 0 || sourceY < 0) {
++                    valid = false;
++                    break;
++                }
++                size_t sourceOffset = baseOffset + (size_t)sourceY * stride +
++                                      (size_t)sourceX * sizeof(uint32_t);
++                if (sourceOffset > record->bytes ||
++                    sizeof(uint32_t) > record->bytes - sourceOffset) {
++                    valid = false;
++                    break;
++                }
++                uint32_t pixel;
++                memcpy(&pixel, (const uint8_t *)record->shadow + sourceOffset,
++                       sizeof(pixel));
++                if ((pixel >> 24) != 255u) {
++                    opaque = false;
++                }
++                g_gpu_map_overlay_pixels[
++                    (size_t)(destinationY + y) * MISTER_WIDTH + destinationX + x] = pixel;
++            }
++        }
++    }
++
++    memcpy(g_gpu_map_overlay_geometry, geometry, sizeof(geometry));
++    g_gpu_map_overlay_cache_record = record;
++    g_gpu_map_overlay_cache_generation = record->generation;
++    g_gpu_map_overlay_cache_opaque = opaque;
++    g_gpu_map_overlay_cache_valid = valid;
++    return valid;
++}
++
++typedef struct {
++    uint32_t *destination;
++    const uint8_t *basePixels;
++    uint32_t baseStride;
++    const uint32_t *overlayPixels;
++    uint8_t ghostAlpha1;
++    uint8_t ghostAlpha2;
++    uint8_t overlayAlpha;
++    uint32_t clearColor;
++    int32_t clipYStart;
++    int32_t clipYEnd;
++} MapTransitionBatch;
++
++static uint32_t blendTintedPixel(uint32_t source, uint32_t destination,
++                                 uint8_t tintAlpha) {
++    uint32_t alpha = gpuMul255((uint8_t)(source >> 24), tintAlpha);
++    return gpuAlphaBlend((source & 0x00ffffffu) | (alpha << 24), destination);
++}
++
++static void *compositeMapTransitionBatch(void *opaque) {
++    MapTransitionBatch *batch = (MapTransitionBatch *)opaque;
++    for (int32_t y = batch->clipYStart; y < batch->clipYEnd; ++y) {
++        const uint32_t *base = (const uint32_t *)(batch->basePixels +
++                                                  (size_t)y * batch->baseStride);
++        const uint32_t *overlay = batch->overlayPixels + (size_t)y * MISTER_WIDTH;
++        uint32_t *destination = batch->destination + (size_t)y * MISTER_WIDTH;
++        int32_t x = 0;
++        for (; x < 2; ++x) {
++            uint32_t pixel = blendTintedPixel(base[x], batch->clearColor, 255);
++            if (x >= 1) pixel = blendTintedPixel(base[x - 1], pixel,
++                                                 batch->ghostAlpha1);
++            pixel = blendTintedPixel(base[x + 1], pixel, batch->ghostAlpha1);
++            if (x >= 2) pixel = blendTintedPixel(base[x - 2], pixel,
++                                                 batch->ghostAlpha2);
++            pixel = blendTintedPixel(base[x + 2], pixel, batch->ghostAlpha2);
++            pixel = gpuAlphaBlend(0xcc000000u, pixel);
++            destination[x] = blendTintedPixel(overlay[x], pixel,
++                                              batch->overlayAlpha);
++        }
++#if defined(__ARM_NEON)
++        for (; x + 8 <= MISTER_WIDTH - 2; x += 8) {
++            uint8x8x4_t pixel;
++            pixel.val[0] = vdup_n_u8((uint8_t)batch->clearColor);
++            pixel.val[1] = vdup_n_u8((uint8_t)(batch->clearColor >> 8));
++            pixel.val[2] = vdup_n_u8((uint8_t)(batch->clearColor >> 16));
++            pixel.val[3] = vdup_n_u8((uint8_t)(batch->clearColor >> 24));
++            pixel = neonBlendTintedPixels(
++                vld4_u8((const uint8_t *)(base + x)), pixel, 255);
++            pixel = neonBlendTintedPixels(
++                vld4_u8((const uint8_t *)(base + x - 1)), pixel,
++                batch->ghostAlpha1);
++            pixel = neonBlendTintedPixels(
++                vld4_u8((const uint8_t *)(base + x + 1)), pixel,
++                batch->ghostAlpha1);
++            pixel = neonBlendTintedPixels(
++                vld4_u8((const uint8_t *)(base + x - 2)), pixel,
++                batch->ghostAlpha2);
++            pixel = neonBlendTintedPixels(
++                vld4_u8((const uint8_t *)(base + x + 2)), pixel,
++                batch->ghostAlpha2);
++            uint8x8_t fillAlpha = vdup_n_u8(204);
++            uint8x8_t black = vdup_n_u8(0);
++            pixel.val[0] = neonBlendChannel(black, pixel.val[0], fillAlpha);
++            pixel.val[1] = neonBlendChannel(black, pixel.val[1], fillAlpha);
++            pixel.val[2] = neonBlendChannel(black, pixel.val[2], fillAlpha);
++            pixel.val[3] = neonBlendAlpha(pixel.val[3], fillAlpha);
++            pixel = neonBlendTintedPixels(
++                vld4_u8((const uint8_t *)(overlay + x)), pixel,
++                batch->overlayAlpha);
++            vst4_u8((uint8_t *)(destination + x), pixel);
++        }
++#endif
++        for (; x < MISTER_WIDTH; ++x) {
++            uint32_t pixel = blendTintedPixel(base[x], batch->clearColor, 255);
++            if (x >= 1) pixel = blendTintedPixel(base[x - 1], pixel,
++                                                 batch->ghostAlpha1);
++            if (x + 1 < MISTER_WIDTH)
++                pixel = blendTintedPixel(base[x + 1], pixel,
++                                         batch->ghostAlpha1);
++            if (x >= 2) pixel = blendTintedPixel(base[x - 2], pixel,
++                                                 batch->ghostAlpha2);
++            if (x + 2 < MISTER_WIDTH)
++                pixel = blendTintedPixel(base[x + 2], pixel,
++                                         batch->ghostAlpha2);
++            pixel = gpuAlphaBlend(0xcc000000u, pixel);
++            destination[x] = blendTintedPixel(overlay[x], pixel,
++                                              batch->overlayAlpha);
++        }
++    }
++    return NULL;
++}
++
++static bool compositeMapTransitionParallel(uint32_t *destination,
++                                           const uint8_t *basePixels,
++                                           uint32_t baseStride,
++                                           uint8_t ghostAlpha1,
++                                           uint8_t ghostAlpha2,
++                                           uint8_t overlayAlpha,
++                                           uint32_t clearColor) {
++    MapTransitionBatch top = {
++        destination, basePixels, baseStride, g_gpu_map_overlay_pixels,
++        ghostAlpha1, ghostAlpha2, overlayAlpha, clearColor,
++        0, MISTER_HEIGHT / 2
++    };
++    MapTransitionBatch bottom = {
++        destination, basePixels, baseStride, g_gpu_map_overlay_pixels,
++        ghostAlpha1, ghostAlpha2, overlayAlpha, clearColor,
++        MISTER_HEIGHT / 2, MISTER_HEIGHT
++    };
++    pthread_t worker;
++    int created = pthread_create(&worker, NULL, compositeMapTransitionBatch, &top);
++    if (created != 0) compositeMapTransitionBatch(&top);
++    compositeMapTransitionBatch(&bottom);
++    return created != 0 || pthread_join(worker, NULL) == 0;
++}
++
++static void replaceMapPrefixWithFused(uint32_t tailIndex,
++                                      uint32_t removedCommandCount) {
++    MisterGpuCommand fused;
++    memset(&fused, 0, sizeof(fused));
++    fused.word[0] = 2u | ((uint64_t)MISTER_WIDTH << 16) |
++                    ((uint64_t)MISTER_HEIGHT << 32);
++    fused.word[1] = g_gpu_fused_physical | ((uint64_t)(MISTER_WIDTH * 4u) << 32);
++    fused.word[5] = 0x00010000u | ((uint64_t)0x00010000u << 32);
++    fused.word[6] = 0xffffffffu;
++    g_gpu_commands[1] = fused;
++    memmove(&g_gpu_commands[2], &g_gpu_commands[tailIndex],
++            (g_gpu_command_count - tailIndex) * sizeof(MisterGpuCommand));
++    g_gpu_command_count -= removedCommandCount;
++}
++
++static bool tryFuseMapBackground(void) {
++    if (g_gpu_command_count < 6 || (g_gpu_commands[0].word[0] & 0x1ffu) != 1u)
++        return false;
++
++    uint32_t sourcePhysical = (uint32_t)g_gpu_commands[1].word[1];
++    uint32_t sourceStride = (uint32_t)(g_gpu_commands[1].word[1] >> 32);
++    if ((g_gpu_commands[1].word[0] & 0x1ffu) != 2u || sourceStride == 0)
++        return false;
++
++    uint32_t blitCount = 0;
++    while (1u + blitCount < g_gpu_command_count && blitCount < 8u) {
++        const MisterGpuCommand *command = &g_gpu_commands[1u + blitCount];
++        if ((command->word[0] & 0x1ffu) != 2u ||
++            (uint32_t)command->word[1] != sourcePhysical ||
++            (uint32_t)(command->word[1] >> 32) != sourceStride ||
++            command->word[3] != 0 || command->word[7] != 0)
++            break;
++        blitCount++;
++    }
++    if (blitCount < 3u) return false;
++
++    uint32_t fillIndex = 1u + blitCount;
++    if (fillIndex >= g_gpu_command_count) return false;
++    const MisterGpuCommand *fill = &g_gpu_commands[fillIndex];
++    if ((fill->word[0] & 0x1ffu) != 3u ||
++        (uint16_t)(fill->word[0] >> 16) != MISTER_WIDTH ||
++        (uint16_t)(fill->word[0] >> 32) != MISTER_HEIGHT ||
++        (uint32_t)fill->word[2] != 0)
++        return false;
++
++    uint32_t overlayCount = 0;
++    uint32_t overlayPhysical = 0;
++    uint32_t overlayStride = 0;
++    uint32_t overlayIndex = fillIndex + 1u;
++    while (overlayIndex + overlayCount < g_gpu_command_count && overlayCount < 4u) {
++        const MisterGpuCommand *command = &g_gpu_commands[overlayIndex + overlayCount];
++        if ((command->word[0] & 0x1ffu) != 2u ||
++            (uint16_t)(command->word[0] >> 16) != MISTER_WIDTH / 2u ||
++            (uint16_t)(command->word[0] >> 32) != MISTER_HEIGHT / 2u ||
++            command->word[3] != 0 || command->word[7] != 0)
++            break;
++        uint32_t physical = (uint32_t)command->word[1];
++        uint32_t stride = (uint32_t)(command->word[1] >> 32);
++        if (overlayCount == 0) {
++            overlayPhysical = physical;
++            overlayStride = stride;
++        } else if (physical != overlayPhysical || stride != overlayStride) {
++            break;
++        }
++        overlayCount++;
++    }
++    if (overlayCount != 4u) overlayCount = 0;
++
++    size_t sourceBaseOffset = 0;
++    const MisterGpuTexture *sourceRecord =
++        textureRecordForPhysical(sourcePhysical, &sourceBaseOffset);
++    if (sourceRecord == NULL || sourceRecord->shadow == NULL) return false;
++
++    size_t overlayBaseOffset = 0;
++    const MisterGpuTexture *overlayRecord = NULL;
++    if (overlayCount != 0) {
++        overlayRecord = textureRecordForPhysical(overlayPhysical, &overlayBaseOffset);
++        if (overlayRecord == NULL || overlayRecord->shadow == NULL) overlayCount = 0;
++    }
++
++    uint32_t basePrefixCount = fillIndex + 1u;
++    uint32_t prefixCount = basePrefixCount + overlayCount;
++    if (prefixCount > GPU_FUSED_PREFIX_COMMANDS) return false;
++
++    uint32_t tailIndex = fillIndex + 1u + overlayCount;
++    if (overlayRecord != NULL &&
++        mapTransitionPatternMatches(&g_gpu_commands[1], blitCount, fill,
++                                    &g_gpu_commands[overlayIndex], overlayCount) &&
++        prepareMapBaseRegion(&g_gpu_commands[1], sourceRecord,
++                             sourceBaseOffset) &&
++        prepareMapOverlayPixels(&g_gpu_commands[overlayIndex], overlayRecord,
++                                overlayBaseOffset)) {
++        bool rebuild = !g_gpu_fused_valid ||
++            g_gpu_fused_source_record != sourceRecord ||
++            g_gpu_fused_source_generation != sourceRecord->generation ||
++            g_gpu_fused_overlay_record != overlayRecord ||
++            g_gpu_fused_overlay_generation != overlayRecord->generation ||
++            g_gpu_fused_source_command_count != prefixCount ||
++            memcmp(g_gpu_fused_source_commands, g_gpu_commands,
++                   prefixCount * sizeof(MisterGpuCommand)) != 0;
++        if (rebuild) {
++            if (g_gpu_fused_pixels == NULL)
++                g_gpu_fused_pixels = (uint32_t *)malloc(MISTER_FB_BYTES);
++            if (g_gpu_fused_pixels == NULL) return false;
++
++            const MisterGpuCommand *base = &g_gpu_commands[1];
++            int32_t sourceX = gpuFixedFloor((int32_t)base->word[4]);
++            int32_t sourceY = gpuFixedFloor((int32_t)(base->word[4] >> 32));
++            uint32_t stride = (uint32_t)(base->word[1] >> 32);
++            const uint8_t *basePixels = (const uint8_t *)sourceRecord->shadow +
++                sourceBaseOffset + (size_t)sourceY * stride +
++                (size_t)sourceX * sizeof(uint32_t);
++            if (!compositeMapTransitionParallel(
++                    g_gpu_fused_pixels, basePixels, stride,
++                    (uint8_t)(g_gpu_commands[2].word[6] >> 24),
++                    (uint8_t)(g_gpu_commands[4].word[6] >> 24),
++                    (uint8_t)(g_gpu_commands[overlayIndex].word[6] >> 24),
++                    (uint32_t)g_gpu_commands[0].word[1]))
++                return false;
++            uint32_t fusedPhysical =
++                MisterGpu_uploadDynamicTexture(g_gpu_fused_pixels, MISTER_FB_BYTES);
++            if (fusedPhysical == 0) return false;
++
++            memcpy(g_gpu_fused_source_commands, g_gpu_commands,
++                   prefixCount * sizeof(MisterGpuCommand));
++            g_gpu_fused_source_command_count = prefixCount;
++            g_gpu_fused_source_record = sourceRecord;
++            g_gpu_fused_source_generation = sourceRecord->generation;
++            g_gpu_fused_overlay_record = overlayRecord;
++            g_gpu_fused_overlay_generation = overlayRecord->generation;
++            g_gpu_fused_physical = fusedPhysical;
++            g_gpu_fused_valid = true;
++        }
++        replaceMapPrefixWithFused(tailIndex, blitCount + overlayCount);
++        return true;
++    }
++
++    bool rebuildBase = !g_gpu_fused_base_valid ||
++        g_gpu_fused_source_record != sourceRecord ||
++        g_gpu_fused_source_generation != sourceRecord->generation ||
++        g_gpu_fused_base_command_count != basePrefixCount ||
++        memcmp(g_gpu_fused_base_commands, g_gpu_commands,
++               basePrefixCount * sizeof(MisterGpuCommand)) != 0;
++
++    if (rebuildBase) {
++        if (g_gpu_fused_base_pixels == NULL)
++            g_gpu_fused_base_pixels = (uint32_t *)malloc(MISTER_FB_BYTES);
++        if (g_gpu_fused_base_pixels == NULL) return false;
++
++        uint32_t clearColor = (uint32_t)g_gpu_commands[0].word[1];
++        for (size_t i = 0; i < (size_t)MISTER_WIDTH * MISTER_HEIGHT; ++i)
++            g_gpu_fused_base_pixels[i] = clearColor;
++        if (!compositeMapParallel(g_gpu_fused_base_pixels, &g_gpu_commands[1],
++                                  blitCount, sourceRecord, sourceBaseOffset,
++                                  fill))
++            return false;
++        memcpy(g_gpu_fused_base_commands, g_gpu_commands,
++               basePrefixCount * sizeof(MisterGpuCommand));
++        g_gpu_fused_base_command_count = basePrefixCount;
++        g_gpu_fused_source_record = sourceRecord;
++        g_gpu_fused_source_generation = sourceRecord->generation;
++        g_gpu_fused_base_valid = true;
++    }
++
++    bool rebuild = rebuildBase || !g_gpu_fused_valid ||
++        g_gpu_fused_overlay_record != overlayRecord ||
++        (overlayRecord != NULL &&
++         g_gpu_fused_overlay_generation != overlayRecord->generation) ||
++        g_gpu_fused_source_command_count != prefixCount ||
++        memcmp(g_gpu_fused_source_commands, g_gpu_commands,
++               prefixCount * sizeof(MisterGpuCommand)) != 0;
++
++    if (rebuild) {
++        if (g_gpu_fused_pixels == NULL)
++            g_gpu_fused_pixels = (uint32_t *)malloc(MISTER_FB_BYTES);
++        if (g_gpu_fused_pixels == NULL) return false;
++
++        memcpy(g_gpu_fused_pixels, g_gpu_fused_base_pixels, MISTER_FB_BYTES);
++        if (overlayCount != 0 &&
++            !compositeMapParallel(g_gpu_fused_pixels,
++                                  &g_gpu_commands[overlayIndex], overlayCount,
++                                  overlayRecord, overlayBaseOffset, NULL))
++            return false;
++        uint32_t fusedPhysical =
++            MisterGpu_uploadDynamicTexture(g_gpu_fused_pixels, MISTER_FB_BYTES);
++        if (fusedPhysical == 0) return false;
++
++        memcpy(g_gpu_fused_source_commands, g_gpu_commands,
++               prefixCount * sizeof(MisterGpuCommand));
++        g_gpu_fused_source_command_count = prefixCount;
++        g_gpu_fused_overlay_record = overlayRecord;
++        g_gpu_fused_overlay_generation =
++            overlayRecord != NULL ? overlayRecord->generation : 0;
++        g_gpu_fused_physical = fusedPhysical;
++        g_gpu_fused_valid = true;
++    }
++
++    replaceMapPrefixWithFused(tailIndex, blitCount + overlayCount);
++    return true;
++}
++
+ bool MisterGpu_addClear(uint32_t rgba) {
+     if (!g_gpu_available || g_gpu_command_count >= GPU_COMMAND_CAPACITY - 1) return false;
+     MisterGpuCommand* command = &g_gpu_commands[g_gpu_command_count++];
+@@ -360,8 +1368,20 @@ bool MisterGpu_addAffineBlit(uint32_t source, uint32_t stride,
+                        int16_t x, int16_t y, uint16_t width, uint16_t height,
+                        int32_t uMin, int32_t uMax, int32_t vMin, int32_t vMax,
+                        int32_t uStart, int32_t vStart,
+-                       int32_t uDx, int32_t vDx, int32_t uDy, int32_t vDy) {
+-    if (!g_gpu_available || source == 0 || g_gpu_command_count >= GPU_COMMAND_CAPACITY - 1) return false;
++                       int32_t uDx, int32_t vDx, int32_t uDy, int32_t vDy,
++                       uint32_t tint, bool additive) {
++    uint32_t needed = (tint != 0xffffffffu || additive) ? 2u : 1u;
++    if (!g_gpu_available || source == 0 ||
++        g_gpu_command_count >= GPU_COMMAND_CAPACITY - needed) return false;
++    if (needed == 2u) {
++        // Affine coordinates occupy all eight descriptor words. Publish tint
++        // and blend state in a small command consumed by the following affine
++        // blit; the FPGA resets it after one use.
++        MisterGpuCommand* setup = &g_gpu_commands[g_gpu_command_count++];
++        memset(setup, 0, sizeof(*setup));
++        setup->word[0] = 5u | ((uint64_t)additive << 8);
++        setup->word[1] = tint;
++    }
+     MisterGpuCommand* command = &g_gpu_commands[g_gpu_command_count++];
+     memset(command, 0, sizeof(*command));
+     command->word[0] = 4u | ((uint64_t)width << 16) | ((uint64_t)height << 32);
+@@ -387,10 +1407,14 @@ bool MisterGpu_finishFrame(uint32_t* cycles) {
+ }
+ 
+ void MisterGpu_readbackRgba(uint8_t* rgba, int32_t width, int32_t height) {
+-    if (rgba == NULL || g_fb == NULL || width != MISTER_WIDTH || height != MISTER_HEIGHT) return;
++    if (rgba == NULL || width != MISTER_WIDTH || height != MISTER_HEIGHT) return;
+     if (!waitGpuCompletion(NULL)) return;
++    if (!g_gpu_last_presented_valid ||
++        g_gpu_native_buffers[g_gpu_last_presented_buffer] == NULL) return;
++    const uint32_t *completed = g_gpu_native_buffers[g_gpu_last_presented_buffer];
++    __sync_synchronize();
+     for (size_t i = 0; i < (size_t)width * height; ++i) {
+-        uint32_t xrgb = g_fb[i];
++        uint32_t xrgb = completed[i];
+         rgba[i * 4 + 0] = (uint8_t)(xrgb >> 16);
+         rgba[i * 4 + 1] = (uint8_t)(xrgb >> 8);
+         rgba[i * 4 + 2] = (uint8_t)xrgb;
+@@ -398,6 +1422,15 @@ void MisterGpu_readbackRgba(uint8_t* rgba, int32_t width, int32_t height) {
+     }
+ }
+ 
++void MisterGpu_continueFrame(void) {
++    // A readback may be a synchronization point rather than a request to
++    // abandon hardware rendering. The completed command list already updated
++    // the shared scanout buffer; start a fresh list that draws on that result.
++    if (!g_gpu_available || g_gpu_pending) return;
++    g_gpu_command_count = 0;
++    g_gpu_software_frame = false;
++}
++
+ void MisterGpu_useSoftwareFrame(void) {
+     // A software fallback writes the same scanout framebuffer as the GPU DMA.
+     // Do not let the two producers overlap.
+@@ -603,12 +1636,41 @@ void platformExit(void) {
+         g_gpu_texture_records[i].shadow = NULL;
+     }
+     g_gpu_texture_record_count = 0;
++    free(g_gpu_fused_base_pixels);
++    g_gpu_fused_base_pixels = NULL;
++    g_gpu_fused_base_valid = false;
++    g_gpu_fused_base_command_count = 0;
++    free(g_gpu_fused_pixels);
++    g_gpu_fused_pixels = NULL;
++    g_gpu_fused_valid = false;
++    g_gpu_fused_source_command_count = 0;
++    g_gpu_fused_source_record = NULL;
++    g_gpu_fused_source_generation = 0;
++    g_gpu_fused_overlay_record = NULL;
++    g_gpu_fused_overlay_generation = 0;
++    free(g_gpu_map_overlay_pixels);
++    g_gpu_map_overlay_pixels = NULL;
++    g_gpu_map_overlay_cache_record = NULL;
++    g_gpu_map_overlay_cache_generation = 0;
++    g_gpu_map_overlay_cache_valid = false;
++    g_gpu_map_overlay_cache_opaque = false;
++    g_gpu_map_base_cache_record = NULL;
++    g_gpu_map_base_cache_generation = 0;
++    g_gpu_map_base_cache_valid = false;
++    g_gpu_map_base_cache_opaque = false;
++    g_gpu_fused_physical = 0;
+     if (g_input_fd >= 0) {
+         close(g_input_fd);
+         g_input_fd = -1;
+     }
+     closeJoyShared();
+     if (g_gpu_textures != NULL) { munmap(g_gpu_textures, GPU_TEXTURE_BYTES); g_gpu_textures = NULL; }
++    if (g_gpu_native_mapping != NULL) {
++        munmap(g_gpu_native_mapping, GPU_NATIVE_WINDOW_BYTES);
++        g_gpu_native_mapping = NULL;
++        g_gpu_native_buffers[0] = NULL;
++        g_gpu_native_buffers[1] = NULL;
++    }
+     for (uint32_t i = 0; i < GPU_COMMAND_BUFFER_COUNT; ++i) {
+         if (g_gpu_command_buffers[i] != NULL) {
+             munmap(g_gpu_command_buffers[i], GPU_COMMAND_BYTES);
+@@ -689,14 +1751,50 @@ static void reportPresentRate(void) {
+ void platformSwapBuffers(void) {
+     if (g_fb == NULL || g_next_frame == NULL || g_next_width != MISTER_WIDTH || g_next_height != MISTER_HEIGHT) return;
+ 
+-    if (!g_gpu_software_frame && g_gpu_command_count != 0) {
++    bool softwareFrame = g_gpu_software_frame;
++    if (softwareFrame && g_gpu_available) {
++        // Native scanout reads the FPGA's alternating DDR buffers, not
++        // Main_MiSTer's Linux framebuffer. Upload a completed CPU fallback as
++        // one texture and let the FPGA publish it through the same atomic
++        // present path as hardware-rendered frames.
++        MisterGpu_beginFrame();
++        uint32_t source = MisterGpu_uploadDynamicTexture(g_next_frame, MISTER_FB_BYTES);
++        if (source != 0 && MisterGpu_addClear(0xff000000u) &&
++            MisterGpu_addBlit(source, MISTER_WIDTH * 4u, 0, 0,
++                              MISTER_WIDTH, MISTER_HEIGHT,
++                              0, 0, 0x00010000, 0x00010000,
++                              0xffffffffu, false)) {
++            uint32_t cycles = 0;
++            if (MisterGpu_finishFrame(&cycles)) {
++                g_gpu_submitted_frames++;
++                g_gpu_presented = false;
++                reportPresentRate();
++                return;
++            }
++        }
++        logWarn("MiSTer GPU: native presentation of software frame failed\n");
++    }
++
++    if (!softwareFrame && g_gpu_command_count != 0) {
++        tryFuseMapBackground();
+         uint32_t cycles = 0;
+         uint32_t commandCount = g_gpu_command_count;
++        uint64_t waitStart = nowNanos();
+         if (MisterGpu_finishFrame(&cycles)) {
++            double waitMs = (int64_t)(nowNanos() - waitStart) / 1000000.0;
+             g_gpu_submitted_frames++;
+             if (g_runner != NULL && (g_runner->frameCount % 300) == 0)
+                 logInfo("MiSTer GPU submit frame %d: %u commands, previous=%u cycles, submitted=%u\n",
+                         g_runner->frameCount, commandCount, cycles, g_gpu_submitted_frames);
++            if (cycles > 1500000u || waitMs > 18.0) {
++                static uint32_t slowGpuLogs = 0;
++                if (slowGpuLogs < 400) {
++                    logInfo("MiSTer GPU slow frame %d: commands=%u previous=%u cycles wait=%.2f ms\n",
++                            g_runner != NULL ? g_runner->frameCount : -1,
++                            commandCount, cycles, waitMs);
++                    slowGpuLogs++;
++                }
++            }
+         }
+     }
+     if (g_gpu_presented) {
+@@ -764,12 +1862,12 @@ bool platformHandleEvents(void) {
+         pad->buttonDown[2]  |= (misterMask & (1u << 4)) != 0; // Fire
+         pad->buttonDown[0]  |= (misterMask & (1u << 5)) != 0; // Jump
+         pad->buttonDown[1]  |= (misterMask & (1u << 6)) != 0; // Missiles
+-        pad->buttonDown[7]  |= (misterMask & (1u << 7)) != 0; // Morph
+-        pad->buttonDown[5]  |= (misterMask & (1u << 8)) != 0; // Walk
+-        pad->buttonDown[4]  |= (misterMask & (1u << 9)) != 0; // Aim
+-        pad->buttonDown[6]  |= (misterMask & (1u << 10)) != 0; // Aim 2
+-        pad->buttonDown[9]  |= (misterMask & (1u << 11)) != 0; // Start
+-        pad->buttonDown[3]  |= (misterMask & (1u << 12)) != 0; // Weapon Select
++		pad->buttonDown[5]  |= (misterMask & (1u << 7)) != 0; // Walk
++		pad->buttonDown[4]  |= (misterMask & (1u << 8)) != 0; // Aim Up
++		pad->buttonDown[6]  |= (misterMask & (1u << 9)) != 0; // Aim Down
++		pad->buttonDown[3]  |= (misterMask & (1u << 10)) != 0; // Weapon Select
++		pad->buttonDown[9]  |= (misterMask & (1u << 11)) != 0; // Start
++		pad->buttonDown[7]  |= (misterMask & (1u << 12)) != 0; // Morph
+     }
+ 
+     for (int button = 0; button < GP_BUTTON_COUNT; ++button) {
+@@ -784,7 +1882,7 @@ bool platformHandleEvents(void) {
+     // A menu-launched hybrid cannot rely on the FPGA OSD to terminate its HPS
+     // companion. Select+Start exits the runner; the launcher trap restores the
+     // normal MiSTer menu core.
+-    return (misterMask & (1u << 11)) && (misterMask & (1u << 12));
++	return (misterMask & (1u << 10)) && (misterMask & (1u << 11));
+ }
+ 
+ void platformSleepUntil(uint64_t target) {
+diff --git a/src/backends/mister_gpu.h b/src/backends/mister_gpu.h
+index 2efdf76..14459d0 100644
+--- a/src/backends/mister_gpu.h
++++ b/src/backends/mister_gpu.h
+@@ -25,9 +25,11 @@ bool MisterGpu_addAffineBlit(uint32_t source, uint32_t stride,
+                        int16_t x, int16_t y, uint16_t width, uint16_t height,
+                        int32_t uMin, int32_t uMax, int32_t vMin, int32_t vMax,
+                        int32_t uStart, int32_t vStart,
+-                       int32_t uDx, int32_t vDx, int32_t uDy, int32_t vDy);
++                       int32_t uDx, int32_t vDx, int32_t uDy, int32_t vDy,
++                       uint32_t tint, bool additive);
+ bool MisterGpu_finishFrame(uint32_t* cycles);
+ void MisterGpu_readbackRgba(uint8_t* rgba, int32_t width, int32_t height);
++void MisterGpu_continueFrame(void);
+ void MisterGpu_useSoftwareFrame(void);
+ bool MisterGpu_prepareSaveState(void);
+ void MisterGpu_afterSaveStateRestore(void);
+diff --git a/src/loop.c b/src/loop.c
+index a6d115d..ddef2cb 100644
+--- a/src/loop.c
++++ b/src/loop.c
+@@ -1393,7 +1393,13 @@ int loop(CommandLineArgs args, const char *argv0) {
+                 }
+ 
+                 // Run one game step (Begin Step, Keyboard, Alarms, Step, End Step, room transitions)
++#ifdef USE_MISTER
++                uint64_t misterProfileStepStart = nowNanos();
++#endif
+                 Runner_step(runner);
++#ifdef USE_MISTER
++                uint64_t misterProfileStepEnd = nowNanos();
++#endif
+ 
+                 if (freeCamActive) {
+                     memcpy(runner->keyboard->keyDown, currentKeyDown, sizeof(runner->keyboard->keyDown));
+@@ -1443,6 +1449,9 @@ int loop(CommandLineArgs args, const char *argv0) {
+                 }
+ 
+                 // Clear the default framebuffer (window background) to black
++#ifdef USE_MISTER
++                uint64_t misterProfileDrawStart = nowNanos();
++#endif
+ #ifdef ENABLE_SW_RENDERER
+                 if (gfx == SOFTWARE)
+                     SWRenderer_clearFrameBuffer(renderer, 0);
+@@ -1514,6 +1523,9 @@ int loop(CommandLineArgs args, const char *argv0) {
+                 Runner_drawPost(runner, fbWidth, fbHeight);
+                 renderer->vtable->endFrameEnd(renderer);
+                 Runner_drawGUI(runner, fbWidth, fbHeight, gameW, gameH);
++#ifdef USE_MISTER
++                uint64_t misterProfileDrawEnd = nowNanos();
++#endif
+ 
+ #ifdef ENABLE_SCREENSHOTS
+                 // Capture screenshot if this frame matches a requested frame
+@@ -1545,9 +1557,32 @@ int loop(CommandLineArgs args, const char *argv0) {
+                 }
+ 
+                 // Only swap when there isn't a room change to match the original runner.
++#ifdef USE_MISTER
++                uint64_t misterProfilePresentStart = nowNanos();
++#endif
+                 if (runner->pendingRoom == -1)
+                     platformSwapBuffers();
+                 Runner_handlePendingRoomChange(runner);
++#ifdef USE_MISTER
++                uint64_t misterProfilePresentEnd = nowNanos();
++                double misterProfileTotalMs = (int64_t)(misterProfilePresentEnd - frameStartNow) / 1000000.0;
++                if (misterProfileTotalMs > 20.0) {
++                    static uint32_t misterSlowFrameLogs = 0;
++                    if (misterSlowFrameLogs < 600) {
++                        logInfo("MiSTer slow frame %d: total=%.2f step=%.2f draw=%.2f present=%.2f other=%.2f ms\n",
++                                runner->frameCount,
++                                misterProfileTotalMs,
++                                (int64_t)(misterProfileStepEnd - misterProfileStepStart) / 1000000.0,
++                                (int64_t)(misterProfileDrawEnd - misterProfileDrawStart) / 1000000.0,
++                                (int64_t)(misterProfilePresentEnd - misterProfilePresentStart) / 1000000.0,
++                                misterProfileTotalMs -
++                                    (int64_t)(misterProfileStepEnd - misterProfileStepStart) / 1000000.0 -
++                                    (int64_t)(misterProfileDrawEnd - misterProfileDrawStart) / 1000000.0 -
++                                    (int64_t)(misterProfilePresentEnd - misterProfilePresentStart) / 1000000.0);
++                        misterSlowFrameLogs++;
++                    }
++                }
++#endif
+             }
+ 
+             if (RunnerKeyboard_checkPressed(runner->keyboard, VK_BACKSPACE)) {
+diff --git a/src/runner.c b/src/runner.c
+index 3e43a31..bac0982 100644
+--- a/src/runner.c
++++ b/src/runner.c
+@@ -1846,7 +1846,6 @@ static void initRoom(Runner* runner, int32_t roomIndex) {
+ 
+         Instance* inst = hmget(runner->instancesById, roomObj->instanceID);
+         if (inst == nullptr) continue;
+-
+         // Skip instances that already had their Create event fired (persistent carry-overs
+         // that hmget also matches, since instancesById still holds them).
+         if (inst->createEventFired) continue;
+@@ -1877,7 +1876,6 @@ static void initRoom(Runner* runner, int32_t roomIndex) {
+         runner->vmContext->currentEventType = savedEventType;
+         Instance_free(dummy);
+     }
+-
+     // Mark this room as initialized for persistent room support
+     savedState->initialized = true;
+ 
+diff --git a/src/sw_renderer.c b/src/sw_renderer.c
+index 8de1b79..25de466 100644
+--- a/src/sw_renderer.c
++++ b/src/sw_renderer.c
+@@ -155,6 +155,36 @@ static void swGpuFallbackIfOutput(SWRenderer* sw, const char* reason) {
+     if (swGpuIsOutputTarget(sw)) swGpuFallback(sw, reason);
+ }
+ 
++static bool swGpuReadbackCheckpoint(SWRenderer* sw) {
++    if (!sw->gpuFrameEligible || !swGpuIsOutputTarget(sw)) return false;
++    if (sw->gpuHasSkippedDraws) {
++        uint32_t cycles = 0;
++        if (!MisterGpu_finishFrame(&cycles)) return false;
++        uint8_t* destination = nullptr;
++        if (sw->gpuHostContinuation) {
++            destination = sw->hostFramebuffer;
++        } else {
++            int32_t app = sw->base.runner->applicationSurfaceId;
++            if (app >= 0 && (uint32_t)app < sw->surfaceCount && sw->surfaceExistsFlags[app])
++                destination = sw->surfacePixels[app];
++        }
++        if (destination == nullptr) return false;
++        MisterGpu_readbackRgba(destination, 320, 240);
++        MisterGpu_continueFrame();
++        sw->gpuHasSkippedDraws = false;
++        // The completed framebuffer is now the base for the continuation, so
++        // a second clear is neither required nor desirable.
++        sw->gpuSawClear = true;
++        static uint32_t checkpointLogs = 0;
++        if (checkpointLogs < 20) {
++            logInfo("MiSTer GPU readback checkpoint frame %d: %u cycles\n",
++                    sw->base.runner->frameCount, cycles);
++            checkpointLogs++;
++        }
++    }
++    return true;
++}
++
+ static uint32_t swGpuTextureAddress(SWRenderer* sw, const uint8_t* pixels,
+                                     int32_t width, int32_t height) {
+     for (uint32_t page = 0; page < sw->textureCount; ++page) {
+@@ -164,16 +194,120 @@ static uint32_t swGpuTextureAddress(SWRenderer* sw, const uint8_t* pixels,
+     return MisterGpu_uploadDynamicTexture(pixels, (size_t)width * height * 4u);
+ }
+ 
++static uint32_t swGpuPrepareAxisTexture(SWRenderer* sw, const uint8_t* pixels,
++                                        int32_t texW, int32_t texH,
++                                        int32_t dstW, int32_t dstH,
++                                        int32_t* u, int32_t* v,
++                                        int32_t* du, int32_t* dv,
++                                        uint32_t* stride) {
++    for (uint32_t page = 0; page < sw->textureCount; ++page) {
++        if (sw->texturePixels[page] == pixels) {
++            *stride = (uint32_t)texW * 4u;
++            return sw->gpuTextureAddresses[page];
++        }
++    }
++    // Small CPU surfaces already fit the FPGA texture aperture.  Upload the
++    // original allocation so repeated draws share one texture record; the
++    // dynamic uploader also suppresses writes when the surface is unchanged.
++    if (texW > 0 && texH > 0 && texW <= 320 && texH <= 240) {
++        *stride = (uint32_t)texW * 4u;
++        return MisterGpu_uploadDynamicTexture(
++            pixels, (size_t)texW * (size_t)texH * 4u);
++    }
++    if (dstW <= 0 || dstH <= 0 || dstW > 320 || dstH > 240 ||
++        sw->gpuDynamicScratchIndex >= 8) return 0;
++
++    // AM2R's map is a 2048x1024 CPU surface, but only one 320x240 nearest-
++    // sampled view reaches the display. Uploading all 8 MiB every frame takes
++    // over 100 ms through uncached HPS DDR. Materialize exactly the samples the
++    // FPGA will consume into a stable 320x240 staging texture instead.
++    uint32_t slot = sw->gpuDynamicScratchIndex++;
++    uint32_t sourceRevision = 0;
++    bool sourceRevisionKnown = false;
++    for (uint32_t surface = 0; surface < sw->surfaceCount; ++surface) {
++        if (sw->surfaceExistsFlags[surface] && sw->surfacePixels[surface] == pixels) {
++            sourceRevision = sw->surfaceRevisions[surface];
++            sourceRevisionKnown = true;
++            break;
++        }
++    }
++    if (sourceRevisionKnown && sw->gpuDynamicScratchAddress[slot] != 0 &&
++        sw->gpuDynamicScratchSource[slot] == pixels &&
++        sw->gpuDynamicScratchSourceRevision[slot] == sourceRevision &&
++        sw->gpuDynamicScratchTexWidth[slot] == texW &&
++        sw->gpuDynamicScratchTexHeight[slot] == texH &&
++        sw->gpuDynamicScratchDstWidth[slot] == dstW &&
++        sw->gpuDynamicScratchDstHeight[slot] == dstH &&
++        sw->gpuDynamicScratchU[slot] == *u && sw->gpuDynamicScratchV[slot] == *v &&
++        sw->gpuDynamicScratchDu[slot] == *du && sw->gpuDynamicScratchDv[slot] == *dv) {
++        *u = 0;
++        *v = 0;
++        *du = 1 << 16;
++        *dv = 1 << 16;
++        *stride = 320u * 4u;
++        return sw->gpuDynamicScratchAddress[slot];
++    }
++    bool newSlot = sw->gpuDynamicScratch[slot] == nullptr;
++    if (newSlot)
++        sw->gpuDynamicScratch[slot] = (uint8_t*)safeCalloc(320u * 240u, 4u);
++    uint32_t* output = (uint32_t*)sw->gpuDynamicScratch[slot];
++    const uint32_t* source = (const uint32_t*)pixels;
++    for (int32_t y = 0; y < dstH; ++y) {
++        int32_t sy = (int32_t)(((int64_t)*v + (int64_t)y * *dv) >> 16);
++        if (sy < 0) sy = 0;
++        if (sy >= texH) sy = texH - 1;
++        for (int32_t x = 0; x < dstW; ++x) {
++            int32_t sx = (int32_t)(((int64_t)*u + (int64_t)x * *du) >> 16);
++            if (sx < 0) sx = 0;
++            if (sx >= texW) sx = texW - 1;
++            output[(size_t)y * 320u + (uint32_t)x] =
++                source[(size_t)sy * (uint32_t)texW + (uint32_t)sx];
++        }
++    }
++    if (newSlot && sw->gpuDynamicResampleLogs < 8) {
++        logInfo("MiSTer GPU dynamic surface slot %u: sampled %dx%d to %dx%d "
++                "uv=%d,%d step=%d,%d (%u-byte buffer)\n",
++                slot, texW, texH, dstW, dstH, *u, *v, *du, *dv,
++                320u * 240u * 4u);
++        sw->gpuDynamicResampleLogs++;
++    }
++    uint32_t address = MisterGpu_uploadDynamicTexture(
++        sw->gpuDynamicScratch[slot], 320u * 240u * 4u);
++    if (address != 0 && sourceRevisionKnown) {
++        sw->gpuDynamicScratchSource[slot] = pixels;
++        sw->gpuDynamicScratchSourceRevision[slot] = sourceRevision;
++        sw->gpuDynamicScratchTexWidth[slot] = texW;
++        sw->gpuDynamicScratchTexHeight[slot] = texH;
++        sw->gpuDynamicScratchDstWidth[slot] = dstW;
++        sw->gpuDynamicScratchDstHeight[slot] = dstH;
++        sw->gpuDynamicScratchU[slot] = *u;
++        sw->gpuDynamicScratchV[slot] = *v;
++        sw->gpuDynamicScratchDu[slot] = *du;
++        sw->gpuDynamicScratchDv[slot] = *dv;
++        sw->gpuDynamicScratchAddress[slot] = address;
++    } else {
++        sw->gpuDynamicScratchSource[slot] = nullptr;
++        sw->gpuDynamicScratchAddress[slot] = 0;
++    }
++    *u = 0;
++    *v = 0;
++    *du = 1 << 16;
++    *dv = 1 << 16;
++    *stride = 320u * 4u;
++    return address;
++}
++
+ static bool swGpuTryAffineQuad(SWRenderer* sw, SWVertex v[4],
+                                const uint8_t* texPixels, int32_t texW, int32_t texH) {
+     if (texPixels == nullptr || texW <= 0 || texH <= 0 ||
+         !sw->gpuFrameEligible || !sw->gpuSawClear || !swGpuIsOutputTarget(sw) ||
+-        !sw->blendEnable || sw->blendMode != bm_normal || sw->alphaTestEnable ||
++        !sw->blendEnable || (sw->blendMode != bm_normal && sw->blendMode != bm_add) || sw->alphaTestEnable ||
+         sw->fogEnable || !sw->colorWriteR || !sw->colorWriteG ||
+         !sw->colorWriteB || !sw->colorWriteA) return false;
+ 
+-    for (int i = 0; i < 4; ++i) {
+-        if (v[i].r != 1.0f || v[i].g != 1.0f || v[i].b != 1.0f || v[i].a != 1.0f)
++    for (int i = 1; i < 4; ++i) {
++        if (v[i].r != v[0].r || v[i].g != v[0].g ||
++            v[i].b != v[0].b || v[i].a != v[0].a)
+             return false;
+     }
+ 
+@@ -227,7 +361,12 @@ static bool swGpuTryAffineQuad(SWRenderer* sw, SWVertex v[4],
+        (int16_t)minX,(int16_t)minY,(uint16_t)(maxX-minX),(uint16_t)(maxY-minY),
+        (int32_t)fuMin,(int32_t)fuMax,(int32_t)fvMin,(int32_t)fvMax,
+        (int32_t)fuStart,(int32_t)fvStart,(int32_t)fuDx,(int32_t)fvDx,
+-       (int32_t)fuDy,(int32_t)fvDy)) return false;
++       (int32_t)fuDy,(int32_t)fvDy,
++       (uint32_t)floatColorByte(v[0].r) |
++       ((uint32_t)floatColorByte(v[0].g) << 8) |
++       ((uint32_t)floatColorByte(v[0].b) << 16) |
++       ((uint32_t)floatColorByte(v[0].a) << 24),
++       sw->blendMode == bm_add)) return false;
+     sw->frameTriangleQuads++;
+     sw->frameTrianglePixels+=(uint64_t)(maxX-minX)*(uint64_t)(maxY-minY);
+     sw->gpuHasSkippedDraws=true;
+@@ -452,10 +591,14 @@ static bool rasterizeAxisAlignedQuad(SWRenderer* sw, SWVertex v[4], const uint8_
+                 stepX>=INT32_MIN&&stepX<=INT32_MAX&&stepYDouble>=INT32_MIN&&stepYDouble<=INT32_MAX&&
+                 dr>=INT16_MIN&&dr<=INT16_MAX&&dg>=INT16_MIN&&dg<=INT16_MAX&&
+                 db>=INT16_MIN&&db<=INT16_MAX&&da>=INT16_MIN&&da<=INT16_MAX;
+-            uint32_t textureAddress=swGpuTextureAddress(sw,texPixels,texW,texH);
+-            if(textureAddress&&fits&&MisterGpu_addBlitVGradient(textureAddress,(uint32_t)texW*4u,
++            int32_t gpuU=(int32_t)startX,gpuV=(int32_t)startY;
++            int32_t gpuDu=(int32_t)stepX,gpuDv=(int32_t)stepYDouble;
++            uint32_t gpuStride=0;
++            uint32_t textureAddress=fits ? swGpuPrepareAxisTexture(sw,texPixels,texW,texH,
++                maxX-minX,maxY-minY,&gpuU,&gpuV,&gpuDu,&gpuDv,&gpuStride) : 0;
++            if(textureAddress&&fits&&MisterGpu_addBlitVGradient(textureAddress,gpuStride,
+                (int16_t)minX,(int16_t)minY,(uint16_t)(maxX-minX),(uint16_t)(maxY-minY),
+-               (int32_t)startX,(int32_t)startY,(int32_t)stepX,(int32_t)stepYDouble,
++               gpuU,gpuV,gpuDu,gpuDv,
+                tintStart,(int16_t)dr,(int16_t)dg,(int16_t)db,(int16_t)da,additive)){
+                 sw->framePlainQuads++;
+                 sw->framePlainPixels+=(uint64_t)(maxX-minX)*(uint64_t)(maxY-minY);
+@@ -476,17 +619,20 @@ static bool rasterizeAxisAlignedQuad(SWRenderer* sw, SWVertex v[4], const uint8_
+         const int64_t startX=(int64_t)((srcX0+(((double)minX+0.5)-v[0].x)*srcDx)*65536.0);
+ #ifdef USE_MISTER
+         if (sw->gpuFrameEligible && sw->gpuSawClear && swGpuIsOutputTarget(sw) && sw->blendEnable) {
+-            uint32_t textureAddress = swGpuTextureAddress(sw, texPixels, texW, texH);
+             const int64_t startY = (int64_t)((srcY0 + (((double)minY + 0.5) - v[0].y) * srcDy) * 65536.0);
+             const double stepYDouble = srcDy * 65536.0;
+             const bool coordinatesFit = stepX >= INT32_MIN && stepX <= INT32_MAX &&
+                 startX >= INT32_MIN && startX <= INT32_MAX && startY >= INT32_MIN && startY <= INT32_MAX &&
+                 stepYDouble >= INT32_MIN && stepYDouble <= INT32_MAX;
++            int32_t gpuU=(int32_t)startX,gpuV=(int32_t)startY;
++            int32_t gpuDu=(int32_t)stepX,gpuDv=(int32_t)stepYDouble;
++            uint32_t gpuStride=0;
++            uint32_t textureAddress=coordinatesFit ? swGpuPrepareAxisTexture(sw,texPixels,texW,texH,
++                maxX-minX,maxY-minY,&gpuU,&gpuV,&gpuDu,&gpuDv,&gpuStride) : 0;
+             if (textureAddress != 0 && coordinatesFit &&
+-                MisterGpu_addBlit(textureAddress, (uint32_t)texW * 4u,
++                MisterGpu_addBlit(textureAddress, gpuStride,
+                     (int16_t)minX, (int16_t)minY, (uint16_t)(maxX-minX), (uint16_t)(maxY-minY),
+-                    (int32_t)startX, (int32_t)startY, (int32_t)stepX,
+-                    (int32_t)stepYDouble, tint, additive)) {
++                    gpuU, gpuV, gpuDu, gpuDv, tint, additive)) {
+                 sw->gpuHasSkippedDraws = true;
+                 return true;
+             }
+@@ -589,12 +735,23 @@ static void swUseHostTarget(SWRenderer* sw) {
+     sw->currentSurface = RENDER_TARGET_HOST_FRAMEBUFFER;
+ }
+ 
++static void swMarkSurfaceWrite(SWRenderer* sw, int32_t id) {
++    if (id < 0 || (uint32_t)id >= sw->surfaceCount) return;
++    sw->surfaceWriteSerial++;
++    if (sw->surfaceWriteSerial == 0) sw->surfaceWriteSerial++;
++    sw->surfaceRevisions[id] = sw->surfaceWriteSerial;
++}
++
+ static bool swUseSurfaceTarget(SWRenderer* sw, int32_t id) {
+     if (id < 0 || (uint32_t)id >= sw->surfaceCount || !sw->surfaceExistsFlags[id]) return false;
+     sw->framebuffer = sw->surfacePixels[id];
+     sw->fbWidth = sw->surfaceWidths[id];
+     sw->fbHeight = sw->surfaceHeights[id];
+     sw->currentSurface = id;
++    // Selecting a surface as a render target is the GameMaker write barrier.
++    // Bump its generation before drawing so cached FPGA staging textures are
++    // reused only while the source surface is genuinely unchanged.
++    swMarkSurfaceWrite(sw, id);
+     return true;
+ }
+ 
+@@ -606,11 +763,13 @@ static void swEnsureSurfaceCapacity(SWRenderer* sw, uint32_t needed) {
+     sw->surfaceWidths = (int32_t*)safeRealloc(sw->surfaceWidths, newCapacity * sizeof(int32_t));
+     sw->surfaceHeights = (int32_t*)safeRealloc(sw->surfaceHeights, newCapacity * sizeof(int32_t));
+     sw->surfaceExistsFlags = (bool*)safeRealloc(sw->surfaceExistsFlags, newCapacity * sizeof(bool));
++    sw->surfaceRevisions = (uint32_t*)safeRealloc(sw->surfaceRevisions, newCapacity * sizeof(uint32_t));
+     for (uint32_t i = sw->surfaceCapacity; i < newCapacity; ++i) {
+         sw->surfacePixels[i] = nullptr;
+         sw->surfaceWidths[i] = 0;
+         sw->surfaceHeights[i] = 0;
+         sw->surfaceExistsFlags[i] = false;
++        sw->surfaceRevisions[i] = 0;
+     }
+     sw->surfaceCapacity = newCapacity;
+ }
+@@ -648,6 +807,9 @@ static bool swEnsureTextureLoaded(SWRenderer* sw, uint32_t pageId) {
+ static void swInit(Renderer* renderer, DataWin* dataWin) {
+     SWRenderer* sw = (SWRenderer*) renderer;
+     renderer->dataWin = dataWin;
++#ifdef USE_MISTER
++    sw->am2rMapSurfaceId = -1;
++#endif
+ 
+     // Texture pages are decoded on demand so the MiSTer does not pay the
+     // memory cost for rooms it has not visited.
+@@ -681,12 +843,14 @@ static void swDestroy(Renderer* renderer) {
+     free(sw->textureLoaded);
+ #ifdef USE_MISTER
+     free(sw->gpuTextureAddresses);
++    for (uint32_t i = 0; i < 8; ++i) free(sw->gpuDynamicScratch[i]);
+ #endif
+     for (uint32_t i = 0; i < sw->surfaceCount; ++i) free(sw->surfacePixels[i]);
+     free(sw->surfacePixels);
+     free(sw->surfaceWidths);
+     free(sw->surfaceHeights);
+     free(sw->surfaceExistsFlags);
++    free(sw->surfaceRevisions);
+     free(sw->hostFramebuffer);
+     free(sw);
+ }
+@@ -711,17 +875,28 @@ static void swBeginFrame(Renderer* renderer, int32_t gameW, int32_t gameH, int32
+     sw->scissorH = sw->fbHeight;
+ #ifdef USE_MISTER
+     MisterGpu_beginFrame();
++    sw->gpuDynamicScratchIndex = 0;
+     sw->gpuFrameEligible = MisterGpu_isAvailable() && sw->fbWidth == 320 && sw->fbHeight == 240 &&
+                            sw->currentSurface == renderer->runner->applicationSurfaceId;
+     sw->gpuSawClear = false;
+     sw->gpuHasSkippedDraws = false;
+     sw->gpuHostContinuation = false;
++    sw->gpuApplicationSurfaceTransferred = false;
+ #endif
+ }
+ 
+ static void swEndFrameInit(Renderer* renderer) {
+-    if (renderer->runner->usingAppSurface && !renderer->runner->appSurfaceAutoDraw)
+-        swUseHostTarget((SWRenderer*)renderer);
++    if (renderer->runner->usingAppSurface && !renderer->runner->appSurfaceAutoDraw) {
++        SWRenderer* sw = (SWRenderer*)renderer;
++        swUseHostTarget(sw);
++#ifdef USE_MISTER
++        // GameMaker effects such as AM2R's map transition explicitly draw the
++        // application surface after disabling automatic presentation. The
++        // host framebuffer is still the same visible GPU target, so keep
++        // recording commands on top of the completed/read-back base frame.
++        if (sw->gpuFrameEligible) sw->gpuHostContinuation = true;
++#endif
++    }
+ }
+ 
+ static void swEndFrameEnd(Renderer* renderer) {
+@@ -1550,6 +1725,18 @@ static void swGpuSetFog(Renderer* renderer, bool enable, uint32_t color) { SWRen
+ static int32_t swCreateSurface(Renderer* renderer, int32_t width, int32_t height) {
+     SWRenderer* sw = (SWRenderer*)renderer;
+     if (width <= 0 || height <= 0) return -1;
++#ifdef USE_MISTER
++    if (width == 2048 && height == 1024 && sw->am2rMapSurfaceRetained &&
++        sw->am2rMapSurfaceId >= 0 &&
++        (uint32_t)sw->am2rMapSurfaceId < sw->surfaceCount &&
++        sw->surfaceExistsFlags[sw->am2rMapSurfaceId] &&
++        sw->surfaceWidths[sw->am2rMapSurfaceId] == width &&
++        sw->surfaceHeights[sw->am2rMapSurfaceId] == height) {
++        sw->am2rMapSurfaceRetained = false;
++        sw->am2rMapSurfaceReused = true;
++        return sw->am2rMapSurfaceId;
++    }
++#endif
+     uint32_t id;
+     for (id = 0; id < sw->surfaceCount; ++id) if (!sw->surfaceExistsFlags[id]) break;
+     if (id == sw->surfaceCount) {
+@@ -1561,6 +1748,7 @@ static int32_t swCreateSurface(Renderer* renderer, int32_t width, int32_t height
+     sw->surfaceWidths[id] = width;
+     sw->surfaceHeights[id] = height;
+     sw->surfaceExistsFlags[id] = true;
++    swMarkSurfaceWrite(sw, (int32_t)id);
+     return (int32_t)id;
+ }
+ 
+@@ -1581,6 +1769,7 @@ static int32_t swEnsureApplicationSurface(Renderer* renderer, int32_t width, int
+         sw->surfacePixels[id] = pixels;
+         sw->surfaceWidths[id] = width;
+         sw->surfaceHeights[id] = height;
++        swMarkSurfaceWrite(sw, id);
+     }
+     return id;
+ }
+@@ -1608,17 +1797,77 @@ static void swSurfaceResize(Renderer* renderer, int32_t id, int32_t width, int32
+     free(sw->surfacePixels[id]);
+     sw->surfacePixels[id]=(uint8_t*)safeCalloc((size_t)width*(size_t)height,4);
+     sw->surfaceWidths[id]=width; sw->surfaceHeights[id]=height;
++    swMarkSurfaceWrite(sw,id);
+     if (current) swUseSurfaceTarget(sw,id);
+ }
+ 
+ static void swSurfaceFree(Renderer* renderer, int32_t id) {
+     SWRenderer* sw=(SWRenderer*)renderer;
+     if (!swSurfaceExists(renderer,id) || id == renderer->runner->applicationSurfaceId) return;
++#ifdef USE_MISTER
++    if (id == sw->am2rMapSurfaceId && sw->am2rMapSurfaceCacheValid &&
++        sw->surfaceWidths[id] == 2048 && sw->surfaceHeights[id] == 1024) {
++        if (sw->currentSurface == id) swUseHostTarget(sw);
++        sw->am2rMapSurfaceRetained = true;
++        sw->am2rMapSurfaceReused = false;
++        return;
++    }
++#endif
+     if (sw->currentSurface == id) swUseHostTarget(sw);
+     free(sw->surfacePixels[id]); sw->surfacePixels[id]=nullptr;
+     sw->surfaceWidths[id]=sw->surfaceHeights[id]=0; sw->surfaceExistsFlags[id]=false;
++    sw->surfaceRevisions[id]=0;
+ }
+ 
++#ifdef USE_MISTER
++static bool swIsAm2rMapTarget(const SWRenderer* sw) {
++    int32_t id = sw->currentSurface;
++    return id >= 0 && (uint32_t)id < sw->surfaceCount &&
++           sw->surfaceExistsFlags[id] && sw->surfaceWidths[id] == 2048 &&
++           sw->surfaceHeights[id] == 1024;
++}
++
++SWAm2rMapCacheMode SWRenderer_misterPrepareAm2rMapSurface(
++        Renderer* renderer, uint64_t topologyHash, uint64_t discoveryHash,
++        bool incrementalEligible) {
++    if (renderer == nullptr || !swIsAm2rMapTarget((SWRenderer*)renderer))
++        return SW_AM2R_MAP_CACHE_REBUILD;
++    SWRenderer* sw = (SWRenderer*)renderer;
++    bool reusable = sw->am2rMapSurfaceReused && sw->am2rMapSurfaceCacheValid &&
++                    sw->currentSurface == sw->am2rMapSurfaceId;
++    SWAm2rMapCacheMode mode = SW_AM2R_MAP_CACHE_REBUILD;
++    if (reusable && sw->am2rMapSurfaceTopologyHash == topologyHash) {
++        if (sw->am2rMapSurfaceDiscoveryHash == discoveryHash)
++            mode = SW_AM2R_MAP_CACHE_HIT;
++        else if (incrementalEligible)
++            mode = SW_AM2R_MAP_CACHE_INCREMENTAL;
++    }
++    if (sw->am2rMapSurfaceLogCount < 16) {
++        const char* modeName = mode == SW_AM2R_MAP_CACHE_HIT ? "hit" :
++                               (mode == SW_AM2R_MAP_CACHE_INCREMENTAL ?
++                                "incremental" : "rebuild");
++        logInfo("MiSTer AM2R map surface cache: %s id=%d topology=%08x%08x discovery=%08x%08x\n",
++                modeName, sw->currentSurface,
++                (uint32_t)(topologyHash >> 32), (uint32_t)topologyHash,
++                (uint32_t)(discoveryHash >> 32), (uint32_t)discoveryHash);
++        sw->am2rMapSurfaceLogCount++;
++    }
++    return mode;
++}
++
++void SWRenderer_misterCommitAm2rMapSurface(
++        Renderer* renderer, uint64_t topologyHash, uint64_t discoveryHash) {
++    if (renderer == nullptr || !swIsAm2rMapTarget((SWRenderer*)renderer)) return;
++    SWRenderer* sw = (SWRenderer*)renderer;
++    sw->am2rMapSurfaceId = sw->currentSurface;
++    sw->am2rMapSurfaceTopologyHash = topologyHash;
++    sw->am2rMapSurfaceDiscoveryHash = discoveryHash;
++    sw->am2rMapSurfaceCacheValid = true;
++    sw->am2rMapSurfaceRetained = false;
++    sw->am2rMapSurfaceReused = false;
++}
++#endif
++
+ static void swDrawPixelBuffer(SWRenderer* sw, const uint8_t* pixels, int32_t texW, int32_t texH,
+                               int32_t srcLeft, int32_t srcTop, int32_t srcWidth, int32_t srcHeight,
+                               float x, float y, float xscale, float yscale, float angleDeg,
+@@ -1644,6 +1893,29 @@ static void swDrawSurfaceColor(Renderer* renderer, int32_t id, int32_t srcLeft,
+     SWRenderer* sw=(SWRenderer*)renderer;
+     if (!swSurfaceExists(renderer,id)) return;
+     if (srcWidth < 0) {srcLeft=srcTop=0;srcWidth=sw->surfaceWidths[id];srcHeight=sw->surfaceHeights[id];}
++#ifdef USE_MISTER
++    // AM2R disables GameMaker's automatic application-surface presentation and
++    // explicitly draws that surface at 1:1 onto the host framebuffer. While
++    // the FPGA owns the frame, its internal framebuffer already *is* the live
++    // application surface. Uploading the stale CPU shadow here covers the
++    // completed game scene with black. Treat the first exact full-frame copy as
++    // the target handoff; later or transformed copies retain normal semantics.
++    if (id == renderer->runner->applicationSurfaceId &&
++        sw->currentSurface == RENDER_TARGET_HOST_FRAMEBUFFER &&
++        sw->gpuFrameEligible && sw->gpuHostContinuation &&
++        sw->gpuHasSkippedDraws && !sw->gpuApplicationSurfaceTransferred &&
++        srcLeft == 0 && srcTop == 0 &&
++        srcWidth == sw->surfaceWidths[id] && srcHeight == sw->surfaceHeights[id] &&
++        srcWidth == sw->hostWidth && srcHeight == sw->hostHeight &&
++        fabsf(x) < 0.0001f && fabsf(y) < 0.0001f &&
++        fabsf(xscale - 1.0f) < 0.0001f && fabsf(yscale - 1.0f) < 0.0001f &&
++        fabsf(angleDeg) < 0.0001f && fabsf(alpha - 1.0f) < 0.0001f &&
++        c1 == 0x00ffffffu && c2 == 0x00ffffffu &&
++        c3 == 0x00ffffffu && c4 == 0x00ffffffu) {
++        sw->gpuApplicationSurfaceTransferred = true;
++        return;
++    }
++#endif
+     swDrawPixelBuffer(sw,sw->surfacePixels[id],sw->surfaceWidths[id],sw->surfaceHeights[id],srcLeft,srcTop,srcWidth,srcHeight,x,y,xscale,yscale,angleDeg,c1,c2,c3,c4,alpha);
+ }
+ 
+@@ -1680,12 +1952,14 @@ static void swSurfaceCopy(Renderer* renderer, int32_t dstId, int32_t dx, int32_t
+     for(int32_t row=0;row<sheight;++row)memcpy(temp+(size_t)row*swidth*4,sw->surfacePixels[srcId]+((size_t)(sy+row)*sw->surfaceWidths[srcId]+sx)*4,(size_t)swidth*4);
+     for(int32_t row=0;row<sheight;++row)memcpy(sw->surfacePixels[dstId]+((size_t)(dy+row)*sw->surfaceWidths[dstId]+dx)*4,temp+(size_t)row*swidth*4,(size_t)swidth*4);
+     free(temp);
++    swMarkSurfaceWrite(sw,dstId);
+ }
+ 
+ static bool swSurfaceGetPixels(Renderer* renderer, int32_t id, uint8_t* outRGBA) {
+     SWRenderer* sw=(SWRenderer*)renderer; if(!swSurfaceExists(renderer,id)||outRGBA==nullptr)return false;
+ #ifdef USE_MISTER
+-    if (id == renderer->runner->applicationSurfaceId)
++    if (id == renderer->runner->applicationSurfaceId &&
++        !swGpuReadbackCheckpoint(sw))
+         swGpuFallback(sw, "application surface readback");
+ #endif
+     memcpy(outRGBA,sw->surfacePixels[id],(size_t)sw->surfaceWidths[id]*sw->surfaceHeights[id]*4);return true;
+diff --git a/src/sw_renderer.h b/src/sw_renderer.h
+index 113920d..7df123e 100644
+--- a/src/sw_renderer.h
++++ b/src/sw_renderer.h
+@@ -4,6 +4,14 @@
+ #include "renderer.h"
+ #include "matrix_math.h"
+ 
++#ifdef USE_MISTER
++typedef enum {
++    SW_AM2R_MAP_CACHE_REBUILD = 0,
++    SW_AM2R_MAP_CACHE_HIT = 1,
++    SW_AM2R_MAP_CACHE_INCREMENTAL = 2,
++} SWAm2rMapCacheMode;
++#endif
++
+ // ===[ SWRenderer Struct ]===
+ 
+ typedef struct {
+@@ -22,6 +30,8 @@ typedef struct {
+     int32_t* surfaceWidths;
+     int32_t* surfaceHeights;
+     bool* surfaceExistsFlags;
++    uint32_t* surfaceRevisions;
++    uint32_t surfaceWriteSerial;
+     uint32_t surfaceCount;
+     uint32_t surfaceCapacity;
+     int32_t currentSurface;
+@@ -65,10 +75,45 @@ typedef struct {
+     bool gpuSawClear;
+     bool gpuHasSkippedDraws;
+     bool gpuHostContinuation;
++    bool gpuApplicationSurfaceTransferred;
+     uint32_t gpuFallbackFrames;
+     uint32_t gpuCompletedFrames;
++    uint8_t* gpuDynamicScratch[8];
++    const uint8_t* gpuDynamicScratchSource[8];
++    uint32_t gpuDynamicScratchSourceRevision[8];
++    int32_t gpuDynamicScratchTexWidth[8];
++    int32_t gpuDynamicScratchTexHeight[8];
++    int32_t gpuDynamicScratchDstWidth[8];
++    int32_t gpuDynamicScratchDstHeight[8];
++    int32_t gpuDynamicScratchU[8];
++    int32_t gpuDynamicScratchV[8];
++    int32_t gpuDynamicScratchDu[8];
++    int32_t gpuDynamicScratchDv[8];
++    uint32_t gpuDynamicScratchAddress[8];
++    uint32_t gpuDynamicScratchIndex;
++    uint32_t gpuDynamicResampleLogs;
++
++    // AM2R rebuilds its 2048x1024 map surface whenever rm_subscreen is
++    // entered. Keep the completed surface allocation outside GameMaker's
++    // visible lifecycle so an unchanged map can be reused on the next visit.
++    int32_t am2rMapSurfaceId;
++    bool am2rMapSurfaceRetained;
++    bool am2rMapSurfaceReused;
++    bool am2rMapSurfaceCacheValid;
++    uint64_t am2rMapSurfaceTopologyHash;
++    uint64_t am2rMapSurfaceDiscoveryHash;
++    uint32_t am2rMapSurfaceLogCount;
+ #endif
+ } SWRenderer;
+ 
+ Renderer* SWRenderer_create(void);
+ void SWRenderer_clearFrameBuffer(Renderer* renderer, uint32_t color);
++#ifdef USE_MISTER
++// Called only for AM2R's draw_surface_map script. Returns true when the
++// renderer restored a retained surface whose source game state is unchanged.
++SWAm2rMapCacheMode SWRenderer_misterPrepareAm2rMapSurface(
++    Renderer* renderer, uint64_t topologyHash, uint64_t discoveryHash,
++    bool incrementalEligible);
++void SWRenderer_misterCommitAm2rMapSurface(
++    Renderer* renderer, uint64_t topologyHash, uint64_t discoveryHash);
++#endif
+diff --git a/src/vm.c b/src/vm.c
+index 4c20da6..e13defb 100644
+--- a/src/vm.c
++++ b/src/vm.c
+@@ -7,6 +7,10 @@
+ #include "wad_versions.h"
+ #include "profiler.h"
+ #include "string_builder.h"
++#ifdef USE_MISTER
++#include "sw_renderer.h"
++#include "gml_array.h"
++#endif
+ 
+ #include "stdio_compat.h"
+ #include <stdlib.h>
+@@ -3663,6 +3667,14 @@ VMContext* VM_create(DataWin* dataWin) {
+ }
+ 
+ void VM_reset(VMContext* ctx) {
++#ifdef USE_MISTER
++    free(ctx->am2rMapDiscoveryVisible);
++    ctx->am2rMapDiscoveryVisible = nullptr;
++    ctx->am2rMapDiscoveryRows = 0;
++    ctx->am2rMapDiscoveryCols = 0;
++    ctx->am2rMapCurrentDiscovery = nullptr;
++    ctx->am2rMapIncremental = false;
++#endif
+     // Reset stack
+     ctx->stack.top = 0;
+ 
+@@ -3748,6 +3760,209 @@ static uint32_t computeLocalsCount(VMContext* ctx, CodeEntry* code) {
+     }
+ }
+ 
++#ifdef USE_MISTER
++static uint64_t am2rMapHashBytes(uint64_t hash, const void* data, size_t size) {
++    const uint8_t* bytes = (const uint8_t*)data;
++    while (size-- != 0) {
++        hash ^= *bytes++;
++        hash *= UINT64_C(1099511628211);
++    }
++    return hash;
++}
++
++static uint64_t am2rMapHashRValue(uint64_t hash, const RValue* value, int depth);
++
++static uint64_t am2rMapHashArray(uint64_t hash, const GMLArray* array, int depth) {
++    if (array == nullptr || depth > 4) {
++        uint8_t marker = 0xff;
++        return am2rMapHashBytes(hash, &marker, sizeof(marker));
++    }
++    hash = am2rMapHashBytes(hash, &array->type, sizeof(array->type));
++    if (array->type == GML_LEGACY_ARRAY) {
++        hash = am2rMapHashBytes(hash, &array->legacy.rowCount,
++                               sizeof(array->legacy.rowCount));
++        for (int32_t rowIndex = 0; rowIndex < array->legacy.rowCount; ++rowIndex) {
++            const GMLArrayRow* row = &array->legacy.rows[rowIndex];
++            hash = am2rMapHashBytes(hash, &row->length, sizeof(row->length));
++            for (int32_t col = 0; col < row->length; ++col)
++                hash = am2rMapHashRValue(hash, &row->data[col], depth + 1);
++        }
++    } else {
++        hash = am2rMapHashBytes(hash, &array->modern.length,
++                               sizeof(array->modern.length));
++        for (int32_t index = 0; index < array->modern.length; ++index)
++            hash = am2rMapHashRValue(hash, &array->modern.data[index], depth + 1);
++    }
++    return hash;
++}
++
++static uint64_t am2rMapHashRValue(uint64_t hash, const RValue* value, int depth) {
++    hash = am2rMapHashBytes(hash, &value->type, sizeof(value->type));
++    switch (value->type) {
++        case RVALUE_STRING:
++            if (value->string != nullptr)
++                hash = am2rMapHashBytes(hash, value->string, strlen(value->string) + 1u);
++            break;
++        case RVALUE_INT32:
++        case RVALUE_BOOL:
++            hash = am2rMapHashBytes(hash, &value->int32, sizeof(value->int32));
++            break;
++#ifndef NO_RVALUE_INT64
++        case RVALUE_INT64:
++            hash = am2rMapHashBytes(hash, &value->int64, sizeof(value->int64));
++            break;
++#endif
++        case RVALUE_REAL:
++            hash = am2rMapHashBytes(hash, &value->real, sizeof(value->real));
++            break;
++        case RVALUE_ARRAY:
++            hash = am2rMapHashArray(hash, value->array, depth);
++            break;
++        default:
++            // map/dmap contain strings and numeric flags in AM2R 1.1. Other
++            // value kinds cannot affect this cache without forcing a miss.
++            hash = am2rMapHashBytes(hash, &value->array, sizeof(value->array));
++            break;
++    }
++    return hash;
++}
++
++static bool am2rMapDiscoveryValueVisible(const RValue* value) {
++    switch (value->type) {
++        case RVALUE_INT32:
++        case RVALUE_BOOL:
++            return value->int32 > 0;
++#ifndef NO_RVALUE_INT64
++        case RVALUE_INT64:
++            return value->int64 > 0;
++#endif
++        case RVALUE_REAL:
++            return value->real > (GMLReal)0;
++        default:
++            return false;
++    }
++}
++
++static bool am2rMapDiscoveryShape(const GMLArray* discovery,
++                                  int32_t* rows, int32_t* cols) {
++    if (discovery == nullptr || discovery->type != GML_LEGACY_ARRAY) return false;
++    int32_t rowCount = discovery->legacy.rowCount;
++    int32_t colCount = 0;
++    for (int32_t row = 0; row < rowCount; ++row) {
++        if (discovery->legacy.rows[row].length > colCount)
++            colCount = discovery->legacy.rows[row].length;
++    }
++    // AM2R initializes an 81x81 table. Bounds keep malformed data from
++    // turning this game-specific optimization into an excessive allocation.
++    if (rowCount <= 0 || colCount <= 0 || rowCount > 512 || colCount > 512)
++        return false;
++    *rows = rowCount;
++    *cols = colCount;
++    return true;
++}
++
++static uint8_t am2rMapDiscoveryAt(const GMLArray* discovery,
++                                  int32_t row, int32_t col) {
++    if (discovery == nullptr || discovery->type != GML_LEGACY_ARRAY ||
++        row < 0 || row >= discovery->legacy.rowCount) return 0;
++    const GMLArrayRow* values = &discovery->legacy.rows[row];
++    if (col < 0 || col >= values->length) return 0;
++    return am2rMapDiscoveryValueVisible(&values->data[col]) ? 1u : 0u;
++}
++
++static uint64_t am2rMapDiscoveryHash(const GMLArray* discovery,
++                                     int32_t rows, int32_t cols) {
++    uint64_t hash = UINT64_C(1469598103934665603);
++    static const char tag[] = "AM2R-map-discovery-v1";
++    hash = am2rMapHashBytes(hash, tag, sizeof(tag));
++    hash = am2rMapHashBytes(hash, &rows, sizeof(rows));
++    hash = am2rMapHashBytes(hash, &cols, sizeof(cols));
++    for (int32_t row = 0; row < rows; ++row) {
++        for (int32_t col = 0; col < cols; ++col) {
++            uint8_t visible = am2rMapDiscoveryAt(discovery, row, col);
++            hash = am2rMapHashBytes(hash, &visible, sizeof(visible));
++        }
++    }
++    return hash;
++}
++
++static bool am2rMapStateHash(VMContext* ctx, uint64_t* topologyHash,
++                             uint64_t* discoveryHash, GMLArray** discovery,
++                             int32_t* discoveryRows, int32_t* discoveryCols) {
++    // WAD14 array bytecode pushes INSTANCE_GLOBAL (-5) before reading map and
++    // dmap. The disassembler's "oTestKeys" label is the VARI definition owner,
++    // not the runtime instance scope.
++    Instance* source = ctx->globalScopeInstance;
++    if (source == nullptr) return false;
++    ptrdiff_t mapName = shgeti(ctx->varNameMap, "map");
++    ptrdiff_t dmapName = shgeti(ctx->varNameMap, "dmap");
++    if (mapName < 0 || dmapName < 0) return false;
++    RValue map = Instance_getSelfVar(source, ctx->varNameMap[mapName].value);
++    RValue dmap = Instance_getSelfVar(source, ctx->varNameMap[dmapName].value);
++    if (map.type != RVALUE_ARRAY || dmap.type != RVALUE_ARRAY ||
++        map.array == nullptr || dmap.array == nullptr) return false;
++
++    int32_t rows = 0;
++    int32_t cols = 0;
++    if (!am2rMapDiscoveryShape(dmap.array, &rows, &cols)) return false;
++
++    uint64_t hash = UINT64_C(1469598103934665603);
++    static const char tag[] = "AM2R-map-topology-v1";
++    hash = am2rMapHashBytes(hash, tag, sizeof(tag));
++    *topologyHash = am2rMapHashArray(hash, map.array, 0);
++    *discoveryHash = am2rMapDiscoveryHash(dmap.array, rows, cols);
++    *discovery = dmap.array;
++    *discoveryRows = rows;
++    *discoveryCols = cols;
++    return true;
++}
++
++static bool am2rMapCanIncremental(const VMContext* ctx,
++                                  const GMLArray* discovery,
++                                  int32_t rows, int32_t cols) {
++    if (ctx->am2rMapDiscoveryVisible == nullptr ||
++        ctx->am2rMapDiscoveryRows != rows ||
++        ctx->am2rMapDiscoveryCols != cols) return false;
++    bool added = false;
++    for (int32_t row = 0; row < rows; ++row) {
++        for (int32_t col = 0; col < cols; ++col) {
++            size_t index = (size_t)row * (size_t)cols + (size_t)col;
++            uint8_t before = ctx->am2rMapDiscoveryVisible[index];
++            uint8_t now = am2rMapDiscoveryAt(discovery, row, col);
++            if (before && !now) return false;
++            if (!before && now) added = true;
++        }
++    }
++    return added;
++}
++
++static bool am2rMapCellUnchanged(const VMContext* ctx, int32_t row, int32_t col) {
++    if (ctx->am2rMapCurrentDiscovery == nullptr ||
++        ctx->am2rMapDiscoveryVisible == nullptr || row < 0 || col < 0 ||
++        row >= ctx->am2rMapDiscoveryRows || col >= ctx->am2rMapDiscoveryCols)
++        return false;
++    size_t index = (size_t)row * (size_t)ctx->am2rMapDiscoveryCols + (size_t)col;
++    uint8_t before = ctx->am2rMapDiscoveryVisible[index];
++    uint8_t now = am2rMapDiscoveryAt(ctx->am2rMapCurrentDiscovery, row, col);
++    return before == now;
++}
++
++static void am2rMapCaptureDiscovery(VMContext* ctx, const GMLArray* discovery,
++                                    int32_t rows, int32_t cols) {
++    size_t count = (size_t)rows * (size_t)cols;
++    uint8_t* visible = (uint8_t*)safeMalloc(count);
++    for (int32_t row = 0; row < rows; ++row) {
++        for (int32_t col = 0; col < cols; ++col)
++            visible[(size_t)row * (size_t)cols + (size_t)col] =
++                am2rMapDiscoveryAt(discovery, row, col);
++    }
++    free(ctx->am2rMapDiscoveryVisible);
++    ctx->am2rMapDiscoveryVisible = visible;
++    ctx->am2rMapDiscoveryRows = rows;
++    ctx->am2rMapDiscoveryCols = cols;
++}
++#endif
++
+ RValue VM_executeCode(VMContext* ctx, int32_t codeIndex) {
+     require(codeIndex >= 0 && ctx->dataWin->code.count > (uint32_t) codeIndex);
+     CodeEntry* code = &ctx->dataWin->code.entries[codeIndex];
+@@ -3804,6 +4019,38 @@ RValue VM_callCodeIndex(VMContext* ctx, int32_t codeIndex, RValue* args, int32_t
+     require(codeIndex >= 0 && ctx->dataWin->code.count > (uint32_t) codeIndex);
+     CodeEntry* code = &ctx->dataWin->code.entries[codeIndex];
+ 
++#ifdef USE_MISTER
++    if (ctx->am2rMapIncremental && code->name != nullptr &&
++        strcmp(code->name, "gml_Script_draw_map_surf") == 0 && argCount >= 2 &&
++        am2rMapCellUnchanged(ctx, RValue_toInt32(args[0]), RValue_toInt32(args[1])))
++        return RValue_makeUndefined();
++
++    bool isAm2rMapDraw = code->name != nullptr &&
++                         strcmp(code->name, "gml_Script_draw_surface_map") == 0;
++    uint64_t am2rTopologyHash = 0;
++    uint64_t am2rDiscoveryHash = 0;
++    GMLArray* am2rDiscovery = nullptr;
++    int32_t am2rDiscoveryRows = 0;
++    int32_t am2rDiscoveryCols = 0;
++    bool hasAm2rStateHash = isAm2rMapDraw && am2rMapStateHash(
++        ctx, &am2rTopologyHash, &am2rDiscoveryHash, &am2rDiscovery,
++        &am2rDiscoveryRows, &am2rDiscoveryCols);
++    SWAm2rMapCacheMode am2rMapMode = SW_AM2R_MAP_CACHE_REBUILD;
++    if (hasAm2rStateHash) {
++        bool incrementalEligible = am2rMapCanIncremental(
++            ctx, am2rDiscovery, am2rDiscoveryRows, am2rDiscoveryCols);
++        am2rMapMode = SWRenderer_misterPrepareAm2rMapSurface(
++            ctx->runner->renderer, am2rTopologyHash, am2rDiscoveryHash,
++            incrementalEligible);
++        if (am2rMapMode == SW_AM2R_MAP_CACHE_HIT)
++            return RValue_makeUndefined();
++        if (am2rMapMode == SW_AM2R_MAP_CACHE_INCREMENTAL) {
++            ctx->am2rMapCurrentDiscovery = am2rDiscovery;
++            ctx->am2rMapIncremental = true;
++        }
++    }
++#endif
++
+     // Save current frame
+     CallFrame frame = {0};
+     frame.savedIP = ctx->ip;
+@@ -3858,6 +4105,16 @@ RValue VM_callCodeIndex(VMContext* ctx, int32_t codeIndex, RValue* args, int32_t
+     Profiler_enter(ctx->profiler, code->name);
+ #endif
+     RValue result = executeLoop(ctx);
++#ifdef USE_MISTER
++    if (hasAm2rStateHash) {
++        SWRenderer_misterCommitAm2rMapSurface(
++            ctx->runner->renderer, am2rTopologyHash, am2rDiscoveryHash);
++        am2rMapCaptureDiscovery(
++            ctx, am2rDiscovery, am2rDiscoveryRows, am2rDiscoveryCols);
++        ctx->am2rMapCurrentDiscovery = nullptr;
++        ctx->am2rMapIncremental = false;
++    }
++#endif
+ #ifdef ENABLE_VM_GML_PROFILER
+     Profiler_exit(ctx->profiler);
+ #endif
+diff --git a/src/vm.h b/src/vm.h
+index 0e55d5e..9671af0 100644
+--- a/src/vm.h
++++ b/src/vm.h
+@@ -232,6 +232,15 @@ struct VMContext {
+     bool traceEventInherited;
+     bool hasFixedSeed;
+     bool actionRelativeFlag; // D&D action relative flag (set by action_set_relative)
++#ifdef USE_MISTER
++    // AM2R map-surface incremental cache. The retained renderer surface uses
++    // this visibility snapshot to redraw only newly discovered 8x8 cells.
++    uint8_t* am2rMapDiscoveryVisible;
++    int32_t am2rMapDiscoveryRows;
++    int32_t am2rMapDiscoveryCols;
++    struct GMLArray* am2rMapCurrentDiscovery;
++    bool am2rMapIncremental;
++#endif
+ 
+     // V17+ extended BREAK opcode state
+     bool* staticInitialized; // Per-code-entry flag for isstaticok/setstatic (allocated in VM_create)
+diff --git a/src/vm_builtins.c b/src/vm_builtins.c
+index 413f27f..cb7b9e4 100644
+--- a/src/vm_builtins.c
++++ b/src/vm_builtins.c
+@@ -10223,6 +10223,11 @@ static RValue builtin_draw_set_color(VMContext* ctx, RValue* args, MAYBE_UNUSED
+ }
+ 
+ static RValue builtin_draw_clear(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
++#ifdef USE_MISTER
++    if (ctx->am2rMapIncremental && ctx->currentCodeName != nullptr &&
++        strcmp(ctx->currentCodeName, "gml_Script_draw_surface_map") == 0)
++        return RValue_makeUndefined();
++#endif
+     Runner* runner = ctx->runner;
+     if (runner->renderer != nullptr) {
+         uint32_t color = RValue_toColour(args[0]);
+@@ -10561,6 +10566,11 @@ static RValue builtin_draw_background_part_ext(VMContext* ctx, RValue* args, MAY
+ }
+ 
+ static RValue builtin_draw_background_tiled(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
++#ifdef USE_MISTER
++    if (ctx->am2rMapIncremental && ctx->currentCodeName != nullptr &&
++        strcmp(ctx->currentCodeName, "gml_Script_draw_surface_map") == 0)
++        return RValue_makeUndefined();
++#endif
+     Runner* runner = ctx->runner;
+     if (runner->renderer == nullptr || 3 > argCount) return RValue_makeUndefined();
+ 
+@@ -11019,6 +11029,138 @@ static void surfacePngWrite(void* context, void* data, int size) {
+     png->size = required;
+ }
+ 
++#ifdef USE_MISTER
++static void surfacePngWriteU32Be(uint8_t* dst, uint32_t value) {
++    dst[0] = (uint8_t)(value >> 24);
++    dst[1] = (uint8_t)(value >> 16);
++    dst[2] = (uint8_t)(value >> 8);
++    dst[3] = (uint8_t)value;
++}
++
++static uint32_t surfacePngCrc32(const uint8_t* data, size_t size) {
++    static uint32_t table[256];
++    static bool initialized = false;
++    if (!initialized) {
++        for (uint32_t i = 0; i < 256; ++i) {
++            uint32_t value = i;
++            for (int bit = 0; bit < 8; ++bit)
++                value = (value >> 1) ^ (0xedb88320u & (uint32_t)-(int32_t)(value & 1u));
++            table[i] = value;
++        }
++        initialized = true;
++    }
++
++    uint32_t crc = 0xffffffffu;
++    for (size_t i = 0; i < size; ++i)
++        crc = table[(crc ^ data[i]) & 0xffu] ^ (crc >> 8);
++    return crc ^ 0xffffffffu;
++}
++
++static uint32_t surfacePngAdler32(const uint8_t* data, size_t size) {
++    uint32_t a = 1;
++    uint32_t b = 0;
++    while (size != 0) {
++        size_t block = size > 5552 ? 5552 : size;
++        size -= block;
++        while (block-- != 0) {
++            a += *data++;
++            b += a;
++        }
++        a %= 65521u;
++        b %= 65521u;
++    }
++    return (b << 16) | a;
++}
++
++/*
++ * stb_image_write's LZ search is prohibitively expensive on the Cortex-A9 for
++ * AM2R's transition screenshot. A PNG using stored DEFLATE blocks is larger,
++ * but it is lossless, standards-compliant, fast to create and fast to decode.
++ * The file lives in the extracted /tmp runtime and is deleted by the game.
++ */
++static bool surfacePngEncodeStoredRgba(const uint8_t* pixels, int32_t width,
++                                       int32_t height, SurfacePngBuffer* png) {
++    if (pixels == nullptr || png == nullptr || width <= 0 || height <= 0) return false;
++    size_t rowBytes = (size_t)width * 4u;
++    if (rowBytes / 4u != (size_t)width || (size_t)height > SIZE_MAX / (rowBytes + 1u))
++        return false;
++    size_t rawSize = (rowBytes + 1u) * (size_t)height;
++    size_t blockCount = (rawSize + 65534u) / 65535u;
++    if (blockCount > (SIZE_MAX - rawSize - 6u) / 5u) return false;
++    size_t idatSize = 2u + blockCount * 5u + rawSize + 4u;
++    if (idatSize > UINT32_MAX || idatSize > SIZE_MAX - 57u) return false;
++
++    uint8_t* raw = (uint8_t*)safeMalloc(rawSize);
++    uint8_t* rawOut = raw;
++    for (int32_t y = 0; y < height; ++y) {
++        *rawOut++ = 0; /* PNG filter: None. */
++        memcpy(rawOut, pixels + (size_t)y * rowBytes, rowBytes);
++        rawOut += rowBytes;
++    }
++
++    png->size = 57u + idatSize;
++    png->capacity = png->size;
++    png->data = (uint8_t*)safeMalloc(png->size);
++    uint8_t* out = png->data;
++    static const uint8_t signature[8] = {137, 80, 78, 71, 13, 10, 26, 10};
++    memcpy(out, signature, sizeof(signature));
++    out += sizeof(signature);
++
++    surfacePngWriteU32Be(out, 13u);
++    out += 4;
++    uint8_t* chunk = out;
++    memcpy(out, "IHDR", 4);
++    out += 4;
++    surfacePngWriteU32Be(out, (uint32_t)width);
++    surfacePngWriteU32Be(out + 4, (uint32_t)height);
++    out[8] = 8;
++    out[9] = 6; /* 8-bit RGBA. */
++    out[10] = 0;
++    out[11] = 0;
++    out[12] = 0;
++    out += 13;
++    surfacePngWriteU32Be(out, surfacePngCrc32(chunk, 17u));
++    out += 4;
++
++    surfacePngWriteU32Be(out, (uint32_t)idatSize);
++    out += 4;
++    chunk = out;
++    memcpy(out, "IDAT", 4);
++    out += 4;
++    *out++ = 0x78;
++    *out++ = 0x01; /* zlib, 32 KiB window, fastest/no compression. */
++    const uint8_t* src = raw;
++    size_t remaining = rawSize;
++    while (remaining != 0) {
++        uint16_t length = (uint16_t)(remaining > 65535u ? 65535u : remaining);
++        *out++ = remaining == (size_t)length ? 1u : 0u;
++        *out++ = (uint8_t)length;
++        *out++ = (uint8_t)(length >> 8);
++        uint16_t inverse = (uint16_t)~length;
++        *out++ = (uint8_t)inverse;
++        *out++ = (uint8_t)(inverse >> 8);
++        memcpy(out, src, length);
++        out += length;
++        src += length;
++        remaining -= length;
++    }
++    surfacePngWriteU32Be(out, surfacePngAdler32(raw, rawSize));
++    out += 4;
++    free(raw);
++    surfacePngWriteU32Be(out, surfacePngCrc32(chunk, 4u + idatSize));
++    out += 4;
++
++    surfacePngWriteU32Be(out, 0u);
++    out += 4;
++    chunk = out;
++    memcpy(out, "IEND", 4);
++    out += 4;
++    surfacePngWriteU32Be(out, surfacePngCrc32(chunk, 4u));
++    out += 4;
++    return (size_t)(out - png->data) == png->size;
++}
++#endif
++
+ static RValue builtin_surface_save(VMContext* ctx, RValue* args, int32_t argCount) {
+     if (argCount < 2 || args[1].type != RVALUE_STRING) return RValue_makeUndefined();
+     Runner* runner = ctx->runner;
+@@ -11031,21 +11173,37 @@ static RValue builtin_surface_save(VMContext* ctx, RValue* args, int32_t argCoun
+     int32_t height = (int32_t)Renderer_getSurfaceHeight(renderer, surfaceId);
+     if (width <= 0 || height <= 0) return RValue_makeUndefined();
+ 
++    uint64_t readStart = nowNanos();
+     size_t pixelBytes = (size_t)width * (size_t)height * 4u;
+     uint8_t* pixels = (uint8_t*)safeMalloc(pixelBytes);
+     if (!renderer->vtable->surfaceGetPixels(renderer, surfaceId, pixels)) {
+         free(pixels);
+         return RValue_makeUndefined();
+     }
++    uint64_t readEnd = nowNanos();
+ 
+     SurfacePngBuffer png = {0};
++#ifdef USE_MISTER
++    int encoded = surfacePngEncodeStoredRgba(pixels, width, height, &png);
++#else
+     int encoded = stbi_write_png_to_func(surfacePngWrite, &png, width, height, 4,
+                                          pixels, width * 4);
++#endif
++    uint64_t encodeEnd = nowNanos();
+     free(pixels);
++    bool wrote = false;
+     if (encoded && png.size <= INT32_MAX) {
+         FileSystem* fs = runner->fileSystem;
+-        fs->vtable->writeFileBinary(fs, args[1].string, png.data, (int32_t)png.size);
++        wrote = fs->vtable->writeFileBinary(fs, args[1].string, png.data, (int32_t)png.size);
+     }
++    uint64_t writeEnd = nowNanos();
++#ifdef USE_MISTER
++    logInfo("MiSTer surface_save: %dx%d read=%.2fms encode=%.2fms write=%.2fms bytes=%zu ok=%d path=%s\n",
++            width, height, (double)(readEnd - readStart) / 1000000.0,
++            (double)(encodeEnd - readEnd) / 1000000.0,
++            (double)(writeEnd - encodeEnd) / 1000000.0, png.size, wrote ? 1 : 0,
++            args[1].string != nullptr ? args[1].string : "");
++#endif
+     free(png.data);
+     return RValue_makeUndefined();
+ }

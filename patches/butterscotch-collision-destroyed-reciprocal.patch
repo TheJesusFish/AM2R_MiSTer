@@ -1,0 +1,33 @@
+diff --git a/src/runner.c b/src/runner.c
+--- a/src/runner.c
++++ b/src/runner.c
+@@ -3364,16 +3364,22 @@ static void dispatchCollisionEvents(Runner* runner) {
+ #endif
+                     executeCollisionEvent(runner, self, other, targetObjIndex, evt->codeId, evt->ownerObjectIndex);
+ 
+-                    // When both objects are colliding, we'll execute the SELF collision (which we already did) and THEN execute the OTHER collision too
+-                    // Because if we don't, the OTHER collision may never happen again because
+-                    // * GML code may have pushed it away
+-                    // * Solid collision resolution may have also pushed it away
+-                    // This ONLY happens if one of them was solid
+-                    if (hadSolid && other->active && self->active) {
++                    // When both objects are colliding, execute the OTHER collision now if
++                    // the normal later pass cannot observe this pair.  Solid pairs need the
++                    // immediate reverse event because collision resolution or user code may
++                    // separate them.  A non-solid self which destroys itself in its handler
++                    // also needs it: GameMaker still runs the other object's handler for the
++                    // detected collision, but the inactive self would otherwise be skipped
++                    // when that object's bucket is visited later.  Keep the inactive instance
++                    // alive as `other` until the normal end-of-step cleanup.
++                    bool selfDestroyedByHandler = !self->active;
++                    bool fireReverseNow = other->active &&
++                        ((hadSolid && self->active) || (!hadSolid && selfDestroyedByHandler));
++                    if (fireReverseNow) {
+                         FlattenedCollisionEvent* reverseEvt = findSymmetricCollisionEvent(runner, other, self);
+ #ifdef ENABLE_VM_TRACING
+                         if (traceThisPair) {
+-                            if (reverseEvt != nullptr) logInfo("  fire other->self: subtype=%u (%s) owner=%d (%s) codeId=%d codeName=%s  [symmetric]\n", reverseEvt->targetObjectIndex, dataWin->objt.objects[reverseEvt->targetObjectIndex].name, reverseEvt->ownerObjectIndex, dataWin->objt.objects[reverseEvt->ownerObjectIndex].name, reverseEvt->codeId, dataWin->code.entries[evt->codeId].name);
++                            if (reverseEvt != nullptr) logInfo("  fire other->self: subtype=%u (%s) owner=%d (%s) codeId=%d codeName=%s  [symmetric:%s]\n", reverseEvt->targetObjectIndex, dataWin->objt.objects[reverseEvt->targetObjectIndex].name, reverseEvt->ownerObjectIndex, dataWin->objt.objects[reverseEvt->ownerObjectIndex].name, reverseEvt->codeId, dataWin->code.entries[reverseEvt->codeId].name, hadSolid ? "solid" : "self-destroyed");
+                             else logInfo("  fire other->self: none (no matching handler)  [symmetric]\n");
+                         }
+ #endif

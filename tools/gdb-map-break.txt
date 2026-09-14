@@ -1,0 +1,20 @@
+set pagination off
+break sw_renderer.c:612
+continue
+printf "MAP_BREAK\n"
+info args
+info locals
+print ((SWRenderer*)0xa99a7cf8)->currentSurface
+print ((SWRenderer*)0xa99a7cf8)->fbWidth
+print ((SWRenderer*)0xa99a7cf8)->fbHeight
+print ((SWRenderer*)0xa99a7cf8)->gpuFrameEligible
+print ((SWRenderer*)0xa99a7cf8)->gpuSawClear
+print ((SWRenderer*)0xa99a7cf8)->gpuHasSkippedDraws
+print ((SWRenderer*)0xa99a7cf8)->gpuHostContinuation
+print ((SWRenderer*)0xa99a7cf8)->blendEnable
+print ((SWRenderer*)0xa99a7cf8)->blendMode
+print ((SWRenderer*)0xa99a7cf8)->base.runner->applicationSurfaceId
+info registers r0 r1 r2 r3 r4 r5 r6 r7 r8 r9 r10 r11 r12 sp lr pc
+thread apply all bt 8
+detach
+quit

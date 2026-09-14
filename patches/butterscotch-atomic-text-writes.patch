@@ -1,0 +1,59 @@
+diff --git a/src/overlay_file_system.c b/src/overlay_file_system.c
+index 7e0e89b..c1cde45 100644
+--- a/src/overlay_file_system.c
++++ b/src/overlay_file_system.c
+@@ -163,14 +163,49 @@ static char* overlayReadFileText(FileSystem* fs, const char* relativePath) {
+ static bool overlayWriteFileText(FileSystem* fs, const char* relativePath, const char* contents) {
+     char* fullPath = resolveForWrite((OverlayFileSystem*) fs, relativePath);
+     ensureParentDir(fullPath);
+-    FILE* f = fopen(fullPath, "wb");
+-    free(fullPath);
+-    if (f == nullptr) return false;
++
++    // Never truncate the live INI/configuration before its replacement is
++    // complete. MiSTer may terminate the runner as part of a normal core
++    // change, and an interruption between fopen("wb") and fwrite previously
++    // left AM2R's config.ini at zero bytes. A sibling temporary keeps rename
++    // atomic on the target filesystem and leaves the prior file intact on any
++    // short write, flush, sync, or close failure.
++    static const char tempSuffix[] = ".butterscotch-tmp";
++    size_t fullPathLen = strlen(fullPath);
++    char* tempPath = (char *)safeMalloc(fullPathLen + sizeof(tempSuffix));
++    memcpy(tempPath, fullPath, fullPathLen);
++    memcpy(tempPath + fullPathLen, tempSuffix, sizeof(tempSuffix));
++
++    FILE* f = fopen(tempPath, "wb");
++    if (f == nullptr) {
++        free(tempPath);
++        free(fullPath);
++        return false;
++    }
+ 
+     size_t len = strlen(contents);
+     size_t written = fwrite(contents, 1, len, f);
+-    fclose(f);
+-    return written == len;
++    bool success = written == len && fflush(f) == 0;
++#ifdef _WIN32
++    // MOVEFILE_WRITE_THROUGH below provides the Windows durability boundary.
++#else
++    if (success && fsync(fileno(f)) != 0) success = false;
++#endif
++    if (fclose(f) != 0) success = false;
++
++    if (success) {
++#ifdef _WIN32
++        success = MoveFileExA(tempPath, fullPath,
++                              MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
++#else
++        success = rename(tempPath, fullPath) == 0;
++#endif
++    }
++    if (!success) remove(tempPath);
++
++    free(tempPath);
++    free(fullPath);
++    return success;
+ }
+ 
+ static bool overlayDeleteFile(FileSystem* fs, const char* relativePath) {

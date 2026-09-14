@@ -1,0 +1,42 @@
+diff --git a/src/sw_raster_bounds.h b/src/sw_raster_bounds.h
+new file mode 100644
+index 0000000..f723c0a
+--- /dev/null
++++ b/src/sw_raster_bounds.h
+@@ -0,0 +1,11 @@
++#pragma once
++
++#include <math.h>
++#include <stdint.h>
++
++// Raster coverage is evaluated at pixel centers. This same half-open rule is
++// used for both the first covered pixel and the exclusive end of an edge.
++static inline int32_t swPixelCoverageEdge(float edge)
++{
++    return (int32_t)ceilf(edge - 0.5f);
++}
+diff --git a/src/sw_renderer.c b/src/sw_renderer.c
+index 25de466..f71eb2d 100644
+--- a/src/sw_renderer.c
++++ b/src/sw_renderer.c
+@@ -1,4 +1,5 @@
+ #include "sw_renderer.h"
++#include "sw_raster_bounds.h"
+ #include "matrix_math.h"
+ #include "text_utils.h"
+ #include "utils.h"
+@@ -532,10 +533,10 @@ static bool rasterizeAxisAlignedQuad(SWRenderer* sw, SWVertex v[4], const uint8_
+     }
+     const float dx=v[1].x-v[0].x, dy=v[3].y-v[0].y;
+     if (fabsf(dx)<epsilon || fabsf(dy)<epsilon) return true;
+-    int32_t minX=(int32_t)floorf(fminf(v[0].x,v[1].x));
+-    int32_t maxX=(int32_t)ceilf(fmaxf(v[0].x,v[1].x));
+-    int32_t minY=(int32_t)floorf(fminf(v[0].y,v[3].y));
+-    int32_t maxY=(int32_t)ceilf(fmaxf(v[0].y,v[3].y));
++    int32_t minX=swPixelCoverageEdge(fminf(v[0].x,v[1].x));
++    int32_t maxX=swPixelCoverageEdge(fmaxf(v[0].x,v[1].x));
++    int32_t minY=swPixelCoverageEdge(fminf(v[0].y,v[3].y));
++    int32_t maxY=swPixelCoverageEdge(fmaxf(v[0].y,v[3].y));
+     if(minX<sw->scissorX)minX=sw->scissorX;if(minY<sw->scissorY)minY=sw->scissorY;
+     if(maxX>sw->scissorX+sw->scissorW)maxX=sw->scissorX+sw->scissorW;
+     if(maxY>sw->scissorY+sw->scissorH)maxY=sw->scissorY+sw->scissorH;

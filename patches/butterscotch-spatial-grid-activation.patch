@@ -1,0 +1,67 @@
+diff --git a/src/runner.h b/src/runner.h
+--- a/src/runner.h
++++ b/src/runner.h
+@@ -889,7 +889,23 @@ static inline void Runner_setActiveState(Runner* runner, Instance* instance, boo
+     (void)runner;
+ #endif
+ 
++    if (instance->active == active)
++        return;
++
++    // Inactive instances are ignored by every spatial-grid query, so a clean
++    // instance can keep its existing cells across AM2R's per-frame
++    // deactivate-object/activate-region cycle.  A pending/moved instance must
++    // be removed before its dirty queue entry is discarded, however.
++    if (!active && runner->spatialGrid != nullptr && instance->spatialGridDirty)
++        SpatialGrid_removeInstance(runner->spatialGrid, instance);
++
+     instance->active = active;
++
++    // An inactive instance can have no cells when it was deactivated before
++    // its first insert or when a script moved it while inactive.  Queue only
++    // that case on activation; clean retained cells need no work.
++    if (active && runner->spatialGrid != nullptr && arrlen(instance->collisionCells) == 0)
++        SpatialGrid_markInstanceAsDirty(runner->spatialGrid, instance);
+ }
+ 
+ #endif /* _BS_RUNNER_H_ */
+diff --git a/src/spatial_grid.c b/src/spatial_grid.c
+--- a/src/spatial_grid.c
++++ b/src/spatial_grid.c
+@@ -77,10 +77,14 @@ void SpatialGrid_removeInstance(SpatialGrid* grid, Instance* instance) {
+         }
+     }
+ 
+-    if (removedAny) {
+-        arrsetlen(instance->collisionCells, 0);
+-        instance->spatialGridDirty = false;
+-    }
++    // Removal is also the state transition that makes a later activation
++    // eligible to enqueue the instance again.  An instance can be deactivated
++    // before its first pending grid insertion is synchronized, in which case
++    // no cell contains it and removedAny is false.  Leaving the dirty bit set
++    // in that case permanently suppresses the later activation enqueue.
++    (void) removedAny;
++    arrsetlen(instance->collisionCells, 0);
++    instance->spatialGridDirty = false;
+ }
+ 
+ void SpatialGrid_syncGrid(Runner* runner, SpatialGrid* grid) {
+@@ -97,7 +101,16 @@ void SpatialGrid_syncGrid(Runner* runner, SpatialGrid* grid) {
+ 
+         // We do not care about removed/inactive/destroyed instances, because they would've been already been removed from the grid on the "SpatialGrid_markInstanceAsDirty" call
+         // We also do not care if the spatial grid is not dirty
+-        if (instance == nullptr || !instance->active || instance->destroyed || !instance->spatialGridDirty)
++        if (instance == nullptr)
++            continue;
++        if (!instance->active || instance->destroyed) {
++            // The queued ID is about to be discarded with the dirty list.
++            // Remove any old cells and clear the dirty bit so a future
++            // activation can enqueue an instance that has no retained cells.
++            SpatialGrid_removeInstance(grid, instance);
++            continue;
++        }
++        if (!instance->spatialGridDirty)
+             continue;
+ 
+         instance->spatialGridDirty = false;

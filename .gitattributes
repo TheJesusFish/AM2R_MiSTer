@@ -1,0 +1,23 @@
+* text=auto eol=lf
+
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+*.sh text eol=lf
+*.tcl text eol=lf
+*.v text eol=lf
+*.sv text eol=lf
+*.sdc text eol=lf
+*.qsf text eol=lf
+*.qpf text eol=lf
+*.qip text eol=lf
+
+*.rbf binary
+*.zip binary
+*.dmtcp binary
+*.ogg binary
+*.so binary
+*.a binary
+*.o binary
+*.exe binary
+*.dll binary

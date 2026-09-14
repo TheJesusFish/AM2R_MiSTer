@@ -1,0 +1,14 @@
+set pagination off
+set $hits = 0
+break builtin_surface_save
+commands
+  silent
+  set $hits = $hits + 1
+  printf "SURFACE_SAVE_HIT %d surface=%d path=%s\n", $hits, (int)args[0].real, args[1].string
+  if $hits >= 8
+    detach
+    quit
+  end
+  continue
+end
+continue

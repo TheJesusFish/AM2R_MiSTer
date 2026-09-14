@@ -1,0 +1,125 @@
+diff --git a/src/backends/mister.c b/src/backends/mister.c
+index d4f4a5a..466ca9e 100644
+--- a/src/backends/mister.c
++++ b/src/backends/mister.c
+@@ -752,20 +752,24 @@ bool platformHandleEvents(void) {
+     }
+ 
+     memcpy(pad->buttonDown, g_keyboard_pad, sizeof(pad->buttonDown));
++    uint32_t misterMask = 0;
+     if (g_joy_shm != NULL && g_joy_shm->magic == AM2R_JOY_SHM_MAGIC &&
+         g_joy_shm->version == AM2R_JOY_SHM_VERSION) {
+         __sync_synchronize();
+-        uint32_t mask = g_joy_shm->joy_mask[0];
+-        pad->buttonDown[15] |= (mask & (1u << 0)) != 0; // Right
+-        pad->buttonDown[14] |= (mask & (1u << 1)) != 0; // Left
+-        pad->buttonDown[13] |= (mask & (1u << 2)) != 0; // Down
+-        pad->buttonDown[12] |= (mask & (1u << 3)) != 0; // Up
+-        pad->buttonDown[0]  |= (mask & (1u << 4)) != 0; // A
+-        pad->buttonDown[1]  |= (mask & (1u << 5)) != 0; // B
+-        pad->buttonDown[8]  |= (mask & (1u << 6)) != 0; // Select
+-        pad->buttonDown[9]  |= (mask & (1u << 7)) != 0; // Start
+-        pad->buttonDown[4]  |= (mask & (1u << 8)) != 0; // L
+-        pad->buttonDown[5]  |= (mask & (1u << 9)) != 0; // R
++        misterMask = g_joy_shm->joy_mask[0];
++        pad->buttonDown[15] |= (misterMask & (1u << 0)) != 0; // Right
++        pad->buttonDown[14] |= (misterMask & (1u << 1)) != 0; // Left
++        pad->buttonDown[13] |= (misterMask & (1u << 2)) != 0; // Down
++        pad->buttonDown[12] |= (misterMask & (1u << 3)) != 0; // Up
++        pad->buttonDown[2]  |= (misterMask & (1u << 4)) != 0; // Fire
++        pad->buttonDown[0]  |= (misterMask & (1u << 5)) != 0; // Jump
++        pad->buttonDown[1]  |= (misterMask & (1u << 6)) != 0; // Missiles
++        pad->buttonDown[7]  |= (misterMask & (1u << 7)) != 0; // Morph
++        pad->buttonDown[5]  |= (misterMask & (1u << 8)) != 0; // Walk
++        pad->buttonDown[4]  |= (misterMask & (1u << 9)) != 0; // Aim
++        pad->buttonDown[6]  |= (misterMask & (1u << 10)) != 0; // Aim 2
++        pad->buttonDown[9]  |= (misterMask & (1u << 11)) != 0; // Start
++        pad->buttonDown[3]  |= (misterMask & (1u << 12)) != 0; // Weapon Select
+     }
+ 
+     for (int button = 0; button < GP_BUTTON_COUNT; ++button) {
+@@ -780,7 +784,7 @@ bool platformHandleEvents(void) {
+     // A menu-launched hybrid cannot rely on the FPGA OSD to terminate its HPS
+     // companion. Select+Start exits the runner; the launcher trap restores the
+     // normal MiSTer menu core.
+-    return pad->buttonDown[8] && pad->buttonDown[9];
++    return (misterMask & (1u << 11)) && (misterMask & (1u << 12));
+ }
+ 
+ void platformSleepUntil(uint64_t target) {
+diff --git a/src/backends/noop.c b/src/backends/noop.c
+index b71767f..396d383 100644
+--- a/src/backends/noop.c
++++ b/src/backends/noop.c
+@@ -80,6 +80,15 @@ bool platformHandleEvents(void) {
+     return false;
+ }
+ 
++// The portable software renderer is part of the patched source set even when
++// the no-op renderer is selected for VM-only tests. It never presents a frame
++// in that configuration, but the linker still needs the backend hook.
++void Runner_setNextFrame(uint32_t *framebuffer, int width, int height) {
++    (void)framebuffer;
++    (void)width;
++    (void)height;
++}
++
+ void platformSleepUntil(uint64_t time) {
+     int64_t remaining = (int64_t)time - (int64_t)nowNanos();
+     if (remaining > 2000000) {
+@@ -96,4 +105,4 @@ void platformSleepUntil(uint64_t time) {
+     while (nowNanos() < time) {
+         YIELD();
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/src/runner.c b/src/runner.c
+index acb9ce6..3e43a31 100644
+--- a/src/runner.c
++++ b/src/runner.c
+@@ -2449,7 +2449,7 @@ Runner* Runner_create(DataWin* dataWin, VMContext* vm, Renderer* renderer, FileS
+     repeat(shlen(vm->builtinMap), i) {
+         bool isRegistered = shgeti(vm->codeIndexByName, vm->builtinMap[i].key) != -1;
+         if (isRegistered) {
+-            logWarn("Runner: Builtin function %s has the same name as a GML script! The script may be a compatibility script provided by GM:S 2+, and the game may have issues due to the builtin overriding it!\n", vm->builtinMap[i].key);
++            logWarn("Runner: Builtin function %s has the same name as a recorded GML script; the recorded script takes precedence.\n", vm->builtinMap[i].key);
+         }
+     }
+     }
+diff --git a/src/vm.c b/src/vm.c
+index 4ab0524..4c20da6 100644
+--- a/src/vm.c
++++ b/src/vm.c
+@@ -3638,21 +3638,22 @@ VMContext* VM_create(DataWin* dataWin) {
+     // Register built-in functions
+     VMBuiltins_registerAll(ctx);
+ 
+-    // Pre-resolve all FUNC entries to cached builtin pointers or script code indices.
+-    // This eliminates per-call string hash lookups in handleCall.
++    // Pre-resolve all FUNC entries to cached script code indices or builtin pointers.
++    // A script recorded in SCPT must win a name collision with a builtin. This is
++    // important for older games: AM2R 1.1 provides its own three-argument
++    // string_split script, while the newer builtin with that name returns an array.
++    // This also eliminates per-call string hash lookups in handleCall.
+     ctx->funcCallCacheCount = dataWin->func.functionCount;
+     ctx->funcCallCache = (FuncCallCache *)safeMalloc(dataWin->func.functionCount * sizeof(FuncCallCache));
+     {
+     repeat(dataWin->func.functionCount, i) {
+         const char* name = dataWin->func.functions[i].name;
+-        BuiltinFunc builtin = VM_findBuiltin(ctx, name);
++        ptrdiff_t mapIdx = shgeti(ctx->codeIndexByName, (char*) name);
++        ctx->funcCallCache[i].scriptCodeIndex =
++            (mapIdx >= 0) ? ctx->codeIndexByName[mapIdx].value : -1;
++        BuiltinFunc builtin = ctx->funcCallCache[i].scriptCodeIndex >= 0
++            ? nullptr : VM_findBuiltin(ctx, name);
+         ctx->funcCallCache[i].builtin = (void*) builtin;
+-        if (builtin != nullptr) {
+-            ctx->funcCallCache[i].scriptCodeIndex = -1;
+-        } else {
+-            ptrdiff_t mapIdx = shgeti(ctx->codeIndexByName, (char*) name);
+-            ctx->funcCallCache[i].scriptCodeIndex = (mapIdx >= 0) ? ctx->codeIndexByName[mapIdx].value : -1;
+-        }
+     }
+     }
+ 

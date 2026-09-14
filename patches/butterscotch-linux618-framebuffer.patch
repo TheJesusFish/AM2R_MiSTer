@@ -1,0 +1,97 @@
+diff --git a/src/backends/mister.c b/src/backends/mister.c
+index 2b9f0ea..022bf39 100644
+--- a/src/backends/mister.c
++++ b/src/backends/mister.c
+@@ -8,6 +8,7 @@
+ 
+ #include <errno.h>
+ #include <fcntl.h>
++#include <linux/fb.h>
+ #include <linux/input.h>
+ #include <pthread.h>
+ #include <stdint.h>
+@@ -129,6 +130,63 @@ static bool g_initialized = false;
+ 
+ static bool openJoyShared(void);
+ 
++static bool mapFramebuffer(void) {
++    g_fb_fd = open("/dev/fb0", O_RDWR | O_SYNC | O_CLOEXEC);
++    if (g_fb_fd < 0) {
++        logError("MiSTer: cannot open /dev/fb0: %s\n", strerror(errno));
++        return false;
++    }
++
++    g_fb = (uint32_t *)mmap(NULL, MISTER_FB_BYTES, PROT_READ | PROT_WRITE,
++                            MAP_SHARED, g_fb_fd, 0);
++    if (g_fb != MAP_FAILED) return true;
++
++    const int mmapError = errno;
++    g_fb = NULL;
++    if (mmapError != ENODEV) {
++        logError("MiSTer: cannot map /dev/fb0: %s\n", strerror(mmapError));
++        close(g_fb_fd);
++        g_fb_fd = -1;
++        return false;
++    }
++
++    // Linux 6.8 removed the fbdev core's default mmap implementation. The
++    // MiSTer_fb driver in current 6.18 kernels still reports its physical
++    // range through FBIOGET_FSCREENINFO but has no fb_mmap callback. Preserve
++    // the native fbdev path on older kernels and redirect only this ENODEV
++    // failure to the same pixels through /dev/mem, as Main_MiSTer does.
++    struct fb_fix_screeninfo fixed = {0};
++    if (ioctl(g_fb_fd, FBIOGET_FSCREENINFO, &fixed) != 0 ||
++        fixed.smem_start == 0 || fixed.smem_len < MISTER_FB_BYTES) {
++        logError("MiSTer: /dev/fb0 mmap unavailable and framebuffer range is invalid\n");
++        close(g_fb_fd);
++        g_fb_fd = -1;
++        return false;
++    }
++    close(g_fb_fd);
++
++    g_fb_fd = open("/dev/mem", O_RDWR | O_SYNC | O_CLOEXEC);
++    if (g_fb_fd < 0) {
++        logError("MiSTer: cannot open /dev/mem for framebuffer fallback: %s\n",
++                 strerror(errno));
++        return false;
++    }
++    g_fb = (uint32_t *)mmap(NULL, MISTER_FB_BYTES, PROT_READ | PROT_WRITE,
++                            MAP_SHARED, g_fb_fd, fixed.smem_start);
++    if (g_fb == MAP_FAILED) {
++        logError("MiSTer: cannot map framebuffer through /dev/mem: %s\n",
++                 strerror(errno));
++        g_fb = NULL;
++        close(g_fb_fd);
++        g_fb_fd = -1;
++        return false;
++    }
++
++    logInfo("MiSTer framebuffer mmap fallback: /dev/mem at 0x%lx (%u bytes)\n",
++            (unsigned long)fixed.smem_start, fixed.smem_len);
++    return true;
++}
++
+ static void closeJoyShared(void) {
+     if (g_joy_shm != NULL) {
+         munmap((void *)g_joy_shm, sizeof(Am2rJoyShm));
+@@ -1614,19 +1672,7 @@ bool platformInit(int32_t reqW, int32_t reqH, const char *title, bool headless) {
+     (void)title;
+     (void)headless;
+ 
+-    g_fb_fd = open("/dev/fb0", O_RDWR | O_SYNC);
+-    if (g_fb_fd < 0) {
+-        logError("MiSTer: cannot open /dev/fb0: %s\n", strerror(errno));
+-        return false;
+-    }
+-    g_fb = (uint32_t *)mmap(NULL, MISTER_FB_BYTES, PROT_READ | PROT_WRITE, MAP_SHARED, g_fb_fd, 0);
+-    if (g_fb == MAP_FAILED) {
+-        logError("MiSTer: cannot map /dev/fb0: %s\n", strerror(errno));
+-        g_fb = NULL;
+-        close(g_fb_fd);
+-        g_fb_fd = -1;
+-        return false;
+-    }
++    if (!mapFramebuffer()) return false;
+     memset(g_fb, 0, MISTER_FB_BYTES);
+     openVirtualInput();
+     if (!openJoyShared()) {

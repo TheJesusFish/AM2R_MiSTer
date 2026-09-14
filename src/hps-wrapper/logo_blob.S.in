@@ -1,0 +1,8 @@
+    .section .rodata
+    .balign 4
+    .global _binary_logo_png_start
+    .global _binary_logo_png_end
+_binary_logo_png_start:
+    .incbin "@MAIN_MISTER_LOGO@"
+_binary_logo_png_end:
+    .section .note.GNU-stack,"",%progbits

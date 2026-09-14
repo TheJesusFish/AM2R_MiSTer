@@ -1,0 +1,718 @@
+diff --git a/src/am2r_savestate.h b/src/am2r_savestate.h
+new file mode 100644
+index 0000000..c63ea32
+--- /dev/null
++++ b/src/am2r_savestate.h
+@@ -0,0 +1,28 @@
++#ifndef AM2R_SAVESTATE_H
++#define AM2R_SAVESTATE_H
++
++#include <stdint.h>
++
++#define AM2R_STATE_MAGIC 0x53523241u /* "A2RS" little-endian */
++#define AM2R_STATE_FD_ENV "AM2R_STATE_FD"
++#define AM2R_STATE_SLOT_COUNT 4
++
++typedef enum {
++    AM2R_STATE_REQUEST_SAVE = 1,
++    AM2R_STATE_REQUEST_LOAD = 2,
++    AM2R_STATE_SNAPSHOT_READY = 3,
++    AM2R_STATE_RESTORED = 4,
++    AM2R_STATE_LOAD_MISSING = 5,
++    AM2R_STATE_SNAPSHOT_ERROR = 6,
++} Am2rStateMessageType;
++
++typedef struct {
++    uint32_t magic;
++    uint32_t type;
++    int32_t slot;
++    int32_t pid;
++    int32_t frame;
++    int32_t error;
++} Am2rStateMessage;
++
++#endif
+diff --git a/src/audio/miniaudio/ma_audio_system.c b/src/audio/miniaudio/ma_audio_system.c
+index acda180..b2eed01 100644
+--- a/src/audio/miniaudio/ma_audio_system.c
++++ b/src/audio/miniaudio/ma_audio_system.c
+@@ -30,6 +30,11 @@
+ // ===[ Helpers ]===
+ 
+ static SoundInstance* findFreeSlot(MaAudioSystem* ma) {
++    if (ma->forcedSlot >= 0 && ma->forcedSlot < MAX_SOUND_INSTANCES) {
++        SoundInstance* forced = &ma->instances[ma->forcedSlot];
++        if (!forced->active) return forced;
++    }
++
+     // First pass: find an inactive slot
+     repeat(MAX_SOUND_INSTANCES, i) {
+         if (!ma->instances[i].active) {
+@@ -114,15 +119,7 @@ static void measuredAudioCallback(ma_device* device, void* output,
+            &previous, scaled, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+ }
+ 
+-static void maInit(AudioSystem* audio, DataWin* dataWin, FileSystem* fileSystem) {
+-    MaAudioSystem* ma = (MaAudioSystem*) audio;
+-    arrput(ma->base.audioGroups, dataWin);
+-    ma->fileSystem = fileSystem;
+-    ma->outputFrames = 0;
+-    ma->nonSilentCallbacks = 0;
+-    ma->peakMicrounits = 0;
+-    ma->outputLogElapsed = 0.0f;
+-
++static bool maInitRuntime(MaAudioSystem* ma) {
+     ma_device_config deviceConfig = ma_device_config_init(ma_device_type_playback);
+     deviceConfig.playback.format   = ma_format_f32;
+     deviceConfig.playback.channels = 2;
+@@ -133,46 +130,69 @@ static void maInit(AudioSystem* audio, DataWin* dataWin, FileSystem* fileSystem)
+     ma_result deviceResult = ma_device_init(NULL, &deviceConfig, &ma->device);
+     if (deviceResult != MA_SUCCESS) {
+         logError("Audio: Failed to initialize playback device (error %d)\n", deviceResult);
+-        return;
++        return false;
+     }
++
+     ma_engine_config config = ma_engine_config_init();
+     config.pDevice = &ma->device;
+-    
+     ma_result result = ma_engine_init(&config, &ma->engine);
+     if (result != MA_SUCCESS) {
+         logError("Audio: Failed to initialize miniaudio engine (error %d)\n", result);
+         ma_device_uninit(&ma->device);
+-        return;
++        return false;
++    }
++
++    repeat(MAX_LISTENERS, i) {
++        ma_sound_group_init(&ma->engine, 0, NULL, &ma->listenerGroups[i]);
++        ma_sound_group_set_volume(&ma->listenerGroups[i], ma->listenerGains[i]);
+     }
++    ma->runtimeInitialized = true;
++    return true;
++}
++
++static void maInit(AudioSystem* audio, DataWin* dataWin, FileSystem* fileSystem) {
++    MaAudioSystem* ma = (MaAudioSystem*) audio;
++    arrput(ma->base.audioGroups, dataWin);
++    ma->fileSystem = fileSystem;
++    ma->outputFrames = 0;
++    ma->nonSilentCallbacks = 0;
++    ma->peakMicrounits = 0;
++    ma->outputLogElapsed = 0.0f;
+ 
+     memset(ma->instances, 0, sizeof(ma->instances));
+     ma->nextInstanceCounter = 0;
++    ma->forcedSlot = -1;
++    ma->checkpointValid = false;
+ 
+     repeat(MAX_LISTENERS, i) {
+-        ma_sound_group_init(&ma->engine, 0, NULL, &ma->listenerGroups[i]);
+-        ma_sound_group_set_volume(&ma->listenerGroups[i], 1.0f);
+         ma->listenerGains[i] = 1.0f;
+     }
+ 
+-    logInfo("Audio: miniaudio engine initialized\n");
++    if (maInitRuntime(ma)) logInfo("Audio: miniaudio engine initialized\n");
+ }
+ 
+ static void maDestroy(AudioSystem* audio) {
+     MaAudioSystem* ma = (MaAudioSystem*) audio;
+ 
+-    repeat(MAX_LISTENERS, i) {
+-        ma_sound_group_uninit(&ma->listenerGroups[i]);
+-    }
++    if (ma->runtimeInitialized) {
++        repeat(MAX_LISTENERS, i) {
++            ma_sound_group_uninit(&ma->listenerGroups[i]);
++        }
+ 
+-    // Uninit all active sound instances
+-    repeat(MAX_SOUND_INSTANCES, i) {
+-        if (ma->instances[i].active) {
+-            ma_sound_uninit(&ma->instances[i].maSound);
+-            if (ma->instances[i].ownsDecoder) {
+-                ma_decoder_uninit(&ma->instances[i].decoder);
++        // Uninit all active sound instances
++        repeat(MAX_SOUND_INSTANCES, i) {
++            if (ma->instances[i].active) {
++                ma_sound_uninit(&ma->instances[i].maSound);
++                if (ma->instances[i].ownsDecoder) {
++                    ma_decoder_uninit(&ma->instances[i].decoder);
++                }
++                ma->instances[i].active = false;
+             }
+-            ma->instances[i].active = false;
+         }
++
++        ma_engine_uninit(&ma->engine);
++        ma_device_uninit(&ma->device);
++        ma->runtimeInitialized = false;
+     }
+ 
+     // Free stream entries
+@@ -190,8 +210,6 @@ static void maDestroy(AudioSystem* audio) {
+     }
+     arrfree(ma->base.audioGroups);
+ 
+-    ma_device_uninit(&ma->device);
+-    ma_engine_uninit(&ma->engine);
+     free(ma);
+ }
+ 
+@@ -237,6 +255,7 @@ static void maUpdate(AudioSystem* audio, float deltaTime) {
+ 
+ static int32_t maPlaySound(AudioSystem* audio, int32_t soundIndex, int32_t priority, bool loop) {
+     MaAudioSystem* ma = (MaAudioSystem*) audio;
++    if (!ma->runtimeInitialized) return -1;
+ 
+     // Check if this is a stream index (created by audio_create_stream)
+     bool isStream = (soundIndex >= AUDIO_STREAM_INDEX_BASE);
+@@ -483,12 +502,90 @@ static void maResumeAll(AudioSystem* audio) {
+ 
+ static void maSuspend(AudioSystem* audio) {
+     MaAudioSystem* ma = (MaAudioSystem*) audio;
+-    ma_device_stop(ma_engine_get_device(&ma->engine));
++    if (ma->runtimeInitialized) ma_device_stop(ma_engine_get_device(&ma->engine));
+ }
+ 
+ static void maResume(AudioSystem* audio) {
+     MaAudioSystem* ma = (MaAudioSystem*) audio;
+-    ma_device_start(ma_engine_get_device(&ma->engine));
++    if (ma->runtimeInitialized) ma_device_start(ma_engine_get_device(&ma->engine));
++}
++
++bool MaAudioSystem_prepareSaveState(AudioSystem* audio) {
++    MaAudioSystem* ma = (MaAudioSystem*) audio;
++    if (ma == nullptr || !ma->runtimeInitialized) return false;
++
++    ma_device_stop(ma_engine_get_device(&ma->engine));
++    memset(ma->checkpoint, 0, sizeof(ma->checkpoint));
++    repeat(MAX_SOUND_INSTANCES, i) {
++        SoundInstance* inst = &ma->instances[i];
++        if (!inst->active) continue;
++        SoundCheckpoint* saved = &ma->checkpoint[i];
++        saved->active = true;
++        saved->playing = ma_sound_is_playing(&inst->maSound);
++        saved->looping = ma_sound_is_looping(&inst->maSound);
++        saved->soundIndex = inst->soundIndex;
++        saved->instanceId = inst->instanceId;
++        saved->priority = inst->priority;
++        saved->targetGain = inst->targetGain;
++        saved->currentGain = inst->currentGain;
++        saved->fadeTimeRemaining = inst->fadeTimeRemaining;
++        saved->fadeTotalTime = inst->fadeTotalTime;
++        saved->startGain = inst->startGain;
++        saved->pitch = ma_sound_get_pitch(&inst->maSound);
++        ma_sound_get_cursor_in_pcm_frames(&inst->maSound, &saved->cursorFrame);
++
++        ma_sound_uninit(&inst->maSound);
++        if (inst->ownsDecoder) ma_decoder_uninit(&inst->decoder);
++        inst->active = false;
++    }
++    repeat(MAX_LISTENERS, i) {
++        ma_sound_group_uninit(&ma->listenerGroups[i]);
++    }
++    ma_engine_uninit(&ma->engine);
++    ma_device_uninit(&ma->device);
++    ma->runtimeInitialized = false;
++    ma->checkpointValid = true;
++    return true;
++}
++
++bool MaAudioSystem_restoreSaveState(AudioSystem* audio) {
++    MaAudioSystem* ma = (MaAudioSystem*) audio;
++    if (ma == nullptr) return false;
++    if (ma->runtimeInitialized) return true;
++    if (!maInitRuntime(ma)) return false;
++
++    memset(ma->instances, 0, sizeof(ma->instances));
++    ma->forcedSlot = -1;
++    if (ma->checkpointValid) {
++        repeat(MAX_SOUND_INSTANCES, i) {
++            SoundCheckpoint* saved = &ma->checkpoint[i];
++            if (!saved->active) continue;
++            ma->forcedSlot = (int32_t)i;
++            int32_t instance = maPlaySound(audio, saved->soundIndex, saved->priority, saved->looping);
++            ma->forcedSlot = -1;
++            if (instance < 0) {
++                logWarn("Audio: could not restore sound instance %d\n", saved->instanceId);
++                continue;
++            }
++
++            SoundInstance* inst = &ma->instances[i];
++            inst->instanceId = saved->instanceId;
++            inst->targetGain = saved->targetGain;
++            inst->currentGain = saved->currentGain;
++            inst->fadeTimeRemaining = saved->fadeTimeRemaining;
++            inst->fadeTotalTime = saved->fadeTotalTime;
++            inst->startGain = saved->startGain;
++            ma_sound_set_volume(&inst->maSound, saved->currentGain);
++            ma_sound_set_pitch(&inst->maSound, saved->pitch);
++            ma_sound_set_looping(&inst->maSound, saved->looping);
++            ma_sound_seek_to_pcm_frame(&inst->maSound, saved->cursorFrame);
++            if (!saved->playing) ma_sound_stop(&inst->maSound);
++        }
++    }
++    ma->forcedSlot = -1;
++    ma->checkpointValid = false;
++    logInfo("Audio: reconstructed after save-state fork\n");
++    return true;
+ }
+ 
+ static void maSetSoundGain(AudioSystem* audio, int32_t soundOrInstance, float gain, uint32_t timeMs) {
+diff --git a/src/audio/miniaudio/ma_audio_system.h b/src/audio/miniaudio/ma_audio_system.h
+index b005fef..0012df9 100644
+--- a/src/audio/miniaudio/ma_audio_system.h
++++ b/src/audio/miniaudio/ma_audio_system.h
+@@ -28,6 +28,22 @@ typedef struct {
+     int32_t priority;
+ } SoundInstance;
+ 
++typedef struct {
++    bool active;
++    bool playing;
++    bool looping;
++    int32_t soundIndex;
++    int32_t instanceId;
++    int32_t priority;
++    float targetGain;
++    float currentGain;
++    float fadeTimeRemaining;
++    float fadeTotalTime;
++    float startGain;
++    float pitch;
++    ma_uint64 cursorFrame;
++} SoundCheckpoint;
++
+ typedef struct {
+     bool active;
+     char* filePath; // resolved file path (owned, freed on destroy)
+@@ -49,8 +65,14 @@ typedef struct {
+     volatile uint32_t nonSilentCallbacks;
+     volatile uint32_t peakMicrounits;
+     float outputLogElapsed;
++    SoundCheckpoint checkpoint[MAX_SOUND_INSTANCES];
++    int32_t forcedSlot;
++    bool runtimeInitialized;
++    bool checkpointValid;
+ } MaAudioSystem;
+ 
+ MaAudioSystem* MaAudioSystem_create(DataWin* dataWin);
++bool MaAudioSystem_prepareSaveState(AudioSystem* audio);
++bool MaAudioSystem_restoreSaveState(AudioSystem* audio);
+ 
+ #endif /* _BS_MA_AUDIO_SYSTEM_H_ */
+diff --git a/src/backends/mister.c b/src/backends/mister.c
+index 11910e8..5fa0fc7 100644
+--- a/src/backends/mister.c
++++ b/src/backends/mister.c
+@@ -11,6 +11,7 @@
+ #include <linux/input.h>
+ #include <stdint.h>
+ #include <stdio.h>
++#include <stdlib.h>
+ #include <string.h>
+ #include <sys/ioctl.h>
+ #include <sys/mman.h>
+@@ -35,7 +36,8 @@
+ 
+ typedef struct { uint64_t word[8]; } MisterGpuCommand;
+ typedef struct {
+-    const void* pixels;
++    const void* source;
++    void* shadow;
+     size_t bytes;
+     uint32_t physical[2];
+     uint32_t last_upload_frame;
+@@ -189,7 +191,7 @@ static uint32_t reserveGpuTexture(size_t bytes) {
+ uint32_t MisterGpu_uploadTexture(const void* rgbaPixels, size_t bytes) {
+     if (!g_gpu_available || rgbaPixels == NULL || bytes == 0) return 0;
+     for (uint32_t i = 0; i < g_gpu_texture_record_count; ++i) {
+-        if (g_gpu_texture_records[i].pixels == rgbaPixels &&
++        if (g_gpu_texture_records[i].source == rgbaPixels &&
+             g_gpu_texture_records[i].bytes == bytes)
+             return g_gpu_texture_records[i].physical[g_gpu_texture_records[i].active];
+     }
+@@ -197,12 +199,19 @@ uint32_t MisterGpu_uploadTexture(const void* rgbaPixels, size_t bytes) {
+         logWarn("MiSTer GPU: texture record table exhausted\n");
+         return 0;
+     }
++    void* shadow = malloc(bytes);
++    if (shadow == NULL) return 0;
+     uint32_t physical = reserveGpuTexture(bytes);
+-    if (physical == 0) return 0;
++    if (physical == 0) {
++        free(shadow);
++        return 0;
++    }
++    memcpy(shadow, rgbaPixels, bytes);
+     memcpy(g_gpu_textures + (physical - GPU_TEXTURE_PHYS), rgbaPixels, bytes);
+     __sync_synchronize();
+     MisterGpuTexture* record = &g_gpu_texture_records[g_gpu_texture_record_count++];
+-    record->pixels = rgbaPixels;
++    record->source = rgbaPixels;
++    record->shadow = shadow;
+     record->bytes = bytes;
+     record->physical[0] = physical;
+     record->physical[1] = 0;
+@@ -217,7 +226,7 @@ uint32_t MisterGpu_uploadTexture(const void* rgbaPixels, size_t bytes) {
+ uint32_t MisterGpu_uploadDynamicTexture(const void* rgbaPixels, size_t bytes) {
+     if (!g_gpu_available || rgbaPixels == NULL || bytes == 0) return 0;
+     for (uint32_t i = 0; i < g_gpu_texture_record_count; ++i) {
+-        if (g_gpu_texture_records[i].pixels == rgbaPixels &&
++        if (g_gpu_texture_records[i].source == rgbaPixels &&
+             g_gpu_texture_records[i].bytes == bytes) {
+             MisterGpuTexture* record = &g_gpu_texture_records[i];
+             if (!record->dynamic) {
+@@ -233,6 +242,7 @@ uint32_t MisterGpu_uploadDynamicTexture(const void* rgbaPixels, size_t bytes) {
+             }
+             uint32_t physical = record->physical[record->active];
+             uint32_t offset = physical - GPU_TEXTURE_PHYS;
++            memcpy(record->shadow, rgbaPixels, bytes);
+             memcpy(g_gpu_textures + offset, rgbaPixels, bytes);
+             __sync_synchronize();
+             record->last_upload_frame = g_gpu_frame_serial;
+@@ -243,13 +253,20 @@ uint32_t MisterGpu_uploadDynamicTexture(const void* rgbaPixels, size_t bytes) {
+         logWarn("MiSTer GPU: texture record table exhausted\n");
+         return 0;
+     }
++    void* shadow = malloc(bytes);
++    if (shadow == NULL) return 0;
+     uint32_t physical0 = reserveGpuTexture(bytes);
+     uint32_t physical1 = reserveGpuTexture(bytes);
+-    if (physical0 == 0 || physical1 == 0) return 0;
++    if (physical0 == 0 || physical1 == 0) {
++        free(shadow);
++        return 0;
++    }
++    memcpy(shadow, rgbaPixels, bytes);
+     memcpy(g_gpu_textures + (physical0 - GPU_TEXTURE_PHYS), rgbaPixels, bytes);
+     __sync_synchronize();
+     MisterGpuTexture* record = &g_gpu_texture_records[g_gpu_texture_record_count++];
+-    record->pixels = rgbaPixels;
++    record->source = rgbaPixels;
++    record->shadow = shadow;
+     record->bytes = bytes;
+     record->physical[0] = physical0;
+     record->physical[1] = physical1;
+@@ -363,6 +380,45 @@ void MisterGpu_useSoftwareFrame(void) {
+     g_gpu_software_frame = true;
+ }
+ 
++bool MisterGpu_prepareSaveState(void) {
++    if (!g_gpu_available) return true;
++    return waitGpuCompletion(NULL);
++}
++
++void MisterGpu_afterSaveStateRestore(void) {
++    if (!g_gpu_available) return;
++
++    // The CPU address space came from the selected snapshot, while the shared
++    // DDR texture pool and FPGA mailbox were most recently used by another
++    // process.  Re-publish every texture owned by this snapshot before the
++    // restored game can submit a new frame.
++    g_gpu_control[0] = 0;
++    __sync_synchronize();
++    g_gpu_pending = false;
++    g_gpu_presented = false;
++    g_gpu_software_frame = false;
++    g_gpu_command_count = 0;
++    g_gpu_write_buffer = 0;
++    g_gpu_commands = g_gpu_command_buffers[0];
++    g_gpu_sequence = g_gpu_control[6];
++    g_gpu_pending_sequence = 0;
++
++    for (uint32_t i = 0; i < g_gpu_texture_record_count; ++i) {
++        MisterGpuTexture* record = &g_gpu_texture_records[i];
++        if (record->shadow == NULL || record->bytes == 0) continue;
++        for (uint32_t copy = 0; copy < (record->dynamic ? 2u : 1u); ++copy) {
++            size_t offset = (size_t)(record->physical[copy] - GPU_TEXTURE_PHYS);
++            if (offset <= GPU_TEXTURE_BYTES && record->bytes <= GPU_TEXTURE_BYTES - offset)
++                memcpy(g_gpu_textures + offset, record->shadow, record->bytes);
++        }
++        record->active = 0;
++        record->last_upload_frame = g_gpu_frame_serial;
++    }
++    __sync_synchronize();
++    logInfo("MiSTer GPU: restored %u texture records after save-state load\n",
++            g_gpu_texture_record_count);
++}
++
+ static int linuxKeyToGml(uint16_t code) {
+     switch (code) {
+         case KEY_A: return 'A'; case KEY_B: return 'B'; case KEY_C: return 'C';
+@@ -470,6 +526,11 @@ bool platformInit(int32_t reqW, int32_t reqH, const char *title, bool headless)
+ 
+ void platformExit(void) {
+     if (g_gpu_available) waitGpuCompletion(NULL);
++    for (uint32_t i = 0; i < g_gpu_texture_record_count; ++i) {
++        free(g_gpu_texture_records[i].shadow);
++        g_gpu_texture_records[i].shadow = NULL;
++    }
++    g_gpu_texture_record_count = 0;
+     if (g_input_fd >= 0) {
+         close(g_input_fd);
+         g_input_fd = -1;
+diff --git a/src/backends/mister_gpu.h b/src/backends/mister_gpu.h
+index c426a0d..2efdf76 100644
+--- a/src/backends/mister_gpu.h
++++ b/src/backends/mister_gpu.h
+@@ -29,5 +29,7 @@ bool MisterGpu_addAffineBlit(uint32_t source, uint32_t stride,
+ bool MisterGpu_finishFrame(uint32_t* cycles);
+ void MisterGpu_readbackRgba(uint8_t* rgba, int32_t width, int32_t height);
+ void MisterGpu_useSoftwareFrame(void);
++bool MisterGpu_prepareSaveState(void);
++void MisterGpu_afterSaveStateRestore(void);
+ 
+ #endif
+diff --git a/src/loop.c b/src/loop.c
+index a0c2592..1928692 100644
+--- a/src/loop.c
++++ b/src/loop.c
+@@ -1,4 +1,5 @@
+ #include <ctype.h>
++#include <errno.h>
+ 
+ #include "data_win.h"
+ #include "vm.h"
+@@ -63,6 +64,14 @@
+ #include "profiler.h"
+ #include "gettime.h"
+ 
++#ifdef USE_MISTER
++#include "am2r_savestate.h"
++#include "backends/mister_gpu.h"
++#include <sys/socket.h>
++#include <sys/prctl.h>
++#include <sys/types.h>
++#endif
++
+ #ifdef PLATFORM_VITA
+ #include "vita_textures.h"
+ #endif
+@@ -471,6 +480,198 @@ static void PreProcessedStuff_free(void) {
+ #endif
+ }
+ 
++#ifdef USE_MISTER
++static int am2rStateFd = -1;
++static volatile sig_atomic_t am2rStateSignalAction = 0;
++static volatile sig_atomic_t am2rStateSignalSlot = 0;
++
++static void am2rStateSignalHandler(int signalNumber) {
++    int offset = signalNumber - SIGRTMIN;
++    if (offset >= 0 && offset < AM2R_STATE_SLOT_COUNT) {
++        am2rStateSignalAction = AM2R_STATE_REQUEST_SAVE;
++        am2rStateSignalSlot = offset;
++    } else if (offset >= AM2R_STATE_SLOT_COUNT && offset < AM2R_STATE_SLOT_COUNT * 2) {
++        am2rStateSignalAction = AM2R_STATE_REQUEST_LOAD;
++        am2rStateSignalSlot = offset - AM2R_STATE_SLOT_COUNT;
++    }
++}
++
++static void am2rStateInit(void) {
++    const char* value = getenv(AM2R_STATE_FD_ENV);
++    if (value == nullptr || value[0] == '\0') return;
++    char* end = nullptr;
++    long fd = strtol(value, &end, 10);
++    if (end == value || *end != '\0' || fd < 0 || fd > INT32_MAX) return;
++    am2rStateFd = (int)fd;
++    int flags = fcntl(am2rStateFd, F_GETFL, 0);
++    if (flags >= 0) fcntl(am2rStateFd, F_SETFL, flags | O_NONBLOCK);
++    signal(SIGCHLD, SIG_IGN);
++    struct sigaction action = {0};
++    action.sa_handler = am2rStateSignalHandler;
++    sigemptyset(&action.sa_mask);
++    for (int i = 0; i < AM2R_STATE_SLOT_COUNT * 2; ++i)
++        sigaction(SIGRTMIN + i, &action, nullptr);
++    logInfo("AM2R save states: four RAM slots enabled (protocol fd %d)\n", am2rStateFd);
++}
++
++static bool am2rStateSend(Am2rStateMessageType type, int slot, int frame, int error) {
++    if (am2rStateFd < 0) return false;
++    Am2rStateMessage message = {
++        .magic = AM2R_STATE_MAGIC,
++        .type = (uint32_t)type,
++        .slot = slot,
++        .pid = (int32_t)getpid(),
++        .frame = frame,
++        .error = error,
++    };
++    return send(am2rStateFd, &message, sizeof(message), MSG_NOSIGNAL) == (ssize_t)sizeof(message);
++}
++
++static bool am2rStateReceive(Am2rStateMessage* message) {
++    if (am2rStateFd < 0) return false;
++    ssize_t count = recv(am2rStateFd, message, sizeof(*message), MSG_DONTWAIT);
++    return count == (ssize_t)sizeof(*message) && message->magic == AM2R_STATE_MAGIC;
++}
++
++// Returns true only in a snapshot process that has just been restored.
++static bool am2rStateSave(Runner* runner, int slot) {
++#ifdef USE_MINIAUDIO
++    if (!MaAudioSystem_prepareSaveState(runner->audioSystem)) {
++        am2rStateSend(AM2R_STATE_SNAPSHOT_ERROR, slot, runner->frameCount, EIO);
++        return false;
++    }
++#else
++    runner->audioSystem->vtable->suspend(runner->audioSystem);
++#endif
++    if (!MisterGpu_prepareSaveState()) {
++#ifdef USE_MINIAUDIO
++        MaAudioSystem_restoreSaveState(runner->audioSystem);
++#else
++        runner->audioSystem->vtable->resume(runner->audioSystem);
++#endif
++        am2rStateSend(AM2R_STATE_SNAPSHOT_ERROR, slot, runner->frameCount, EIO);
++        return false;
++    }
++    fflush(nullptr);
++
++    pid_t snapshot = fork();
++    if (snapshot < 0) {
++        int savedError = errno;
++#ifdef USE_MINIAUDIO
++        MaAudioSystem_restoreSaveState(runner->audioSystem);
++#else
++        runner->audioSystem->vtable->resume(runner->audioSystem);
++#endif
++        am2rStateSend(AM2R_STATE_SNAPSHOT_ERROR, slot, runner->frameCount, savedError);
++        logWarn("AM2R save state %d failed: %s\n", slot + 1, strerror(savedError));
++        return false;
++    }
++
++    if (snapshot == 0) {
++        // A loaded slot is cloned again before it resumes, so loading is
++        // non-destructive and behaves like the four reusable slots in NES.
++        for (;;) {
++            am2rStateSend(AM2R_STATE_SNAPSHOT_READY, slot, runner->frameCount, 0);
++            raise(SIGSTOP);
++            int parentSignal = 0;
++            prctl(PR_GET_PDEATHSIG, &parentSignal);
++            logError("AM2R save state %d resume stage=awake pid=%d ppid=%d pdeath=%d\n",
++                     slot + 1, (int)getpid(), (int)getppid(), parentSignal);
++            pid_t retained = fork();
++            if (retained == 0) continue;
++            if (retained < 0)
++                am2rStateSend(AM2R_STATE_SNAPSHOT_ERROR, slot, runner->frameCount, errno);
++            break;
++        }
++        logError("AM2R save state %d resume stage=gpu-begin pid=%d\n", slot + 1, (int)getpid());
++        MisterGpu_afterSaveStateRestore();
++        logError("AM2R save state %d resume stage=gpu-done pid=%d\n", slot + 1, (int)getpid());
++#ifdef USE_MINIAUDIO
++        if (!MaAudioSystem_restoreSaveState(runner->audioSystem)) {
++            am2rStateSend(AM2R_STATE_SNAPSHOT_ERROR, slot, runner->frameCount, EIO);
++            _exit(125);
++        }
++#else
++        runner->audioSystem->vtable->resume(runner->audioSystem);
++#endif
++        logError("AM2R save state %d resume stage=audio-done pid=%d\n", slot + 1, (int)getpid());
++        am2rStateSend(AM2R_STATE_RESTORED, slot, runner->frameCount, 0);
++        logInfo("AM2R save state %d restored at frame %d\n", slot + 1, runner->frameCount);
++        return true;
++    }
++
++#ifdef USE_MINIAUDIO
++    if (!MaAudioSystem_restoreSaveState(runner->audioSystem)) {
++        am2rStateSend(AM2R_STATE_SNAPSHOT_ERROR, slot, runner->frameCount, EIO);
++        return false;
++    }
++#else
++    runner->audioSystem->vtable->resume(runner->audioSystem);
++#endif
++    logInfo("AM2R save state %d captured at frame %d (snapshot pid %d)\n",
++            slot + 1, runner->frameCount, (int)snapshot);
++    return false;
++}
++
++static void am2rStateLoad(Runner* runner, int slot) {
++    runner->audioSystem->vtable->suspend(runner->audioSystem);
++    if (!MisterGpu_prepareSaveState() ||
++        !am2rStateSend(AM2R_STATE_REQUEST_LOAD, slot, runner->frameCount, 0)) {
++        runner->audioSystem->vtable->resume(runner->audioSystem);
++        logWarn("AM2R save state %d load request failed\n", slot + 1);
++        return;
++    }
++
++    // A successful request terminates this active timeline and resumes the
++    // selected stopped snapshot.  Only a missing-slot response returns here.
++    for (int wait = 0; wait < 500; ++wait) {
++        Am2rStateMessage response = {0};
++        if (am2rStateReceive(&response) && response.type == AM2R_STATE_LOAD_MISSING &&
++            response.slot == slot) {
++            runner->audioSystem->vtable->resume(runner->audioSystem);
++            logWarn("AM2R save state %d is empty\n", slot + 1);
++            return;
++        }
++        usleep(1000);
++    }
++    runner->audioSystem->vtable->resume(runner->audioSystem);
++    logWarn("AM2R save state %d load request timed out\n", slot + 1);
++}
++
++static bool am2rStatePoll(Runner* runner) {
++    if (am2rStateFd < 0) return false;
++
++    int action = 0;
++    int slot = -1;
++    Am2rStateMessage command = {0};
++    while (am2rStateReceive(&command)) {
++        if ((command.type == AM2R_STATE_REQUEST_SAVE || command.type == AM2R_STATE_REQUEST_LOAD) &&
++            command.slot >= 0 && command.slot < AM2R_STATE_SLOT_COUNT) {
++            action = (int)command.type;
++            slot = command.slot;
++        }
++    }
++
++    if (am2rStateSignalAction != 0) {
++        action = (int)am2rStateSignalAction;
++        slot = (int)am2rStateSignalSlot;
++        am2rStateSignalAction = 0;
++    }
++
++    static const int keys[AM2R_STATE_SLOT_COUNT] = { VK_F1, VK_F2, VK_F3, VK_F4 };
++    for (int i = 0; i < AM2R_STATE_SLOT_COUNT; ++i) {
++        if (!RunnerKeyboard_checkPressed(runner->keyboard, keys[i])) continue;
++        action = RunnerKeyboard_check(runner->keyboard, VK_ALT) ?
++            AM2R_STATE_REQUEST_SAVE : AM2R_STATE_REQUEST_LOAD;
++        slot = i;
++    }
++
++    if (action == AM2R_STATE_REQUEST_SAVE) return am2rStateSave(runner, slot);
++    if (action == AM2R_STATE_REQUEST_LOAD) am2rStateLoad(runner, slot);
++    return false;
++}
++#endif
++
+ // ===[ MAIN ]===
+ int loop(CommandLineArgs args, const char *argv0) {
+ #ifdef _WIN32
+@@ -489,6 +690,9 @@ int loop(CommandLineArgs args, const char *argv0) {
+ 
+     bool fastForwardActive = false;
+     bool fastForwardTabPrev = false;
++#ifdef USE_MISTER
++    am2rStateInit();
++#endif
+     while (true) {
+         logInfo("Loading %s...\n", args.dataWinPath);
+ 
+@@ -1011,6 +1215,15 @@ int loop(CommandLineArgs args, const char *argv0) {
+                 continue;
+             }
+ 
++#ifdef USE_MISTER
++            if (am2rStatePoll(runner)) {
++                // Loading can leave the snapshot stopped for minutes. Avoid a
++                // huge delta_time on its first restored frame.
++                lastFrameStartTime = nowNanos();
++                lastFrameTime = lastFrameStartTime;
++            }
++#endif
++
+             // Debug key bindings
+             if (runner->debugMode) {
+                 // Pause

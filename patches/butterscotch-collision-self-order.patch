@@ -1,0 +1,68 @@
+diff --git a/src/runner.c b/src/runner.c
+--- a/src/runner.c
++++ b/src/runner.c
+@@ -3252,32 +3252,27 @@ static int sortInstancesByObjectIndexThenInstanceIdAscending(const void* element
+ 
+ static void dispatchCollisionEvents(Runner* runner) {
+     DataWin* dataWin = runner->dataWin;
+-    // Iterate only the objects that have any collision event in their parent chain.
+-    int32_t* selfObjects = (runner->objectsWithAnyEventOfType != nullptr) ? runner->objectsWithAnyEventOfType[EVENT_COLLISION] : nullptr;
+-    if (selfObjects == nullptr) return;
+-    int32_t selfObjCount = (int32_t) arrlen(selfObjects);
+-
+-    repeat(selfObjCount, soIdx) {
+-        int32_t selfObjIdx = selfObjects[soIdx];
+-        Instance** selfBucket = runner->instancesByExactObject[selfObjIdx];
+-        int32_t selfBucketCount = (int32_t) arrlen(selfBucket);
+-        if (selfBucketCount == 0) continue;
+-
+-        // Snapshot the self bucket: collision handlers can spawn/destroy/instance_change. Iterating a snapshot also keeps newly-created instances from firing collisions in this same phase.
+-        int32_t selfSnapBase = (int32_t) arrlen(runner->instanceSnapshots);
+-        arrsetlen(runner->instanceSnapshots, selfSnapBase + selfBucketCount);
+-        memcpy(&runner->instanceSnapshots[selfSnapBase], selfBucket, (size_t) selfBucketCount * sizeof(Instance*));
+-
+-        repeat(selfBucketCount, si) {
+-            Instance* self = runner->instanceSnapshots[selfSnapBase + si];
+-            if (!self->active) continue;
+-
+-            InstanceBBox bboxSelf;
+-            Sprite* sprSelf;
+-            bool selfDirty = true;
+-
+-            FlattenedCollisionEventList* eventList = &runner->flattenedCollisionEvents[self->objectIndex];
+-            repeat(eventList->eventCount, evtIdx) {
++    // Collision self instances must remain in the runner's forward instance
++    // order.  Grouping them by the first event subtype that happened to add
++    // their object to objectsWithAnyEventOfType changed observable GameMaker
++    // ordering: a newly-created projectile could run its generic oSolid
++    // handler and destroy itself before an older door/enemy received its
++    // projectile collision.  Capture the length so instances created by a
++    // handler do not join this phase, matching the original/native loop.  The
++    // flattened event table and target-object buckets still retain the costly
++    // collision-dispatch optimizations.
++    int32_t selfCount = (int32_t) arrlen(runner->instances);
++
++    repeat(selfCount, si) {
++        Instance* self = runner->instances[si];
++        if (!self->active) continue;
++
++        InstanceBBox bboxSelf;
++        Sprite* sprSelf;
++        bool selfDirty = true;
++
++        FlattenedCollisionEventList* eventList = &runner->flattenedCollisionEvents[self->objectIndex];
++        repeat(eventList->eventCount, evtIdx) {
+                 FlattenedCollisionEvent* evt = &eventList->events[evtIdx];
+                 int32_t targetObjIndex = (int32_t) evt->targetObjectIndex;
+ 
+@@ -3443,10 +3438,7 @@ static void dispatchCollisionEvents(Runner* runner) {
+                     selfDirty = true;
+                 }
+                 Runner_popInstanceSnapshot(runner, snapBase);
+-            }
+         }
+-
+-        arrsetlen(runner->instanceSnapshots, selfSnapBase);
+     }
+ }
+ 

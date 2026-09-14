@@ -1,0 +1,272 @@
+diff --git a/src/backends/mister.c b/src/backends/mister.c
+index f8bcd8b..c74e717 100644
+--- a/src/backends/mister.c
++++ b/src/backends/mister.c
+@@ -69,6 +69,9 @@ typedef struct {
+     bool dynamic;
+     bool source_revision_valid;
+     bool shadow_valid;
++    uint64_t *opaque_pixels;
++    size_t opaque_word_count;
++    uint32_t opaque_generation;
+ } MisterGpuTexture;
+ 
+ static Runner *g_runner = NULL;
+@@ -134,6 +137,7 @@ static uint32_t *g_next_frame = NULL;
+ static int32_t g_next_width = 0;
+ static int32_t g_next_height = 0;
+ static bool g_initialized = false;
++static uint64_t g_gpu_opaque_coverage[MISTER_HEIGHT][MISTER_WIDTH / 64];
+ 
+ static bool openJoyShared(void);
+ 
+@@ -398,6 +402,9 @@ uint32_t MisterGpu_uploadTexture(const void* rgbaPixels, size_t bytes) {
+     record->dynamic = false;
+     record->source_revision_valid = false;
+     record->shadow_valid = true;
++    record->opaque_pixels = NULL;
++    record->opaque_word_count = 0;
++    record->opaque_generation = 0;
+     logInfo("MiSTer GPU: uploaded texture %u (%zu bytes at 0x%08x)\n",
+             g_gpu_texture_record_count - 1, bytes, physical);
+     return physical;
+@@ -482,6 +489,9 @@ static uint32_t uploadDynamicTexture(const void* rgbaPixels, size_t bytes,
+     record->dynamic = true;
+     record->source_revision_valid = sourceRevisionValid;
+     record->shadow_valid = true;
++    record->opaque_pixels = NULL;
++    record->opaque_word_count = 0;
++    record->opaque_generation = 0;
+     logInfo("MiSTer GPU: uploaded dynamic texture %u (%zu bytes at 0x%08x/0x%08x)\n",
+             g_gpu_texture_record_count - 1, bytes, physical0, physical1);
+     return physical0;
+@@ -526,6 +536,9 @@ uint32_t MisterGpu_prepareDynamicTextureGpuWrite(const void* rgbaPixels, size_t
+         record->physical[1] = physical1;
+         record->active = 0;
+         record->dynamic = true;
++        record->opaque_pixels = NULL;
++        record->opaque_word_count = 0;
++        record->opaque_generation = 0;
+     } else if (!record->dynamic) {
+         record->physical[1] = reserveGpuTexture(bytes);
+         if (record->physical[1] == 0) return 0;
+@@ -543,10 +556,10 @@ uint32_t MisterGpu_prepareDynamicTextureGpuWrite(const void* rgbaPixels, size_t
+     return record->physical[record->active];
+ }
+ 
+-static const MisterGpuTexture* textureRecordForPhysical(uint32_t physical,
+-                                                         size_t *recordOffset) {
++static MisterGpuTexture* textureRecordForPhysical(uint32_t physical,
++                                                   size_t *recordOffset) {
+     for (uint32_t i = 0; i < g_gpu_texture_record_count; ++i) {
+-        const MisterGpuTexture *record = &g_gpu_texture_records[i];
++        MisterGpuTexture *record = &g_gpu_texture_records[i];
+         uint32_t copies = record->dynamic ? 2u : 1u;
+         for (uint32_t copy = 0; copy < copies; ++copy) {
+             uint32_t base = record->physical[copy];
+@@ -560,6 +573,186 @@ static const MisterGpuTexture* textureRecordForPhysical(uint32_t physical,
+     return NULL;
+ }
+ 
++static int32_t gpuFixedFloor(int32_t value);
++
++static bool prepareTextureOpacity(MisterGpuTexture *record) {
++    if (record->opaque_generation == record->generation &&
++        record->opaque_pixels != NULL)
++        return true;
++    if (record->shadow == NULL || !record->shadow_valid || record->bytes < 4u)
++        return false;
++
++    size_t pixelCount = record->bytes / sizeof(uint32_t);
++    size_t wordCount = (pixelCount + 63u) / 64u;
++    if (record->opaque_word_count != wordCount) {
++        uint64_t *replacement = (uint64_t *)realloc(
++            record->opaque_pixels, wordCount * sizeof(uint64_t));
++        if (replacement == NULL) return false;
++        record->opaque_pixels = replacement;
++        record->opaque_word_count = wordCount;
++    }
++    memset(record->opaque_pixels, 0, wordCount * sizeof(uint64_t));
++    const uint32_t *pixels = (const uint32_t *)record->shadow;
++    for (size_t i = 0; i < pixelCount; ++i)
++        if ((pixels[i] >> 24) == 255u)
++            record->opaque_pixels[i >> 6] |= UINT64_C(1) << (i & 63u);
++    record->opaque_generation = record->generation;
++    return true;
++}
++
++static bool textureOpacityRangeIsSet(const MisterGpuTexture *record,
++                                     size_t firstPixel, size_t pixelCount) {
++    if (pixelCount == 0) return true;
++    size_t lastPixel = firstPixel + pixelCount - 1u;
++    size_t firstWord = firstPixel >> 6;
++    size_t lastWord = lastPixel >> 6;
++    if (lastWord >= record->opaque_word_count) return false;
++    uint64_t firstMask = UINT64_MAX << (firstPixel & 63u);
++    uint64_t lastMask = UINT64_MAX >> (63u - (lastPixel & 63u));
++    if (firstWord == lastWord)
++        return (record->opaque_pixels[firstWord] & firstMask & lastMask) ==
++            (firstMask & lastMask);
++    if ((record->opaque_pixels[firstWord] & firstMask) != firstMask)
++        return false;
++    for (size_t word = firstWord + 1u; word < lastWord; ++word)
++        if (record->opaque_pixels[word] != UINT64_MAX) return false;
++    return (record->opaque_pixels[lastWord] & lastMask) == lastMask;
++}
++
++static bool axisCommandCanOverwrite(const MisterGpuCommand *command) {
++    return (command->word[0] & 0x1ffu) == 2u &&
++        (uint32_t)command->word[5] == 0x00010000u &&
++        (uint32_t)(command->word[5] >> 32) == 0x00010000u &&
++        (uint8_t)(command->word[6] >> 24) == 255u &&
++        command->word[7] == 0;
++}
++
++static void markAxisCommandCoverage(const MisterGpuCommand *command) {
++    int32_t destinationX = (int16_t)command->word[2];
++    int32_t destinationY = (int16_t)(command->word[2] >> 16);
++    int32_t firstX = destinationX < 0 ? -destinationX : 0;
++    int32_t firstY = destinationY < 0 ? -destinationY : 0;
++    int32_t lastX = (uint16_t)(command->word[0] >> 16);
++    int32_t lastY = (uint16_t)(command->word[0] >> 32);
++    if (destinationX + lastX > MISTER_WIDTH) lastX = MISTER_WIDTH - destinationX;
++    if (destinationY + lastY > MISTER_HEIGHT) lastY = MISTER_HEIGHT - destinationY;
++    if (firstX >= lastX || firstY >= lastY) return;
++
++    uint32_t outputFirstX = (uint32_t)(destinationX + firstX);
++    uint32_t outputLastX = (uint32_t)(destinationX + lastX);
++    uint32_t firstWord = outputFirstX >> 6;
++    uint32_t lastWord = (outputLastX - 1u) >> 6;
++    uint64_t firstMask = UINT64_MAX << (outputFirstX & 63u);
++    uint64_t lastMask = UINT64_MAX >> (63u - ((outputLastX - 1u) & 63u));
++    for (int32_t y = firstY; y < lastY; ++y) {
++        uint64_t *coverage = g_gpu_opaque_coverage[destinationY + y];
++        if (firstWord == lastWord) {
++            coverage[firstWord] |= firstMask & lastMask;
++            continue;
++        }
++        coverage[firstWord] |= firstMask;
++        for (uint32_t word = firstWord + 1u; word < lastWord; ++word)
++            coverage[word] = UINT64_MAX;
++        coverage[lastWord] |= lastMask;
++    }
++}
++
++static bool coverageIsFull(void) {
++    for (uint32_t y = 0; y < MISTER_HEIGHT; ++y)
++        for (uint32_t word = 0; word < MISTER_WIDTH / 64; ++word)
++            if (g_gpu_opaque_coverage[y][word] != UINT64_MAX) return false;
++    return true;
++}
++
++static bool axisCommandSourceIsOpaque(const MisterGpuCommand *command) {
++    size_t sourceBaseOffset = 0;
++    MisterGpuTexture *record = textureRecordForPhysical(
++        (uint32_t)command->word[1], &sourceBaseOffset);
++    if (record == NULL || record->shadow == NULL || !record->shadow_valid)
++        return false;
++
++    int32_t destinationX = (int16_t)command->word[2];
++    int32_t destinationY = (int16_t)(command->word[2] >> 16);
++    int32_t firstX = destinationX < 0 ? -destinationX : 0;
++    int32_t firstY = destinationY < 0 ? -destinationY : 0;
++    int32_t lastX = (uint16_t)(command->word[0] >> 16);
++    int32_t lastY = (uint16_t)(command->word[0] >> 32);
++    if (destinationX + lastX > MISTER_WIDTH) lastX = MISTER_WIDTH - destinationX;
++    if (destinationY + lastY > MISTER_HEIGHT) lastY = MISTER_HEIGHT - destinationY;
++    if (firstX >= lastX || firstY >= lastY) return true;
++
++    int32_t sourceX = gpuFixedFloor((int32_t)command->word[4]);
++    int32_t sourceY = gpuFixedFloor((int32_t)(command->word[4] >> 32));
++    uint32_t sourceStride = (uint32_t)(command->word[1] >> 32);
++    if (sourceX + firstX < 0 || sourceY + firstY < 0 || sourceStride == 0)
++        return false;
++
++    size_t firstOffset = sourceBaseOffset +
++        (size_t)(sourceY + firstY) * sourceStride +
++        (size_t)(sourceX + firstX) * sizeof(uint32_t);
++    size_t lastOffset = sourceBaseOffset +
++        (size_t)(sourceY + lastY - 1) * sourceStride +
++        (size_t)(sourceX + lastX - 1) * sizeof(uint32_t);
++    if (firstOffset > record->bytes || sizeof(uint32_t) > record->bytes - firstOffset ||
++        lastOffset > record->bytes || sizeof(uint32_t) > record->bytes - lastOffset)
++        return false;
++
++    if (!prepareTextureOpacity(record)) return false;
++    for (int32_t y = firstY; y < lastY; ++y) {
++        size_t rowOffset = sourceBaseOffset +
++            (size_t)(sourceY + y) * sourceStride +
++            (size_t)(sourceX + firstX) * sizeof(uint32_t);
++        if ((rowOffset & (sizeof(uint32_t) - 1u)) != 0 ||
++            !textureOpacityRangeIsSet(record, rowOffset / sizeof(uint32_t),
++                                      (size_t)(lastX - firstX)))
++            return false;
++    }
++    return true;
++}
++
++static uint32_t cullFullyCoveredPrefix(void) {
++    // GameMaker often draws several independently scrolling room layers as
++    // screen-sized strips. If a later consecutive strip group covers every
++    // output pixel with opaque samples, everything before it is unobservable.
++    // Detect that condition from the exact CPU texture shadows rather than
++    // assuming a particular AM2R room or layer order.
++    uint32_t bestPrefix = 0;
++    uint32_t groupEnd = g_gpu_command_count;
++    while (groupEnd != 0) {
++        uint32_t groupStart = groupEnd - 1u;
++        if (!axisCommandCanOverwrite(&g_gpu_commands[groupStart])) {
++            groupEnd = groupStart;
++            continue;
++        }
++        uint64_t source = g_gpu_commands[groupStart].word[1];
++        while (groupStart != 0 &&
++               axisCommandCanOverwrite(&g_gpu_commands[groupStart - 1u]) &&
++               g_gpu_commands[groupStart - 1u].word[1] == source)
++            groupStart--;
++
++        memset(g_gpu_opaque_coverage, 0, sizeof(g_gpu_opaque_coverage));
++        for (uint32_t i = groupStart; i < groupEnd; ++i)
++            markAxisCommandCoverage(&g_gpu_commands[i]);
++        if (coverageIsFull()) {
++            bool opaque = true;
++            for (uint32_t i = groupStart; i < groupEnd && opaque; ++i)
++                opaque = axisCommandSourceIsOpaque(&g_gpu_commands[i]);
++            if (opaque) {
++                bestPrefix = groupStart;
++                break;
++            }
++        }
++        groupEnd = groupStart;
++    }
++
++    if (bestPrefix != 0) {
++        memmove(g_gpu_commands, &g_gpu_commands[bestPrefix],
++                (g_gpu_command_count - bestPrefix) * sizeof(MisterGpuCommand));
++        g_gpu_command_count -= bestPrefix;
++    }
++    return bestPrefix;
++}
++
+ static uint8_t gpuMul255(uint8_t a, uint8_t b) {
+     uint32_t product = (uint32_t)a * b;
+     return (uint8_t)((product + 128u + ((product + 128u) >> 8)) >> 8);
+@@ -1881,6 +2074,10 @@ void platformExit(void) {
+     for (uint32_t i = 0; i < g_gpu_texture_record_count; ++i) {
+         free(g_gpu_texture_records[i].shadow);
+         g_gpu_texture_records[i].shadow = NULL;
++        free(g_gpu_texture_records[i].opaque_pixels);
++        g_gpu_texture_records[i].opaque_pixels = NULL;
++        g_gpu_texture_records[i].opaque_word_count = 0;
++        g_gpu_texture_records[i].opaque_generation = 0;
+     }
+     g_gpu_texture_record_count = 0;
+     free(g_gpu_fused_base_pixels);
+@@ -2029,6 +2226,7 @@ void platformSwapBuffers(void) {
+ 
+     if (!softwareFrame && g_gpu_command_count != 0) {
+         tryFuseMapBackground();
++        cullFullyCoveredPrefix();
+         uint32_t cycles = 0;
+         uint32_t commandCount = g_gpu_command_count;
+         uint64_t waitStart = nowNanos();

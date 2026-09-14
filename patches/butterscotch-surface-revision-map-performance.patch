@@ -1,0 +1,379 @@
+diff --git a/src/backends/mister.c b/src/backends/mister.c
+index 022bf39..e764c2d 100644
+--- a/src/backends/mister.c
++++ b/src/backends/mister.c
+@@ -44,6 +44,7 @@
+ #define GPU_TEXTURE_BYTES (128u * 1024u * 1024u)
+ #define GPU_TEXTURE_RECORDS 64
+ #define GPU_FUSED_PREFIX_COMMANDS 12u
++#define GPU_FUSED_BASE_SOURCES 8u
+ #define AM2R_JOY_SHM_PATH "/dev/shm/am2r-joy"
+ #define AM2R_JOY_SHM_ENV "AM2R_JOY_SHM"
+ #define AM2R_JOY_SHM_MAGIC 0x524a3241u
+@@ -63,8 +64,10 @@ typedef struct {
+     uint32_t physical[2];
+     uint32_t last_upload_frame;
+     uint32_t generation;
++    uint32_t source_revision;
+     uint8_t active;
+     bool dynamic;
++    bool source_revision_valid;
+ } MisterGpuTexture;
+ 
+ static Runner *g_runner = NULL;
+@@ -108,6 +111,9 @@ static MisterGpuCommand g_gpu_fused_source_commands[GPU_FUSED_PREFIX_COMMANDS];
+ static uint32_t g_gpu_fused_source_command_count = 0;
+ static const MisterGpuTexture *g_gpu_fused_source_record = NULL;
+ static uint32_t g_gpu_fused_source_generation = 0;
++static const MisterGpuTexture *g_gpu_fused_base_source_records[GPU_FUSED_BASE_SOURCES];
++static uint32_t g_gpu_fused_base_source_generations[GPU_FUSED_BASE_SOURCES];
++static uint32_t g_gpu_fused_base_source_count = 0;
+ static const MisterGpuTexture *g_gpu_fused_overlay_record = NULL;
+ static uint32_t g_gpu_fused_overlay_generation = 0;
+ static uint32_t *g_gpu_map_overlay_pixels = NULL;
+@@ -386,24 +392,41 @@ uint32_t MisterGpu_uploadTexture(const void* rgbaPixels, size_t bytes) {
+     record->physical[1] = 0;
+     record->last_upload_frame = 0;
+     record->generation = nextTextureGeneration();
++    record->source_revision = 0;
+     record->active = 0;
+     record->dynamic = false;
++    record->source_revision_valid = false;
+     logInfo("MiSTer GPU: uploaded texture %u (%zu bytes at 0x%08x)\n",
+             g_gpu_texture_record_count - 1, bytes, physical);
+     return physical;
+ }
+ 
+-uint32_t MisterGpu_uploadDynamicTexture(const void* rgbaPixels, size_t bytes) {
++static uint32_t uploadDynamicTexture(const void* rgbaPixels, size_t bytes,
++                                     bool sourceRevisionValid,
++                                     uint32_t sourceRevision) {
+     if (!g_gpu_available || rgbaPixels == NULL || bytes == 0) return 0;
+     for (uint32_t i = 0; i < g_gpu_texture_record_count; ++i) {
+         if (g_gpu_texture_records[i].source == rgbaPixels &&
+             g_gpu_texture_records[i].bytes == bytes) {
+             MisterGpuTexture* record = &g_gpu_texture_records[i];
+-            // Most GameMaker surfaces are composited repeatedly even when
+-            // their pixels did not change.  Avoid another cached copy plus an
+-            // uncached HPS-to-FPGA DDR write in that common case.
+-            if (gpuBuffersEqual(record->shadow, rgbaPixels, bytes))
++            // A GameMaker surface may be composited hundreds of times in one
++            // frame. Its renderer-owned revision is an exact write barrier,
++            // so do not rescan the entire pixel allocation for every draw.
++            // Unversioned callers retain the byte comparison fallback.
++            if (sourceRevisionValid && record->source_revision_valid &&
++                record->source_revision == sourceRevision)
++                return record->physical[record->active];
++
++            // Selecting a GameMaker surface as a render target advances its
++            // revision even when the commands reproduce identical pixels.
++            // Compare at most once for each new revision; if the content is
++            // unchanged, remember that revision so the many remaining draws
++            // in this frame become constant-time lookups.
++            if (gpuBuffersEqual(record->shadow, rgbaPixels, bytes)) {
++                record->source_revision = sourceRevision;
++                record->source_revision_valid = sourceRevisionValid;
+                 return record->physical[record->active];
++            }
+             if (!record->dynamic) {
+                 record->physical[1] = reserveGpuTexture(bytes);
+                 if (record->physical[1] == 0) return 0;
+@@ -422,6 +445,8 @@ uint32_t MisterGpu_uploadDynamicTexture(const void* rgbaPixels, size_t bytes) {
+             __sync_synchronize();
+             record->last_upload_frame = g_gpu_frame_serial;
+             record->generation = nextTextureGeneration();
++            record->source_revision = sourceRevision;
++            record->source_revision_valid = sourceRevisionValid;
+             return physical;
+         }
+     }
+@@ -448,13 +473,24 @@ uint32_t MisterGpu_uploadDynamicTexture(const void* rgbaPixels, size_t bytes) {
+     record->physical[1] = physical1;
+     record->last_upload_frame = g_gpu_frame_serial;
+     record->generation = nextTextureGeneration();
++    record->source_revision = sourceRevision;
+     record->active = 0;
+     record->dynamic = true;
++    record->source_revision_valid = sourceRevisionValid;
+     logInfo("MiSTer GPU: uploaded dynamic texture %u (%zu bytes at 0x%08x/0x%08x)\n",
+             g_gpu_texture_record_count - 1, bytes, physical0, physical1);
+     return physical0;
+ }
+ 
++uint32_t MisterGpu_uploadDynamicTexture(const void* rgbaPixels, size_t bytes) {
++    return uploadDynamicTexture(rgbaPixels, bytes, false, 0);
++}
++
++uint32_t MisterGpu_uploadDynamicTextureRevision(const void* rgbaPixels, size_t bytes,
++                                                uint32_t sourceRevision) {
++    return uploadDynamicTexture(rgbaPixels, bytes, true, sourceRevision);
++}
++
+ static const MisterGpuTexture* textureRecordForPhysical(uint32_t physical,
+                                                          size_t *recordOffset) {
+     for (uint32_t i = 0; i < g_gpu_texture_record_count; ++i) {
+@@ -842,8 +878,8 @@ typedef struct {
+     uint32_t *destination;
+     const MisterGpuCommand *commands;
+     uint32_t commandCount;
+-    const MisterGpuTexture *sourceRecord;
+-    size_t sourceBaseOffset;
++    const MisterGpuTexture *const *sourceRecords;
++    const size_t *sourceBaseOffsets;
+     const MisterGpuCommand *fill;
+     int32_t clipYStart;
+     int32_t clipYEnd;
+@@ -855,7 +891,8 @@ static void *compositeMapBatch(void *opaque) {
+     batch->success = true;
+     for (uint32_t i = 0; i < batch->commandCount; ++i) {
+         if (!compositeAxisCommand(batch->destination, &batch->commands[i],
+-                                  batch->sourceRecord, batch->sourceBaseOffset,
++                                  batch->sourceRecords[i],
++                                  batch->sourceBaseOffsets[i],
+                                   batch->clipYStart, batch->clipYEnd)) {
+             batch->success = false;
+             return NULL;
+@@ -870,15 +907,15 @@ static void *compositeMapBatch(void *opaque) {
+ static bool compositeMapParallel(uint32_t *destination,
+                                  const MisterGpuCommand *commands,
+                                  uint32_t commandCount,
+-                                 const MisterGpuTexture *sourceRecord,
+-                                 size_t sourceBaseOffset,
++                                 const MisterGpuTexture *const *sourceRecords,
++                                 const size_t *sourceBaseOffsets,
+                                  const MisterGpuCommand *fill) {
+     MapCompositeBatch top = {
+-        destination, commands, commandCount, sourceRecord, sourceBaseOffset,
++        destination, commands, commandCount, sourceRecords, sourceBaseOffsets,
+         fill, 0, MISTER_HEIGHT / 2, false
+     };
+     MapCompositeBatch bottom = {
+-        destination, commands, commandCount, sourceRecord, sourceBaseOffset,
++        destination, commands, commandCount, sourceRecords, sourceBaseOffsets,
+         fill, MISTER_HEIGHT / 2, MISTER_HEIGHT, false
+     };
+     pthread_t worker;
+@@ -1198,13 +1235,17 @@ static bool tryFuseMapBackground(void) {
+         return false;
+ 
+     uint32_t blitCount = 0;
+-    while (1u + blitCount < g_gpu_command_count && blitCount < 8u) {
++    bool sameSource = true;
++    while (1u + blitCount < g_gpu_command_count &&
++           blitCount < GPU_FUSED_BASE_SOURCES) {
+         const MisterGpuCommand *command = &g_gpu_commands[1u + blitCount];
+         if ((command->word[0] & 0x1ffu) != 2u ||
+-            (uint32_t)command->word[1] != sourcePhysical ||
+-            (uint32_t)(command->word[1] >> 32) != sourceStride ||
++            (uint32_t)(command->word[1] >> 32) == 0 ||
+             command->word[3] != 0 || command->word[7] != 0)
+             break;
++        if ((uint32_t)command->word[1] != sourcePhysical ||
++            (uint32_t)(command->word[1] >> 32) != sourceStride)
++            sameSource = false;
+         blitCount++;
+     }
+     if (blitCount < 3u) return false;
+@@ -1241,10 +1282,16 @@ static bool tryFuseMapBackground(void) {
+     }
+     if (overlayCount != 4u) overlayCount = 0;
+ 
+-    size_t sourceBaseOffset = 0;
+-    const MisterGpuTexture *sourceRecord =
+-        textureRecordForPhysical(sourcePhysical, &sourceBaseOffset);
+-    if (sourceRecord == NULL || sourceRecord->shadow == NULL) return false;
++    const MisterGpuTexture *sourceRecords[GPU_FUSED_BASE_SOURCES];
++    size_t sourceBaseOffsets[GPU_FUSED_BASE_SOURCES];
++    for (uint32_t i = 0; i < blitCount; ++i) {
++        sourceRecords[i] = textureRecordForPhysical(
++            (uint32_t)g_gpu_commands[1u + i].word[1], &sourceBaseOffsets[i]);
++        if (sourceRecords[i] == NULL || sourceRecords[i]->shadow == NULL)
++            return false;
++    }
++    const MisterGpuTexture *sourceRecord = sourceRecords[0];
++    size_t sourceBaseOffset = sourceBaseOffsets[0];
+ 
+     size_t overlayBaseOffset = 0;
+     const MisterGpuTexture *overlayRecord = NULL;
+@@ -1252,13 +1299,19 @@ static bool tryFuseMapBackground(void) {
+         overlayRecord = textureRecordForPhysical(overlayPhysical, &overlayBaseOffset);
+         if (overlayRecord == NULL || overlayRecord->shadow == NULL) overlayCount = 0;
+     }
++    const MisterGpuTexture *overlayRecords[4] = {
++        overlayRecord, overlayRecord, overlayRecord, overlayRecord
++    };
++    const size_t overlayBaseOffsets[4] = {
++        overlayBaseOffset, overlayBaseOffset, overlayBaseOffset, overlayBaseOffset
++    };
+ 
+     uint32_t basePrefixCount = fillIndex + 1u;
+     uint32_t prefixCount = basePrefixCount + overlayCount;
+     if (prefixCount > GPU_FUSED_PREFIX_COMMANDS) return false;
+ 
+     uint32_t tailIndex = fillIndex + 1u + overlayCount;
+-    if (overlayRecord != NULL &&
++    if (sameSource && overlayRecord != NULL &&
+         mapTransitionPatternMatches(&g_gpu_commands[1], blitCount, fill,
+                                     &g_gpu_commands[overlayIndex], overlayCount) &&
+         prepareMapBaseRegion(&g_gpu_commands[1], sourceRecord,
+@@ -1310,9 +1363,14 @@ static bool tryFuseMapBackground(void) {
+         return true;
+     }
+ 
+-    bool rebuildBase = !g_gpu_fused_base_valid ||
+-        g_gpu_fused_source_record != sourceRecord ||
+-        g_gpu_fused_source_generation != sourceRecord->generation ||
++    bool sourceInputsChanged =
++        g_gpu_fused_base_source_count != blitCount;
++    for (uint32_t i = 0; i < blitCount && !sourceInputsChanged; ++i) {
++        if (g_gpu_fused_base_source_records[i] != sourceRecords[i] ||
++            g_gpu_fused_base_source_generations[i] != sourceRecords[i]->generation)
++            sourceInputsChanged = true;
++    }
++    bool rebuildBase = !g_gpu_fused_base_valid || sourceInputsChanged ||
+         g_gpu_fused_base_command_count != basePrefixCount ||
+         memcmp(g_gpu_fused_base_commands, g_gpu_commands,
+                basePrefixCount * sizeof(MisterGpuCommand)) != 0;
+@@ -1326,7 +1384,7 @@ static bool tryFuseMapBackground(void) {
+         for (size_t i = 0; i < (size_t)MISTER_WIDTH * MISTER_HEIGHT; ++i)
+             g_gpu_fused_base_pixels[i] = clearColor;
+         if (!compositeMapParallel(g_gpu_fused_base_pixels, &g_gpu_commands[1],
+-                                  blitCount, sourceRecord, sourceBaseOffset,
++                                  blitCount, sourceRecords, sourceBaseOffsets,
+                                   fill))
+             return false;
+         memcpy(g_gpu_fused_base_commands, g_gpu_commands,
+@@ -1334,6 +1392,11 @@ static bool tryFuseMapBackground(void) {
+         g_gpu_fused_base_command_count = basePrefixCount;
+         g_gpu_fused_source_record = sourceRecord;
+         g_gpu_fused_source_generation = sourceRecord->generation;
++        g_gpu_fused_base_source_count = blitCount;
++        for (uint32_t i = 0; i < blitCount; ++i) {
++            g_gpu_fused_base_source_records[i] = sourceRecords[i];
++            g_gpu_fused_base_source_generations[i] = sourceRecords[i]->generation;
++        }
+         g_gpu_fused_base_valid = true;
+     }
+ 
+@@ -1354,7 +1417,7 @@ static bool tryFuseMapBackground(void) {
+         if (overlayCount != 0 &&
+             !compositeMapParallel(g_gpu_fused_pixels,
+                                   &g_gpu_commands[overlayIndex], overlayCount,
+-                                  overlayRecord, overlayBaseOffset, NULL))
++                                  overlayRecords, overlayBaseOffsets, NULL))
+             return false;
+         uint32_t fusedPhysical =
+             MisterGpu_uploadDynamicTexture(g_gpu_fused_pixels, MISTER_FB_BYTES);
+@@ -1540,6 +1603,18 @@ void MisterGpu_afterSaveStateRestore(void) {
+     g_gpu_commands = g_gpu_command_buffers[0];
+     g_gpu_sequence = g_gpu_control[6];
+     g_gpu_pending_sequence = 0;
++    g_gpu_last_presented_valid = false;
++
++    // Fused/map surfaces are derived into reserved FPGA DDR addresses rather
++    // than texture records with their own CPU shadows.  Their cache metadata
++    // is part of the checkpoint, but the external DDR contents are not.  A
++    // later timeline may therefore have overwritten those addresses before
++    // this snapshot is restored.  Force every derived cache to rebuild from
++    // the shadowed source textures on the first restored frame.
++    g_gpu_fused_base_valid = false;
++    g_gpu_fused_valid = false;
++    g_gpu_map_overlay_cache_valid = false;
++    g_gpu_map_base_cache_valid = false;
+ 
+     for (uint32_t i = 0; i < g_gpu_texture_record_count; ++i) {
+         MisterGpuTexture* record = &g_gpu_texture_records[i];
+@@ -1706,6 +1781,11 @@ void platformExit(void) {
+     g_gpu_fused_source_command_count = 0;
+     g_gpu_fused_source_record = NULL;
+     g_gpu_fused_source_generation = 0;
++    g_gpu_fused_base_source_count = 0;
++    memset(g_gpu_fused_base_source_records, 0,
++           sizeof(g_gpu_fused_base_source_records));
++    memset(g_gpu_fused_base_source_generations, 0,
++           sizeof(g_gpu_fused_base_source_generations));
+     g_gpu_fused_overlay_record = NULL;
+     g_gpu_fused_overlay_generation = 0;
+     free(g_gpu_map_overlay_pixels);
+diff --git a/src/backends/mister_gpu.h b/src/backends/mister_gpu.h
+index c95d502..ef40422 100644
+--- a/src/backends/mister_gpu.h
++++ b/src/backends/mister_gpu.h
+@@ -9,6 +9,8 @@ bool MisterGpu_isAvailable(void);
+ void MisterGpu_beginFrame(void);
+ uint32_t MisterGpu_uploadTexture(const void* rgbaPixels, size_t bytes);
+ uint32_t MisterGpu_uploadDynamicTexture(const void* rgbaPixels, size_t bytes);
++uint32_t MisterGpu_uploadDynamicTextureRevision(const void* rgbaPixels, size_t bytes,
++                                                uint32_t sourceRevision);
+ bool MisterGpu_addClear(uint32_t rgba);
+ bool MisterGpu_addFill(int16_t x, int16_t y, uint16_t width, uint16_t height,
+                        uint32_t rgba, bool additive);
+diff --git a/src/sw_renderer.c b/src/sw_renderer.c
+index 3ae2a50..ac73b9d 100644
+--- a/src/sw_renderer.c
++++ b/src/sw_renderer.c
+@@ -201,6 +201,12 @@ static uint32_t swGpuTextureAddress(SWRenderer* sw, const uint8_t* pixels,
+         if (sw->texturePixels[page] == pixels)
+             return sw->gpuTextureAddresses[page];
+     }
++    for (uint32_t surface = 0; surface < sw->surfaceCount; ++surface) {
++        if (sw->surfaceExistsFlags[surface] && sw->surfacePixels[surface] == pixels)
++            return MisterGpu_uploadDynamicTextureRevision(
++                pixels, (size_t)width * height * 4u,
++                sw->surfaceRevisions[surface]);
++    }
+     return MisterGpu_uploadDynamicTexture(pixels, (size_t)width * height * 4u);
+ }
+ 
+@@ -216,13 +222,31 @@ static uint32_t swGpuPrepareAxisTexture(SWRenderer* sw, const uint8_t* pixels,
+             return sw->gpuTextureAddresses[page];
+         }
+     }
+-    // Small CPU surfaces already fit the FPGA texture aperture.  Upload the
++    uint32_t sourceRevision = 0;
++    bool sourceRevisionKnown = false;
++    for (uint32_t surface = 0; surface < sw->surfaceCount; ++surface) {
++        if (sw->surfaceExistsFlags[surface] && sw->surfacePixels[surface] == pixels) {
++            sourceRevision = sw->surfaceRevisions[surface];
++            sourceRevisionKnown = true;
++            break;
++        }
++    }
++    // Modest CPU surfaces already fit the FPGA texture aperture. Upload the
+     // original allocation so repeated draws share one texture record; the
+     // dynamic uploader also suppresses writes when the surface is unchanged.
+-    if (texW > 0 && texH > 0 && texW <= 320 && texH <= 240) {
++    // AM2R's map transition draws five cropped views of the same 512x256
++    // snapshot. Keeping that source intact avoids rebuilding and comparing
++    // five separate 320x240 staging images on every frame, and also lets the
++    // transition fuser recognize the common source.
++    size_t sourceBytes = texW > 0 && texH > 0
++        ? (size_t)texW * (size_t)texH * 4u : 0;
++    if (sourceBytes != 0 && sourceBytes <= 1024u * 1024u) {
+         *stride = (uint32_t)texW * 4u;
+-        return MisterGpu_uploadDynamicTexture(
+-            pixels, (size_t)texW * (size_t)texH * 4u);
++        return sourceRevisionKnown ?
++            MisterGpu_uploadDynamicTextureRevision(
++                pixels, sourceBytes, sourceRevision) :
++            MisterGpu_uploadDynamicTexture(
++                pixels, sourceBytes);
+     }
+     if (dstW <= 0 || dstH <= 0 || dstW > 320 || dstH > 240 ||
+         sw->gpuDynamicScratchIndex >= 8) return 0;
+@@ -232,15 +256,6 @@ static uint32_t swGpuPrepareAxisTexture(SWRenderer* sw, const uint8_t* pixels,
+     // over 100 ms through uncached HPS DDR. Materialize exactly the samples the
+     // FPGA will consume into a stable 320x240 staging texture instead.
+     uint32_t slot = sw->gpuDynamicScratchIndex++;
+-    uint32_t sourceRevision = 0;
+-    bool sourceRevisionKnown = false;
+-    for (uint32_t surface = 0; surface < sw->surfaceCount; ++surface) {
+-        if (sw->surfaceExistsFlags[surface] && sw->surfacePixels[surface] == pixels) {
+-            sourceRevision = sw->surfaceRevisions[surface];
+-            sourceRevisionKnown = true;
+-            break;
+-        }
+-    }
+     if (sourceRevisionKnown && sw->gpuDynamicScratchAddress[slot] != 0 &&
+         sw->gpuDynamicScratchSource[slot] == pixels &&
+         sw->gpuDynamicScratchSourceRevision[slot] == sourceRevision &&

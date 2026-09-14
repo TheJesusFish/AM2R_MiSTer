@@ -1,0 +1,418 @@
+diff --git a/src/backends/mister.c b/src/backends/mister.c
+index e764c2d..d74c735 100644
+--- a/src/backends/mister.c
++++ b/src/backends/mister.c
+@@ -68,6 +68,7 @@ typedef struct {
+     uint8_t active;
+     bool dynamic;
+     bool source_revision_valid;
++    bool shadow_valid;
+ } MisterGpuTexture;
+ 
+ static Runner *g_runner = NULL;
+@@ -396,6 +397,7 @@ uint32_t MisterGpu_uploadTexture(const void* rgbaPixels, size_t bytes) {
+     record->active = 0;
+     record->dynamic = false;
+     record->source_revision_valid = false;
++    record->shadow_valid = true;
+     logInfo("MiSTer GPU: uploaded texture %u (%zu bytes at 0x%08x)\n",
+             g_gpu_texture_record_count - 1, bytes, physical);
+     return physical;
+@@ -422,7 +424,8 @@ static uint32_t uploadDynamicTexture(const void* rgbaPixels, size_t bytes,
+             // Compare at most once for each new revision; if the content is
+             // unchanged, remember that revision so the many remaining draws
+             // in this frame become constant-time lookups.
+-            if (gpuBuffersEqual(record->shadow, rgbaPixels, bytes)) {
++            if (record->shadow_valid &&
++                gpuBuffersEqual(record->shadow, rgbaPixels, bytes)) {
+                 record->source_revision = sourceRevision;
+                 record->source_revision_valid = sourceRevisionValid;
+                 return record->physical[record->active];
+@@ -447,6 +450,7 @@ static uint32_t uploadDynamicTexture(const void* rgbaPixels, size_t bytes,
+             record->generation = nextTextureGeneration();
+             record->source_revision = sourceRevision;
+             record->source_revision_valid = sourceRevisionValid;
++            record->shadow_valid = true;
+             return physical;
+         }
+     }
+@@ -477,6 +481,7 @@ static uint32_t uploadDynamicTexture(const void* rgbaPixels, size_t bytes,
+     record->active = 0;
+     record->dynamic = true;
+     record->source_revision_valid = sourceRevisionValid;
++    record->shadow_valid = true;
+     logInfo("MiSTer GPU: uploaded dynamic texture %u (%zu bytes at 0x%08x/0x%08x)\n",
+             g_gpu_texture_record_count - 1, bytes, physical0, physical1);
+     return physical0;
+@@ -491,6 +496,53 @@ uint32_t MisterGpu_uploadDynamicTextureRevision(const void* rgbaPixels, size_t b
+     return uploadDynamicTexture(rgbaPixels, bytes, true, sourceRevision);
+ }
+ 
++uint32_t MisterGpu_prepareDynamicTextureGpuWrite(const void* rgbaPixels, size_t bytes,
++                                                 uint32_t sourceRevision) {
++    if (!g_gpu_available || rgbaPixels == NULL || bytes == 0) return 0;
++    MisterGpuTexture* record = NULL;
++    for (uint32_t i = 0; i < g_gpu_texture_record_count; ++i) {
++        if (g_gpu_texture_records[i].source == rgbaPixels &&
++            g_gpu_texture_records[i].bytes == bytes) {
++            record = &g_gpu_texture_records[i];
++            break;
++        }
++    }
++    if (record == NULL) {
++        if (g_gpu_texture_record_count >= GPU_TEXTURE_RECORDS) return 0;
++        void* shadow = malloc(bytes);
++        if (shadow == NULL) return 0;
++        memcpy(shadow, rgbaPixels, bytes);
++        uint32_t physical0 = reserveGpuTexture(bytes);
++        uint32_t physical1 = reserveGpuTexture(bytes);
++        if (physical0 == 0 || physical1 == 0) {
++            free(shadow);
++            return 0;
++        }
++        record = &g_gpu_texture_records[g_gpu_texture_record_count++];
++        record->source = rgbaPixels;
++        record->shadow = shadow;
++        record->bytes = bytes;
++        record->physical[0] = physical0;
++        record->physical[1] = physical1;
++        record->active = 0;
++        record->dynamic = true;
++    } else if (!record->dynamic) {
++        record->physical[1] = reserveGpuTexture(bytes);
++        if (record->physical[1] == 0) return 0;
++        record->dynamic = true;
++        record->active = 1;
++    } else if (record->last_upload_frame != g_gpu_frame_serial) {
++        // The preceding FPGA job can still sample the other allocation.
++        record->active ^= 1u;
++    }
++    record->last_upload_frame = g_gpu_frame_serial;
++    record->generation = nextTextureGeneration();
++    record->source_revision = sourceRevision;
++    record->source_revision_valid = true;
++    record->shadow_valid = false;
++    return record->physical[record->active];
++}
++
+ static const MisterGpuTexture* textureRecordForPhysical(uint32_t physical,
+                                                          size_t *recordOffset) {
+     for (uint32_t i = 0; i < g_gpu_texture_record_count; ++i) {
+@@ -636,6 +688,9 @@ static bool compositeAxisCommand(uint32_t *destination,
+                                  size_t sourceBaseOffset,
+                                  int32_t clipYStart,
+                                  int32_t clipYEnd) {
++    if (sourceRecord == NULL || sourceRecord->shadow == NULL ||
++        !sourceRecord->shadow_valid)
++        return false;
+     uint16_t width = (uint16_t)(command->word[0] >> 16);
+     uint16_t height = (uint16_t)(command->word[0] >> 32);
+     int16_t destinationX = (int16_t)command->word[2];
+@@ -993,6 +1048,8 @@ static bool mapTransitionPatternMatches(const MisterGpuCommand *commands,
+ static bool prepareMapBaseRegion(const MisterGpuCommand *base,
+                                  const MisterGpuTexture *record,
+                                  size_t baseOffset) {
++    if (record == NULL || record->shadow == NULL || !record->shadow_valid)
++        return false;
+     if (g_gpu_map_base_cache_valid &&
+         g_gpu_map_base_cache_record == record &&
+         g_gpu_map_base_cache_generation == record->generation &&
+@@ -1031,6 +1088,8 @@ static bool prepareMapBaseRegion(const MisterGpuCommand *base,
+ static bool prepareMapOverlayPixels(const MisterGpuCommand *overlays,
+                                     const MisterGpuTexture *record,
+                                     size_t baseOffset) {
++    if (record == NULL || record->shadow == NULL || !record->shadow_valid)
++        return false;
+     MisterGpuCommand geometry[4];
+     memcpy(geometry, overlays, sizeof(geometry));
+     for (uint32_t i = 0; i < 4; ++i) geometry[i].word[6] = 0xffffffffu;
+@@ -1287,7 +1346,8 @@ static bool tryFuseMapBackground(void) {
+     for (uint32_t i = 0; i < blitCount; ++i) {
+         sourceRecords[i] = textureRecordForPhysical(
+             (uint32_t)g_gpu_commands[1u + i].word[1], &sourceBaseOffsets[i]);
+-        if (sourceRecords[i] == NULL || sourceRecords[i]->shadow == NULL)
++        if (sourceRecords[i] == NULL || sourceRecords[i]->shadow == NULL ||
++            !sourceRecords[i]->shadow_valid)
+             return false;
+     }
+     const MisterGpuTexture *sourceRecord = sourceRecords[0];
+@@ -1297,7 +1357,9 @@ static bool tryFuseMapBackground(void) {
+     const MisterGpuTexture *overlayRecord = NULL;
+     if (overlayCount != 0) {
+         overlayRecord = textureRecordForPhysical(overlayPhysical, &overlayBaseOffset);
+-        if (overlayRecord == NULL || overlayRecord->shadow == NULL) overlayCount = 0;
++        if (overlayRecord == NULL || overlayRecord->shadow == NULL ||
++            !overlayRecord->shadow_valid)
++            overlayCount = 0;
+     }
+     const MisterGpuTexture *overlayRecords[4] = {
+         overlayRecord, overlayRecord, overlayRecord, overlayRecord
+@@ -1530,6 +1592,16 @@ bool MisterGpu_addAffineBlit(uint32_t source, uint32_t stride,
+     return true;
+ }
+ 
++bool MisterGpu_addFramebufferExport(uint32_t destination) {
++    if (!g_gpu_available || destination == 0 ||
++        g_gpu_command_count >= GPU_COMMAND_CAPACITY) return false;
++    MisterGpuCommand* command = &g_gpu_commands[g_gpu_command_count++];
++    memset(command, 0, sizeof(*command));
++    command->word[0] = 6u;
++    command->word[1] = destination;
++    return true;
++}
++
+ bool MisterGpu_finishFrame(uint32_t* cycles) {
+     if (!appendGpuEnd()) return false;
+     // While the FPGA rendered the previous command buffer, the ARM built this
+@@ -1578,6 +1650,23 @@ bool MisterGpu_prepareSaveState(void) {
+     if (!g_gpu_available) return true;
+     if (!waitGpuCompletion(NULL)) return false;
+ 
++    // FPGA-exported GameMaker surfaces normally stay GPU-resident. Materialize
++    // them before checkpointing so DMTCP never captures a stale CPU shadow and
++    // the post-restore texture republish loop remains self-contained.
++    for (uint32_t i = 0; i < g_gpu_texture_record_count; ++i) {
++        MisterGpuTexture* record = &g_gpu_texture_records[i];
++        if (record->shadow_valid || !record->dynamic || record->shadow == NULL)
++            continue;
++        uint32_t physical = record->physical[record->active];
++        if (physical < GPU_TEXTURE_PHYS ||
++            record->bytes > GPU_TEXTURE_BYTES - (physical - GPU_TEXTURE_PHYS))
++            return false;
++        const void* source = g_gpu_textures + (physical - GPU_TEXTURE_PHYS);
++        memcpy(record->shadow, source, record->bytes);
++        memcpy((void*)record->source, source, record->bytes);
++        record->shadow_valid = true;
++    }
++
+     // The wrapper owns and recreates this shared file on every core launch.
+     // Never ask DMTCP to restore a mapping to the previous launch's inode.
+     closeJoyShared();
+@@ -1618,7 +1707,8 @@ void MisterGpu_afterSaveStateRestore(void) {
+ 
+     for (uint32_t i = 0; i < g_gpu_texture_record_count; ++i) {
+         MisterGpuTexture* record = &g_gpu_texture_records[i];
+-        if (record->shadow == NULL || record->bytes == 0) continue;
++        if (record->shadow == NULL || record->bytes == 0 || !record->shadow_valid)
++            continue;
+         for (uint32_t copy = 0; copy < (record->dynamic ? 2u : 1u); ++copy) {
+             size_t offset = (size_t)(record->physical[copy] - GPU_TEXTURE_PHYS);
+             if (offset <= GPU_TEXTURE_BYTES && record->bytes <= GPU_TEXTURE_BYTES - offset)
+diff --git a/src/backends/mister_gpu.h b/src/backends/mister_gpu.h
+index ef40422..a450757 100644
+--- a/src/backends/mister_gpu.h
++++ b/src/backends/mister_gpu.h
+@@ -11,6 +11,8 @@ uint32_t MisterGpu_uploadTexture(const void* rgbaPixels, size_t bytes);
+ uint32_t MisterGpu_uploadDynamicTexture(const void* rgbaPixels, size_t bytes);
+ uint32_t MisterGpu_uploadDynamicTextureRevision(const void* rgbaPixels, size_t bytes,
+                                                 uint32_t sourceRevision);
++uint32_t MisterGpu_prepareDynamicTextureGpuWrite(const void* rgbaPixels, size_t bytes,
++                                                 uint32_t sourceRevision);
+ bool MisterGpu_addClear(uint32_t rgba);
+ bool MisterGpu_addFill(int16_t x, int16_t y, uint16_t width, uint16_t height,
+                        uint32_t rgba, bool additive);
+@@ -32,6 +34,7 @@ bool MisterGpu_addAffineBlit(uint32_t source, uint32_t stride,
+                        int32_t uStart, int32_t vStart,
+                        int32_t uDx, int32_t vDx, int32_t uDy, int32_t vDy,
+                        uint32_t tint, bool additive);
++bool MisterGpu_addFramebufferExport(uint32_t destination);
+ bool MisterGpu_finishFrame(uint32_t* cycles);
+ void MisterGpu_readbackRgba(uint8_t* rgba, int32_t width, int32_t height);
+ void MisterGpu_continueFrame(void);
+diff --git a/src/sw_renderer.c b/src/sw_renderer.c
+index ac73b9d..7810679 100644
+--- a/src/sw_renderer.c
++++ b/src/sw_renderer.c
+@@ -665,6 +665,69 @@ static bool rasterizeAxisAlignedQuad(SWRenderer* sw, SWVertex v[4], const uint8_
+ #endif
+     }
+     if(compatibleTexture){
++#ifdef USE_MISTER
++        // AM2R's Draw-GUI surface reaches this common textured-quad path as a
++        // full 320x240 draw, but its alpha data normally occupies only the
++        // top 32 rows. Detect that exact 1:1 surface quad here (after every
++        // draw API has converged), pack its non-transparent rows into a stable
++        // 320x64 texture, and tighten the destination rectangle. This avoids
++        // both the 307 KiB per-frame dynamic upload and tens of thousands of
++        // transparent FPGA samples.
++        if (sw->gpuFrameEligible && swGpuIsOutputTarget(sw) &&
++            texW == 320 && texH == 240 &&
++            fabsf(dx - 320.0f) < 0.0001f && fabsf(dy - 240.0f) < 0.0001f &&
++            fabsf(v[0].u) < 0.0001f && fabsf(v[0].v) < 0.0001f &&
++            fabsf(v[1].u - 1.0f) < 0.0001f && fabsf(v[1].v) < 0.0001f &&
++            fabsf(v[2].u - 1.0f) < 0.0001f && fabsf(v[2].v - 1.0f) < 0.0001f &&
++            fabsf(v[3].u) < 0.0001f && fabsf(v[3].v - 1.0f) < 0.0001f &&
++            tint == 0xffffffffu) {
++            bool isSurface = false;
++            for (uint32_t surface = 0; surface < sw->surfaceCount; ++surface) {
++                if (sw->surfaceExistsFlags[surface] &&
++                    sw->surfacePixels[surface] == texPixels) {
++                    isSurface = true;
++                    break;
++                }
++            }
++            if (isSurface) {
++                int32_t minSourceX = 320, minSourceY = 240;
++                int32_t maxSourceX = 0, maxSourceY = 0;
++                for (int32_t py = 0; py < 240; ++py) {
++                    const uint8_t* row = texPixels + (size_t)py * 320u * 4u;
++                    for (int32_t px = 0; px < 320; ++px) {
++                        if (row[(size_t)px * 4u + 3u] == 0) continue;
++                        if (px < minSourceX) minSourceX = px;
++                        if (px + 1 > maxSourceX) maxSourceX = px + 1;
++                        if (py < minSourceY) minSourceY = py;
++                        if (py + 1 > maxSourceY) maxSourceY = py + 1;
++                    }
++                }
++                int32_t cropHeight = maxSourceY - minSourceY;
++                if (minSourceX < maxSourceX && cropHeight > 0 && cropHeight <= 64) {
++                    if (sw->gpuHudScratch == nullptr)
++                        sw->gpuHudScratch = (uint8_t*)safeCalloc(320u * 64u, 4u);
++                    memset(sw->gpuHudScratch, 0, 320u * 64u * 4u);
++                    for (int32_t py = 0; py < cropHeight; ++py)
++                        memcpy(sw->gpuHudScratch + (size_t)py * 320u * 4u,
++                               texPixels + (size_t)(minSourceY + py) * 320u * 4u,
++                               320u * 4u);
++                    texPixels = sw->gpuHudScratch;
++                    texH = 64;
++                    v[0].v = v[1].v = -(float)minSourceY / 64.0f;
++                    v[2].v = v[3].v = (240.0f - (float)minSourceY) / 64.0f;
++                    minX += minSourceX;
++                    maxX -= 320 - maxSourceX;
++                    minY += minSourceY;
++                    maxY -= 240 - maxSourceY;
++                    if (sw->gpuHudCropLogs < 8) {
++                        logInfo("MiSTer AM2R HUD crop: bounds=%d,%d..%d,%d staged=320x64\n",
++                                minSourceX, minSourceY, maxSourceX, maxSourceY);
++                        sw->gpuHudCropLogs++;
++                    }
++                }
++            }
++        }
++#endif
+         sw->framePlainQuads++;
+         sw->framePlainPixels+=(uint64_t)(maxX-minX)*(uint64_t)(maxY-minY);
+         const double srcX0=(double)v[0].u*texW;
+@@ -901,6 +964,7 @@ static void swDestroy(Renderer* renderer) {
+ #ifdef USE_MISTER
+     free(sw->gpuTextureAddresses);
+     for (uint32_t i = 0; i < 8; ++i) free(sw->gpuDynamicScratch[i]);
++    free(sw->gpuHudScratch);
+ #endif
+     for (uint32_t i = 0; i < sw->surfaceCount; ++i) free(sw->surfacePixels[i]);
+     free(sw->surfacePixels);
+@@ -1055,15 +1119,17 @@ static void swSetGuiProjection(Renderer* renderer, int32_t guiW, int32_t guiH, i
+ static void swEndGUI(Renderer* renderer) {
+     SWRenderer* sw = (SWRenderer*)renderer;
+ #ifdef USE_MISTER
+-    // Pre, Post and Draw GUI each close a GUI pass. The final GUI pass is the
+-    // one after the application-surface handoff, so defer GPU submission until
+-    // platformSwapBuffers rather than accidentally presenting three times.
++    // Pre, Post and Draw GUI each close a GUI pass. AM2R's persistent HUD is
++    // assembled in an off-screen gui_surface and composited by the final
++    // Draw-GUI pass, after Draw-Post has already ended. Keep recording host
++    // continuation commands through every pass and submit exactly once from
++    // platformSwapBuffers; disabling eligibility here leaves those final CPU
++    // shadow writes invisible while the FPGA owns presentation.
+     if (sw->gpuHostContinuation) {
+         if ((renderer->runner->frameCount % 300) == 0)
+             logInfo("MiSTer GPU frame %d: queued=%d fallback=%u (eligible=%d clear=%d)\n",
+                     renderer->runner->frameCount, sw->gpuHasSkippedDraws,
+                     sw->gpuFallbackFrames, sw->gpuFrameEligible, sw->gpuSawClear);
+-        sw->gpuFrameEligible = false;
+     }
+ #endif
+     if (sw->currentSurface == RENDER_TARGET_HOST_FRAMEBUFFER && sw->hostFramebuffer != nullptr)
+@@ -2024,11 +2090,14 @@ static void swDrawSurfaceColor(Renderer* renderer, int32_t id, int32_t srcLeft,
+         fabsf(x) < 0.0001f && fabsf(y) < 0.0001f &&
+         fabsf(xscale - 1.0f) < 0.0001f && fabsf(yscale - 1.0f) < 0.0001f &&
+         fabsf(angleDeg) < 0.0001f && fabsf(alpha - 1.0f) < 0.0001f &&
+-        c1 == 0x00ffffffu && c2 == 0x00ffffffu &&
+-        c3 == 0x00ffffffu && c4 == 0x00ffffffu) {
++        (c1 & 0x00ffffffu) == 0x00ffffffu &&
++        (c2 & 0x00ffffffu) == 0x00ffffffu &&
++        (c3 & 0x00ffffffu) == 0x00ffffffu &&
++        (c4 & 0x00ffffffu) == 0x00ffffffu) {
+         sw->gpuApplicationSurfaceTransferred = true;
+         return;
+     }
++
+ #endif
+     swDrawPixelBuffer(sw,sw->surfacePixels[id],sw->surfaceWidths[id],sw->surfaceHeights[id],srcLeft,srcTop,srcWidth,srcHeight,x,y,xscale,yscale,angleDeg,c1,c2,c3,c4,alpha);
+ }
+@@ -2048,11 +2117,6 @@ static void swDrawSurfaceTiled(Renderer* renderer, int32_t id, float x, float y,
+ 
+ static void swSurfaceCopy(Renderer* renderer, int32_t dstId, int32_t dx, int32_t dy, int32_t srcId, int32_t sx, int32_t sy, int32_t swidth, int32_t sheight, bool part) {
+     SWRenderer* sw=(SWRenderer*)renderer;
+-#ifdef USE_MISTER
+-    if (dstId == renderer->runner->applicationSurfaceId ||
+-        srcId == renderer->runner->applicationSurfaceId)
+-        swGpuFallback(sw, "application surface copy");
+-#endif
+     if(!swSurfaceExists(renderer,dstId)||!swSurfaceExists(renderer,srcId))return;
+     if(!part){sx=sy=0;swidth=sw->surfaceWidths[srcId];sheight=sw->surfaceHeights[srcId];}
+     if(sx<0){dx-=sx;swidth+=sx;sx=0;} if(sy<0){dy-=sy;sheight+=sy;sy=0;}
+@@ -2062,6 +2126,45 @@ static void swSurfaceCopy(Renderer* renderer, int32_t dstId, int32_t dx, int32_t
+     if(dx+swidth>sw->surfaceWidths[dstId])swidth=sw->surfaceWidths[dstId]-dx;
+     if(dy+sheight>sw->surfaceHeights[dstId])sheight=sw->surfaceHeights[dstId]-dy;
+     if(swidth<=0||sheight<=0)return;
++#ifdef USE_MISTER
++    if (srcId == renderer->runner->applicationSurfaceId &&
++        dstId != renderer->runner->applicationSurfaceId &&
++        sw->gpuFrameEligible && sw->gpuHasSkippedDraws &&
++        sx == 0 && sy == 0 && dx == 0 && dy == 0 &&
++        swidth == 320 && sheight == 240 &&
++        sw->surfaceWidths[srcId] == 320 && sw->surfaceHeights[srcId] == 240 &&
++        sw->surfaceWidths[dstId] == 320 && sw->surfaceHeights[dstId] == 240) {
++        swMarkSurfaceWrite(sw, dstId);
++        uint32_t destination = MisterGpu_prepareDynamicTextureGpuWrite(
++            sw->surfacePixels[dstId], 320u * 240u * 4u,
++            sw->surfaceRevisions[dstId]);
++        if (destination != 0 && MisterGpu_addFramebufferExport(destination)) {
++            static uint32_t exportLogs = 0;
++            if (exportLogs < 16) {
++                logInfo("MiSTer application surface export frame=%d dst=%d address=%08x\n",
++                        renderer->runner->frameCount, dstId, destination);
++                exportLogs++;
++            }
++            return;
++        }
++    }
++    if (dstId == renderer->runner->applicationSurfaceId ||
++        srcId == renderer->runner->applicationSurfaceId) {
++        static uint32_t applicationCopyLogs = 0;
++        if (applicationCopyLogs < 24) {
++            logInfo("MiSTer application surface copy frame=%d app=%d current=%d "
++                    "dst=%d at=%d,%d src=%d from=%d,%d size=%dx%d part=%d "
++                    "eligible=%d skipped=%d host=%d\n",
++                    renderer->runner->frameCount,
++                    renderer->runner->applicationSurfaceId, sw->currentSurface,
++                    dstId, dx, dy, srcId, sx, sy, swidth, sheight, part,
++                    sw->gpuFrameEligible, sw->gpuHasSkippedDraws,
++                    sw->gpuHostContinuation);
++            applicationCopyLogs++;
++        }
++        swGpuFallback(sw, "application surface copy");
++    }
++#endif
+     uint8_t* temp=(uint8_t*)safeMalloc((size_t)swidth*sheight*4);
+     for(int32_t row=0;row<sheight;++row)memcpy(temp+(size_t)row*swidth*4,sw->surfacePixels[srcId]+((size_t)(sy+row)*sw->surfaceWidths[srcId]+sx)*4,(size_t)swidth*4);
+     for(int32_t row=0;row<sheight;++row)memcpy(sw->surfacePixels[dstId]+((size_t)(dy+row)*sw->surfaceWidths[dstId]+dx)*4,temp+(size_t)row*swidth*4,(size_t)swidth*4);
+diff --git a/src/sw_renderer.h b/src/sw_renderer.h
+index 92ca508..9341004 100644
+--- a/src/sw_renderer.h
++++ b/src/sw_renderer.h
+@@ -94,6 +94,13 @@ typedef struct {
+     uint32_t gpuDynamicScratchIndex;
+     uint32_t gpuDynamicResampleLogs;
+ 
++    // AM2R builds its persistent HUD into a transparent 320x240 surface even
++    // though the visible pixels occupy only a shallow strip. Keep a stable,
++    // compact staging allocation so that composite does not upload and scan
++    // all 76,800 transparent pixels every frame.
++    uint8_t* gpuHudScratch;
++    uint32_t gpuHudCropLogs;
++
+     // AM2R rebuilds its 2048x1024 map surface whenever rm_subscreen is
+     // entered. Keep the completed surface allocation outside GameMaker's
+     // visible lifecycle so an unchanged map can be reused on the next visit.

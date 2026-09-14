@@ -1,0 +1,327 @@
+diff --git a/src/backends/mister.c b/src/backends/mister.c
+index 5676e73..6a409de 100644
+--- a/src/backends/mister.c
++++ b/src/backends/mister.c
+@@ -35,7 +35,8 @@
+ #define GPU_NATIVE_WINDOW_PHYS 0x3a000000u
+ #define GPU_NATIVE_BUFFER_OFFSET 0x100u
+ #define GPU_NATIVE_BUFFER_BYTES MISTER_FB_BYTES
+-#define GPU_NATIVE_WINDOW_BYTES (GPU_NATIVE_BUFFER_OFFSET + 2u * GPU_NATIVE_BUFFER_BYTES)
++#define GPU_NATIVE_BUFFER_COUNT 3u
++#define GPU_NATIVE_WINDOW_BYTES (GPU_NATIVE_BUFFER_OFFSET + GPU_NATIVE_BUFFER_COUNT * GPU_NATIVE_BUFFER_BYTES)
+ #define GPU_CONTROL_MAGIC 0x50473241u
+ #define GPU_CONTROL_BYTES 4096u
+ #define GPU_COMMAND_BYTES 65536u
+@@ -47,6 +48,9 @@
+ #define GPU_FUSED_BASE_SOURCES 8u
+ #define GPU_WATER_ROWS MISTER_HEIGHT
+ #define GPU_WATER_MIN_RUN 8u
++#define GPU_WATER_NATIVE_ALIAS_FLAG (1ull << 8)
++#define GPU_REPEAT_TILE_WIDTH 32u
++#define GPU_REPEAT_TILE_MIN_HEIGHT 32u
+ #define AM2R_JOY_SHM_PATH "/dev/shm/am2r-joy"
+ #define AM2R_JOY_SHM_ENV "AM2R_JOY_SHM"
+ #define AM2R_JOY_SHM_MAGIC 0x524a3241u
+@@ -89,7 +93,7 @@ static MisterGpuCommand *g_gpu_command_buffers[GPU_COMMAND_BUFFER_COUNT] = { NUL
+ static MisterGpuCommand *g_gpu_commands = NULL;
+ static uint8_t *g_gpu_textures = NULL;
+ static uint8_t *g_gpu_native_mapping = NULL;
+-static uint32_t *g_gpu_native_buffers[2] = { NULL, NULL };
++static uint32_t *g_gpu_native_buffers[GPU_NATIVE_BUFFER_COUNT] = { NULL, NULL, NULL };
+ static MisterGpuTexture g_gpu_texture_records[GPU_TEXTURE_RECORDS];
+ static uint32_t g_gpu_texture_record_count = 0;
+ static size_t g_gpu_texture_offset = 0;
+@@ -230,10 +234,17 @@ static bool waitGpuCompletion(uint32_t* cycles) {
+         __sync_synchronize();
+         if (g_gpu_control[6] == g_gpu_pending_sequence) {
+             uint32_t completion = g_gpu_control[7];
+-            g_gpu_last_presented_buffer = (uint8_t)(completion >> 31);
++            g_gpu_last_presented_buffer = (uint8_t)(completion >> 30);
++            if (g_gpu_last_presented_buffer >= GPU_NATIVE_BUFFER_COUNT) {
++                logError("MiSTer GPU: invalid presentation buffer %u\n",
++                         g_gpu_last_presented_buffer);
++                g_gpu_pending = false;
++                g_gpu_available = false;
++                return false;
++            }
+             g_gpu_last_presented_valid = true;
+-            g_gpu_scanout_underflow = (completion & 0x40000000u) != 0;
+-            g_gpu_last_completed_cycles = completion & 0x3fffffffu;
++            g_gpu_scanout_underflow = (completion & 0x20000000u) != 0;
++            g_gpu_last_completed_cycles = completion & 0x1fffffffu;
+             if (g_gpu_scanout_underflow)
+                 logWarn("MiSTer scanout FIFO underflow detected\n");
+             if (cycles != NULL) *cycles = g_gpu_last_completed_cycles;
+@@ -298,11 +309,10 @@ static void initGpu(void) {
+     g_gpu_native_mapping = mapPhysical(g_mem_fd, GPU_NATIVE_WINDOW_PHYS,
+                                        GPU_NATIVE_WINDOW_BYTES);
+     if (g_gpu_native_mapping != NULL) {
+-        g_gpu_native_buffers[0] = (uint32_t *)(g_gpu_native_mapping +
+-                                               GPU_NATIVE_BUFFER_OFFSET);
+-        g_gpu_native_buffers[1] = (uint32_t *)(g_gpu_native_mapping +
+-                                               GPU_NATIVE_BUFFER_OFFSET +
+-                                               GPU_NATIVE_BUFFER_BYTES);
++        for (uint32_t i = 0; i < GPU_NATIVE_BUFFER_COUNT; ++i) {
++            g_gpu_native_buffers[i] = (uint32_t *)(g_gpu_native_mapping +
++                GPU_NATIVE_BUFFER_OFFSET + i * GPU_NATIVE_BUFFER_BYTES);
++        }
+     }
+     if (g_gpu_control == NULL || g_gpu_command_buffers[0] == NULL ||
+         g_gpu_command_buffers[1] == NULL || g_gpu_textures == NULL ||
+@@ -866,14 +876,10 @@ static bool decodeFusibleWaterRow(const MisterGpuCommand *command,
+         return false;
+ 
+     // The compact hardware engine assumes one consecutive source pixel per
+-    // destination pixel. Verify the exact 16.16 floors rather than assuming a
+-    // nearly-unit derivative is harmless; exceptional rows retain opcode 2.
+-    for (uint32_t x = 0; x < width; ++x) {
+-        int64_t coordinate = (int64_t)uStart + (int64_t)x * uStep;
+-        if (coordinate < INT32_MIN || coordinate > INT32_MAX ||
+-            gpuFixedFloor((int32_t)coordinate) != sourceX + (int32_t)x)
+-            return false;
+-    }
++    // destination pixel. An exact 16.16 unit derivative proves that property
++    // for the entire row, including a fractional uStart, without walking all
++    // 320 pixels on the Cortex-A9. Exceptional derivatives retain opcode 2.
++    if (uStep != 0x00010000) return false;
+ 
+     row->destination_x = destinationX;
+     row->destination_y = destinationY;
+@@ -975,6 +981,191 @@ static uint32_t tryFuseWaterEffect(void) {
+     return fusedRows;
+ }
+ 
++static bool commandReadsTexture(const MisterGpuCommand *command,
++                                uint32_t texture, bool *eligibleWater) {
++    uint8_t opcode = (uint8_t)command->word[0];
++    if (opcode != 2u && opcode != 4u && opcode != 7u) return false;
++    if ((uint32_t)command->word[1] != texture) return false;
++    if (eligibleWater != NULL)
++        *eligibleWater = opcode == 7u &&
++            (command->word[0] & GPU_WATER_NATIVE_ALIAS_FLAG) != 0;
++    return true;
++}
++
++// AM2R copies the completed application surface into a 320x240 user surface
++// immediately before the next renderer frame, then uses that snapshot only as
++// the source of its guarded water pass. The same completed image already lives
++// in the FPGA's immutable published native buffer. When the complete command
++// list proves there are no other readers or duplicate writers for the export,
++// replace the water source with that buffer and drop one full-frame DDR write.
++static uint32_t aliasExclusiveWaterExports(void) {
++    uint32_t aliasedRows = 0;
++    for (uint32_t exportIndex = 0; exportIndex < g_gpu_command_count;
++         ++exportIndex) {
++        MisterGpuCommand *exportCommand = &g_gpu_commands[exportIndex];
++        if ((uint8_t)exportCommand->word[0] != 6u) continue;
++        uint32_t texture = (uint32_t)exportCommand->word[1];
++        uint32_t exportCount = 0;
++        uint32_t readerCount = 0;
++        bool exclusive = true;
++
++        for (uint32_t i = 0; i < g_gpu_command_count; ++i) {
++            MisterGpuCommand *command = &g_gpu_commands[i];
++            if ((uint8_t)command->word[0] == 6u &&
++                (uint32_t)command->word[1] == texture) {
++                exportCount++;
++                continue;
++            }
++            bool eligibleWater = false;
++            if (commandReadsTexture(command, texture, &eligibleWater)) {
++                readerCount++;
++                if (!eligibleWater || i < exportIndex) exclusive = false;
++            }
++        }
++        if (exportCount != 1u || readerCount == 0u || !exclusive) continue;
++
++        for (uint32_t i = 0; i < g_gpu_command_count; ++i) {
++            MisterGpuCommand *command = &g_gpu_commands[i];
++            bool eligibleWater = false;
++            if (!commandReadsTexture(command, texture, &eligibleWater) ||
++                !eligibleWater)
++                continue;
++            aliasedRows += (uint16_t)(command->word[0] >> 16);
++            command->word[0] = (command->word[0] & ~0x1ffull) | 8u;
++        }
++        memmove(&g_gpu_commands[exportIndex],
++                &g_gpu_commands[exportIndex + 1u],
++                (g_gpu_command_count - exportIndex - 1u) *
++                    sizeof(*g_gpu_commands));
++        g_gpu_command_count--;
++        exportIndex--;
++    }
++
++    // The marker is HPS-only. Any direct water command that could not prove a
++    // safe alias remains the existing external-texture opcode 7.
++    for (uint32_t i = 0; i < g_gpu_command_count; ++i) {
++        if ((uint8_t)g_gpu_commands[i].word[0] == 7u)
++            g_gpu_commands[i].word[0] &= ~GPU_WATER_NATIVE_ALIAS_FLAG;
++    }
++    return aliasedRows;
++}
++
++// AM2R's underwater foreground is emitted as a clipped leading slice,
++// repeated 32-pixel slices, and a clipped trailing slice of the same source
++// tile.  Eleven independent partial-alpha blits make the FPGA repeatedly pay
++// descriptor, DDR, and read/modify/write setup costs.  Collapse only the exact
++// full-screen-width pattern into opcode 9.  The hardware fetches each 32-pixel
++// source row once and repeats it through its two-pixel blend pipeline.
++static uint32_t tryFuseRepeatedAdditiveTiles(void) {
++    uint32_t fusedCommands = 0;
++    uint32_t index = 0;
++    while (index < g_gpu_command_count) {
++        MisterGpuCommand *first = &g_gpu_commands[index];
++        if ((first->word[0] & 0x1ffu) != (2u | (1u << 8)) ||
++            (int16_t)first->word[2] != 0 ||
++            (int16_t)(first->word[2] >> 16) < 0 ||
++            (uint16_t)(first->word[0] >> 32) < GPU_REPEAT_TILE_MIN_HEIGHT ||
++            (uint16_t)(first->word[0] >> 32) > MISTER_HEIGHT ||
++            (uint16_t)(first->word[0] >> 16) == 0 ||
++            (uint16_t)(first->word[0] >> 16) > GPU_REPEAT_TILE_WIDTH ||
++            first->word[3] != 0 || first->word[7] != 0 ||
++            first->word[5] != UINT64_C(0x0001000000010000) ||
++            ((uint32_t)first->word[6] & 0x00ffffffu) != 0x00ffffffu ||
++            (uint8_t)(first->word[6] >> 24) == 0 ||
++            (uint8_t)(first->word[6] >> 24) == 255) {
++            index++;
++            continue;
++        }
++
++        uint32_t firstWidth = (uint16_t)(first->word[0] >> 16);
++        uint32_t height = (uint16_t)(first->word[0] >> 32);
++        int32_t destinationY = (int16_t)(first->word[2] >> 16);
++        if ((uint32_t)destinationY + height > MISTER_HEIGHT) {
++            index++;
++            continue;
++        }
++
++        uint32_t secondIndex = index + 1u;
++        if (secondIndex >= g_gpu_command_count) {
++            index++;
++            continue;
++        }
++        MisterGpuCommand *second = &g_gpu_commands[secondIndex];
++        int32_t baseU = firstWidth == GPU_REPEAT_TILE_WIDTH
++            ? (int32_t)first->word[4]
++            : (int32_t)second->word[4];
++        int64_t expectedFirstU = (int64_t)baseU +
++            (int64_t)(GPU_REPEAT_TILE_WIDTH - firstWidth) * 65536;
++        if (expectedFirstU < INT32_MIN || expectedFirstU > INT32_MAX ||
++            (int32_t)first->word[4] != (int32_t)expectedFirstU) {
++            index++;
++            continue;
++        }
++
++        uint32_t covered = 0;
++        uint32_t runEnd = index;
++        while (runEnd < g_gpu_command_count && covered < MISTER_WIDTH) {
++            MisterGpuCommand *command = &g_gpu_commands[runEnd];
++            uint32_t remaining = MISTER_WIDTH - covered;
++            uint32_t expectedWidth = runEnd == index
++                ? firstWidth
++                : (remaining < GPU_REPEAT_TILE_WIDTH
++                    ? remaining : GPU_REPEAT_TILE_WIDTH);
++            int32_t expectedU = runEnd == index
++                ? (int32_t)expectedFirstU : baseU;
++            if ((command->word[0] & 0x1ffu) != (2u | (1u << 8)) ||
++                (uint16_t)(command->word[0] >> 16) != expectedWidth ||
++                (uint16_t)(command->word[0] >> 32) != height ||
++                (int16_t)command->word[2] != (int32_t)covered ||
++                (int16_t)(command->word[2] >> 16) != destinationY ||
++                command->word[1] != first->word[1] ||
++                (int32_t)command->word[4] != expectedU ||
++                (uint32_t)(command->word[4] >> 32) !=
++                    (uint32_t)(first->word[4] >> 32) ||
++                command->word[5] != first->word[5] ||
++                command->word[6] != first->word[6] ||
++                command->word[3] != 0 || command->word[7] != 0)
++                break;
++            covered += expectedWidth;
++            runEnd++;
++        }
++        if (covered != MISTER_WIDTH || runEnd - index < 3u) {
++            index++;
++            continue;
++        }
++
++        int32_t sourceX = gpuFixedFloor(baseU);
++        int32_t sourceY = gpuFixedFloor((int32_t)(first->word[4] >> 32));
++        uint32_t source = (uint32_t)first->word[1];
++        uint32_t stride = (uint32_t)(first->word[1] >> 32);
++        uint64_t firstByte = (uint64_t)source + (uint64_t)sourceY * stride +
++            (uint64_t)sourceX * sizeof(uint32_t);
++        uint64_t lastByte = firstByte + (uint64_t)(height - 1u) * stride +
++            GPU_REPEAT_TILE_WIDTH * sizeof(uint32_t);
++        if (sourceX < 0 || sourceY < 0 || stride == 0 ||
++            source < GPU_TEXTURE_PHYS || firstByte < GPU_TEXTURE_PHYS ||
++            lastByte > (uint64_t)GPU_TEXTURE_PHYS + GPU_TEXTURE_BYTES) {
++            index++;
++            continue;
++        }
++
++        MisterGpuCommand fused = *first;
++        fused.word[0] = 9u | (1u << 8) |
++            ((uint64_t)MISTER_WIDTH << 16) | ((uint64_t)height << 32);
++        fused.word[3] = GPU_REPEAT_TILE_WIDTH - firstWidth;
++        fused.word[4] = (uint32_t)baseU |
++            ((uint64_t)(uint32_t)(first->word[4] >> 32) << 32);
++        fused.word[7] = 0;
++        g_gpu_commands[index] = fused;
++        memmove(&g_gpu_commands[index + 1u], &g_gpu_commands[runEnd],
++                (g_gpu_command_count - runEnd) * sizeof(MisterGpuCommand));
++        fusedCommands += runEnd - index - 1u;
++        g_gpu_command_count -= runEnd - index - 1u;
++        index++;
++    }
++    return fusedCommands;
++}
++
+ #if defined(__ARM_NEON)
+ static uint8x8_t neonScaleFloor255(uint8x8_t values, uint8_t multiplier) {
+     uint16x8_t product = vmull_u8(values, vdup_n_u8(multiplier));
+@@ -2008,7 +2199,8 @@ bool MisterGpu_addWaterRows(uint32_t source, uint32_t stride,
+ 
+     MisterGpuCommand* command = &g_gpu_commands[g_gpu_command_count++];
+     memset(command, 0, sizeof(*command));
+-    command->word[0] = 7u | ((uint64_t)rowCount << 16);
++    command->word[0] = 7u | GPU_WATER_NATIVE_ALIAS_FLAG |
++                       ((uint64_t)rowCount << 16);
+     command->word[1] = source | ((uint64_t)stride << 32);
+     command->word[2] = tablePhysical |
+                        ((uint64_t)(uint16_t)firstDestinationY << 32);
+@@ -2353,8 +2545,8 @@ void platformExit(void) {
+     if (g_gpu_native_mapping != NULL) {
+         munmap(g_gpu_native_mapping, GPU_NATIVE_WINDOW_BYTES);
+         g_gpu_native_mapping = NULL;
+-        g_gpu_native_buffers[0] = NULL;
+-        g_gpu_native_buffers[1] = NULL;
++        for (uint32_t i = 0; i < GPU_NATIVE_BUFFER_COUNT; ++i)
++            g_gpu_native_buffers[i] = NULL;
+     }
+     for (uint32_t i = 0; i < GPU_COMMAND_BUFFER_COUNT; ++i) {
+         if (g_gpu_command_buffers[i] != NULL) {
+@@ -2462,6 +2654,8 @@ void platformSwapBuffers(void) {
+ 
+     if (!softwareFrame && g_gpu_command_count != 0) {
+         uint32_t waterRows = tryFuseWaterEffect();
++        uint32_t nativeWaterRows = aliasExclusiveWaterExports();
++        uint32_t repeatedTileCommands = tryFuseRepeatedAdditiveTiles();
+         tryFuseMapBackground();
+         cullFullyCoveredPrefix();
+         uint32_t cycles = 0;
+@@ -2470,10 +2664,12 @@ void platformSwapBuffers(void) {
+         if (MisterGpu_finishFrame(&cycles)) {
+             double waitMs = (int64_t)(nowNanos() - waitStart) / 1000000.0;
+             g_gpu_submitted_frames++;
+-            if (g_runner != NULL && (g_runner->frameCount % 300) == 0)
+-                logInfo("MiSTer GPU submit frame %d: %u commands, water=%u rows, previous=%u cycles, submitted=%u\n",
+-                        g_runner->frameCount, commandCount, waterRows, cycles,
++            if (g_runner != NULL && (g_runner->frameCount % 300) == 0) {
++                logInfo("MiSTer GPU submit frame %d: %u commands, water=%u rows, native=%u, repeat=%u, previous=%u cycles, submitted=%u\n",
++                        g_runner->frameCount, commandCount, waterRows,
++                        nativeWaterRows, repeatedTileCommands, cycles,
+                         g_gpu_submitted_frames);
++            }
+             if (cycles > 1500000u || waitMs > 18.0) {
+                 static uint32_t slowGpuLogs = 0;
+                 if (slowGpuLogs < 400) {

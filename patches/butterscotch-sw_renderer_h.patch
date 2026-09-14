@@ -1,0 +1,80 @@
+diff --git a/src/sw_renderer.h b/src/sw_renderer.h
+new file mode 100644
+index 0000000..113920d
+--- /dev/null
++++ b/src/sw_renderer.h
+@@ -0,0 +1,74 @@
++#pragma once
++
++#include "common.h"
++#include "renderer.h"
++#include "matrix_math.h"
++
++// ===[ SWRenderer Struct ]===
++
++typedef struct {
++    Renderer base; // Must be first field for struct embedding
++
++    // Current render target (RGBA, top-down scanline order)
++    uint8_t* framebuffer;
++    int32_t fbWidth, fbHeight;
++
++    // Final host framebuffer handed to the MiSTer backend.
++    uint8_t* hostFramebuffer;
++    int32_t hostWidth, hostHeight;
++
++    // GameMaker surfaces, including the application surface.
++    uint8_t** surfacePixels;
++    int32_t* surfaceWidths;
++    int32_t* surfaceHeights;
++    bool* surfaceExistsFlags;
++    uint32_t surfaceCount;
++    uint32_t surfaceCapacity;
++    int32_t currentSurface;
++
++    // Decoded texture pages (RGBA pixel data)
++    uint8_t** texturePixels;
++    int32_t* textureWidths;
++    int32_t* textureHeights;
++    bool* textureLoaded;
++    uint32_t textureCount;
++#ifdef USE_MISTER
++    uint32_t* gpuTextureAddresses;
++#endif
++
++    // View transform: world coords -> framebuffer pixel coords
++    Matrix4f worldToScreen;
++
++    // Scissor rect (framebuffer pixel coords)
++    int32_t scissorX, scissorY, scissorW, scissorH;
++
++    // Game dimensions (from beginFrame)
++    int32_t gameW, gameH;
++
++    bool blendEnable;
++    int32_t blendMode;
++    BlendFactors blendFactors;
++    bool alphaTestEnable;
++    uint8_t alphaTestRef;
++    bool colorWriteR, colorWriteG, colorWriteB, colorWriteA;
++    bool fogEnable;
++    uint32_t fogColor;
++
++    uint64_t frameAxisPixels;
++    uint64_t framePlainPixels;
++    uint64_t frameTrianglePixels;
++    uint32_t frameAxisQuads;
++    uint32_t framePlainQuads;
++    uint32_t frameTriangleQuads;
++#ifdef USE_MISTER
++    bool gpuFrameEligible;
++    bool gpuSawClear;
++    bool gpuHasSkippedDraws;
++    bool gpuHostContinuation;
++    uint32_t gpuFallbackFrames;
++    uint32_t gpuCompletedFrames;
++#endif
++} SWRenderer;
++
++Renderer* SWRenderer_create(void);
++void SWRenderer_clearFrameBuffer(Renderer* renderer, uint32_t color);

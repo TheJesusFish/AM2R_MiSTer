@@ -1,0 +1,13 @@
+set pagination off
+set confirm off
+break MisterGpu_finishFrame
+continue
+printf "GPU_COMMAND_COUNT %u\n", g_gpu_command_count
+set $i = 0
+while $i < g_gpu_command_count
+  set $w0 = g_gpu_commands[$i].word[0]
+  printf "GPU_COMMAND %u op=%u flags=%u width=%u height=%u word1=%016llx tint=%08x gradient=%016llx\n", $i, (unsigned int)($w0 & 255), (unsigned int)(($w0 >> 8) & 255), (unsigned int)(($w0 >> 16) & 65535), (unsigned int)(($w0 >> 32) & 65535), g_gpu_commands[$i].word[1], (unsigned int)g_gpu_commands[$i].word[6], g_gpu_commands[$i].word[7]
+  set $i = $i + 1
+end
+detach
+quit
