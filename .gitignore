@@ -30,6 +30,7 @@ __MACOSX/
 /_reference_3s_mister_arm/
 /work_am2r_gpu/
 /work_am2r_sdram/
+/work_*/
 
 # Release assets belong on the GitHub Releases page, not in source control
 /releases/*.zip

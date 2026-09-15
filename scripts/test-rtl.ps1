@@ -28,8 +28,9 @@ try {
 	if ($topSource -notmatch '(?m)^\s*assign\s+CLK_VIDEO\s*=\s*clk_video\s*;') {
 		throw 'AM2R.sv must use the dedicated PLL framework video clock.'
     }
-	if ($topSource -notmatch '(?m)^\s*assign\s+clk_sys\s*=\s*clk_video\s*;') {
-		throw 'AM2R.sv must keep the framework and video domains synchronous so pristine sys/osd.v infers block RAM.'
+	if ($topSource -notmatch '(?s)pll\s+pll\s*\(.*?\.outclk_0\(clk_sys\)' -or
+		$topSource -match '(?m)^\s*assign\s+clk_sys\s*=\s*clk_video\s*;') {
+		throw 'AM2R.sv must keep the framework system clock separate from the 50 MHz CRT video clock.'
 	}
     if (-not $topSource.Contains('"O[7:6],Savestate slot,1,2,3,4;"')) {
         throw 'AM2R.sv must expose the standard Savestate slot OSD label.'
@@ -43,11 +44,55 @@ try {
     if ($topSource.Contains('CRT safe area') -or $topSource.Contains('.safe_area(')) {
         throw 'AM2R.sv must not expose or drive the removed CRT safe-area scaler.'
     }
-	if (-not $topSource.Contains('CRT Adjustments') -or
-		-not $topSource.Contains('Analog H Position') -or
-		-not $topSource.Contains('Analog V Position') -or
-		-not $topSource.Contains('Analog H Scale')) {
-		throw 'AM2R.sv must expose the core-local analog CRT controls.'
+	if (-not $topSource.Contains('CRT Adjust') -or
+		-not $topSource.Contains('CRT H-Size') -or
+		-not $topSource.Contains('CRT H-Position') -or
+		-not $topSource.Contains('CRT V-Shift') -or
+		-not $topSource.Contains('CRT V-Size') -or
+		-not $topSource.Contains('CRT V-Size Mode')) {
+		throw 'AM2R.sv must expose the complete core-side CRT-Adjust controls.'
+	}
+	$frameworkSourceFiles = Get-Content -Raw -LiteralPath (Join-Path $projectRoot 'files.qip')
+	if ($frameworkSourceFiles.Contains('am2r_crt_resync') -or
+		$frameworkSourceFiles.Contains('am2r_video_hscale') -or
+		$frameworkSourceFiles.Contains('am2r_video_line_ram') -or
+		$frameworkSourceFiles.Contains('am2r_crt_video')) {
+		throw 'files.qip must not retain the replaced JT/PGM CRT implementation.'
+	}
+	if (-not $frameworkSourceFiles.Contains('rtl/crt_vsize.sv') -or
+		-not $frameworkSourceFiles.Contains('rtl/crt_adjust.sv') -or
+		-not $frameworkSourceFiles.Contains('rtl/am2r_crt_pipeline.sv')) {
+		throw 'files.qip must compile the pinned CRT-Adjust implementation and AM2R glue.'
+	}
+
+	$projectSource = Get-Content -Raw -LiteralPath (Join-Path $projectRoot 'AM2R.qsf')
+	if (-not $projectSource.Contains('source am2r_sys.tcl') -or $projectSource.Contains('source sys/sys.tcl')) {
+		throw 'AM2R.qsf must use the core-local framework manifest while leaving sys/ untouched.'
+	}
+	foreach ($requiredRam in @('pal1_mem', 'i_mem', 'o_line', 'o_linf', 'o_h_poly_mem', 'o_v_poly_mem', 'o_a_poly_mem')) {
+		if (-not $projectSource.Contains("RAMSTYLE_ATTRIBUTE M10K -to `"*|$requiredRam")) {
+			throw "AM2R.qsf must keep ASCal memory '$requiredRam' in M10K RAM when CRT-Adjust is present."
+		}
+	}
+	$coreSysManifest = Get-Content -Raw -LiteralPath (Join-Path $projectRoot 'am2r_sys.qip')
+	if (-not $coreSysManifest.Contains('rtl am2r_osd.v') -or $coreSysManifest.Contains('sys osd.v')) {
+		throw 'am2r_sys.qip must select only the explicit-RAM core-local OSD.'
+	}
+	$upstreamSysManifest = Get-Content -Raw -LiteralPath (Join-Path $projectRoot 'sys\sys.qip')
+	$coreAssignmentCount = ([regex]::Matches($coreSysManifest, '(?m)^set_global_assignment -name ')).Count
+	$upstreamAssignmentCount = ([regex]::Matches($upstreamSysManifest, '(?m)^set_global_assignment -name ')).Count
+	if ($coreAssignmentCount -ne $upstreamAssignmentCount) {
+		throw "am2r_sys.qip has $coreAssignmentCount source assignments; upstream sys/sys.qip has $upstreamAssignmentCount."
+	}
+	$osdSource = Get-Content -Raw -LiteralPath (Join-Path $projectRoot 'rtl\am2r_osd.v')
+	if (-not $osdSource.Contains('altsyncram #(') -or
+		-not $osdSource.Contains('.ram_block_type') -or
+		-not $osdSource.Contains('("M10K")')) {
+		throw 'rtl/am2r_osd.v must keep both framework OSD buffers in explicit M10K RAM.'
+	}
+	& git diff --quiet HEAD -- sys
+	if ($LASTEXITCODE -ne 0) {
+		throw 'The tracked sys/ framework tree must remain untouched.'
 	}
 
     $alsaSource = Get-Content -Raw -LiteralPath (Join-Path $projectRoot 'sys\alsa.sv')
@@ -104,10 +149,10 @@ try {
     & vsim -c -lib $library am2r_native_video_tb -do 'onerror {quit -code 1}; run -all; quit -code 0'
     if ($LASTEXITCODE -ne 0) { throw "native-video vsim failed with exit code $LASTEXITCODE." }
 
-	& vlog -sv -work $library rtl\am2r_native_video.sv rtl\am2r_crt_resync.sv rtl\am2r_video_line_ram.sv rtl\am2r_video_hscale.sv rtl\am2r_crt_video.sv tests\rtl\am2r_crt_video_tb.sv
+	& vlog -sv -work $library rtl\am2r_native_video.sv rtl\crt_vsize.sv rtl\crt_adjust.sv rtl\am2r_crt_pipeline.sv tests\rtl\am2r_crt_pipeline_tb.sv
 	if ($LASTEXITCODE -ne 0) { throw "CRT-video vlog failed with exit code $LASTEXITCODE." }
 
-	& vsim -c -lib $library am2r_crt_video_tb -do 'onerror {quit -code 1}; run -all; quit -code 0'
+	& vsim -c -lib $library am2r_crt_pipeline_tb -do 'onerror {quit -code 1}; run -all; quit -code 0'
 	if ($LASTEXITCODE -ne 0) { throw "CRT-video vsim failed with exit code $LASTEXITCODE." }
 
 	& vlog -sv -work $library rtl\am2r_ddr_arbiter.sv tests\rtl\am2r_ddr_arbiter_tb.sv

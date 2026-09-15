@@ -55,7 +55,7 @@ module am2r_native_reader_late_frame_tb;
 	);
 
 	always #5 ddr_clk = ~ddr_clk;
-	always #20 clk_vid = ~clk_vid;
+	always #10 clk_vid = ~clk_vid;
 
 	// Distinguish the three physical presentation buffers in every returned
 	// word.  This makes even a single stale or mixed-buffer line observable.

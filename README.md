@@ -75,19 +75,33 @@ Classic Morph Ball accepts crouch followed by Down again, so the Morph action
 is optional with the game's default setting. Weapon Select+Start exits the ARM
 runtime and returns to `menu.rbf`.
 
-## CRT adjustments
+## CRT Adjust
 
-The core's **CRT Adjustments** submenu provides signed horizontal and vertical
-sync positioning plus an optional 75–123% horizontal line scaler. The scaler
-is intended for 15 kHz analog displays whose visible raster clips the native
-image. All controls default to zero/off; in that state the RTL is an exact
-clock, RGB, blanking, and sync bypass and adds no buffering.
+The optional **CRT Adjust** submenu uses the upstream
+[MiSTer-CRT-Adjust](https://github.com/rmonic79/MiSTer-CRT-Adjust) core-side
+pipeline. It provides H-Size, H-Position, V-Shift, and experimental V-Size.
+Everything defaults to Off/zero; Off bypasses the complete pipeline and retains
+the native clock, RGB, blanking, sync, and latency.
+
+V-Size offers two modes. **Cabinet** is the default and retains native sync by
+photometrically redistributing adjacent scanlines; its trade-off is slight
+vertical softness. **PVM** keeps every source line unique but changes the line
+rate, so it is intended only for monitors with sufficient H-lock range. One
+V-Size menu step is three lines (about 1.1% of the complete raster or 1.25% of
+the 240-line active image). Negative values make the picture shorter; start at
+`-2` and move toward `-4` only if the tube needs closer to a 5% reduction.
 
 MiSTer's core interface exposes one video stream before the framework splits
-the direct analog path from the HDMI/ascal path. Consequently, enabling a CRT
-adjustment also changes the signal presented to ascal even though the final
-HDMI mode is still produced by the normal framework. Leave the controls off
-when only HDMI is in use. Horizontal scaling buffers one scanline, not a frame.
+the direct analog path from the HDMI/ascal path. Consequently, CRT Adjust also
+changes the stream presented to HDMI while it is On. Leave it Off when an
+untouched HDMI source is required. The internal video clock is 50 MHz with a
+divide-by-8 pixel enable; the resulting native output remains 6.25 MHz,
+398×262 total, 15.704 kHz, and 59.94 Hz.
+
+The MiSTer framework remains on the core's conventional 20 MHz system clock.
+Core-local build constraints keep ASCal's existing line, coefficient, and
+palette stores in M10K RAM after CRT-Adjust raises overall block-RAM use; no
+file under `sys/` is modified.
 
 ## Architecture
 

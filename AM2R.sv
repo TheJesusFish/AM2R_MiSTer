@@ -58,11 +58,15 @@ localparam CONF_STR = {
 	"O[5:4],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
 	"O[1],Video source,ARM Framebuffer,Diagnostic;",
 	"O[3:2],Diagnostic pattern,Color Bars,Grid,Gradient,Black;",
-	"P1,CRT Adjustments;",
-	"P1O[13:10],Analog H Position,0,1,2,3,4,5,6,7,-8,-7,-6,-5,-4,-3,-2,-1;",
-	"P1O[17:14],Analog V Position,0,1,2,3,4,5,6,7,-8,-7,-6,-5,-4,-3,-2,-1;",
-	"P1O[18],Analog H Scaler,Off,On;",
-	"P1O[23:19],Analog H Scale,100%,102%,103%,105%,106%,108%,109%,111%,113%,114%,116%,117%,119%,120%,122%,123%,75%,77%,78%,80%,81%,83%,84%,86%,88%,89%,91%,92%,94%,95%,97%,98%;",
+	"P1,CRT Adjust;",
+	"P1O[101],CRT Adjust,Off,On;",
+	"H1P1O[100:96],CRT H-Size,0,+1,+2,+3,+4,+5,+6,+7,+8,+9,+10,+11,+12,+13,+14,+15,-16,-15,-14,-13,-12,-11,-10,-9,-8,-7,-6,-5,-4,-3,-2,-1;",
+	"H1P1O[85:79],CRT H-Position,0,+1,+2,+3,+4,+5,+6,+7,+8,+9,+10,+11,+12,+13,+14,+15,+16,+17,+18,+19,+20,+21,+22,+23,+24,+25,+26,+27,+28,+29,+30,+31,+32,+33,+34,+35,+36,+37,+38,+39,+40,+41,+42,+43,+44,+45,+46,+47,+48,-48,-47,-46,-45,-44,-43,-42,-41,-40,-39,-38,-37,-36,-35,-34,-33,-32,-31,-30,-29,-28,-27,-26,-25,-24,-23,-22,-21,-20,-19,-18,-17,-16,-15,-14,-13,-12,-11,-10,-9,-8,-7,-6,-5,-4,-3,-2,-1;",
+	"H1P1O[78:74],CRT V-Shift,0,+1,+2,+3,+4,+5,+6,+7,+8,+9,+10,+11,+12,+13,+14,+15,-16,-15,-14,-13,-12,-11,-10,-9,-8,-7,-6,-5,-4,-3,-2,-1;",
+	"H1P1O[107:104],CRT V-Size,0,+1,+2,+3,+4,+5,+6,+7,-7,-6,-5,-4,-3,-2,-1;",
+	// Cabinet mode is the safe default for consumer CRTs because it retains
+	// native sync. PVM mode preserves exact source lines but retimes HSync.
+	"H1P1O[108],CRT V-Size Mode,Cabinet,PVM;",
 	"-;",
 	"O[7:6],Savestate slot,1,2,3,4;",
 	"T[8],Save state;",
@@ -90,6 +94,7 @@ hps_io #(.CONF_STR(CONF_STR)) hps_io
 	.gamma_bus(),
 	.forced_scandoubler(forced_scandoubler),
 	.buttons(buttons),
+	.status_menumask({14'd0, ~status[101], 1'b0}),
 	.status(status)
 );
 
@@ -98,12 +103,11 @@ wire clk_gpu;
 wire pll_locked;
 wire clk_video;
 wire pll_video_locked;
-wire clk_sys_unused;
 pll pll
 (
 	.refclk(CLK_50M),
 	.rst(0),
-	.outclk_0(clk_sys_unused),
+	.outclk_0(clk_sys),
 	.outclk_1(clk_gpu),
 	.locked(pll_locked)
 );
@@ -118,11 +122,10 @@ pll_video pll_vid
 	.locked(pll_video_locked)
 );
 
-// Keep the framework's system and native-video domains on the same 25 MHz
-// core PLL. Besides being ample for hps_io, this lets the untouched upstream
-// OSD infer its normal block RAM rather than becoming a mixed-clock register
-// array. The GPU remains on its independent 88 MHz PLL output.
-assign clk_sys = clk_video;
+// Keep the framework on its conventional system clock. CRT-Adjust needs the
+// independent 50 MHz video clock for its Cabinet-mode subpixel phases, while
+// the explicit dual-clock OSD RAM safely bridges the two domains. The GPU
+// remains on its independent 88 MHz output.
 
 wire reset = RESET | status[0] | buttons[1] | ~pll_locked | ~pll_video_locked;
 
@@ -137,8 +140,10 @@ always @(posedge clk_gpu) begin
 	gpu_reset <= gpu_reset_meta;
 end
 
-// The framework and native video run at 25 MHz while the renderer remains at
-// 88 MHz. Keep reset deassertion synchronous to scanout.
+// Native video runs at 50 MHz while the renderer remains at 88 MHz. The
+// native pixel enable remains 6.25 MHz; the eight-cycle ratio
+// ratio supplies CRT V-Size's Cabinet pipeline with its required sub-phases.
+// Keep reset deassertion synchronous to scanout.
 reg video_reset_meta = 1;
 reg video_reset = 1;
 always @(posedge clk_video) begin
@@ -276,15 +281,55 @@ wire       crt_hblank;
 wire       crt_hsync;
 wire       crt_vblank;
 wire       crt_vsync;
+wire       crt_de;
 wire [7:0] crt_r;
 wire [7:0] crt_g;
 wire [7:0] crt_b;
-wire       crt_hscale_active;
+reg crt_on = 0;
+reg signed [4:0] crt_hsize = 0;
+reg signed [8:0] crt_hposition = 0;
+reg signed [5:0] crt_vshift = 0;
+reg signed [5:0] crt_vsize = 0;
+reg crt_cabinet_mode = 1;
 
-am2r_crt_video crt_video
+wire [6:0] crt_hposition_menu = status[85:79];
+wire signed [8:0] crt_hposition_decoded =
+	(crt_hposition_menu <= 7'd48) ? $signed({2'b0, crt_hposition_menu}) :
+	(crt_hposition_menu <= 7'd96) ? $signed({2'b0, crt_hposition_menu}) - 9'sd97 :
+	9'sd0;
+wire [3:0] crt_vsize_menu = status[107:104];
+wire signed [5:0] crt_vsize_step =
+	(crt_vsize_menu <= 4'd7) ? $signed({2'b0, crt_vsize_menu}) :
+	$signed({2'b0, crt_vsize_menu}) - 6'sd15;
+
+always @(posedge clk_video) begin
+	if (video_reset) begin
+		crt_on <= 0;
+		crt_hsize <= 0;
+		crt_hposition <= 0;
+		crt_vshift <= 0;
+		crt_vsize <= 0;
+		crt_cabinet_mode <= 1;
+	end else if (ce_pix) begin
+		crt_on <= status[101];
+		crt_hsize <= $signed(status[100:96]);
+		crt_hposition <= crt_hposition_decoded;
+		crt_vshift <= $signed(status[78:74]);
+		crt_vsize <= -(crt_vsize_step + (crt_vsize_step <<< 1));
+		crt_cabinet_mode <= ~status[108];
+	end
+end
+
+am2r_crt_pipeline crt_video
 (
 	.clk(clk_video),
 	.reset(video_reset),
+	.active(crt_on),
+	.hsize(crt_hsize),
+	.hposition(crt_hposition),
+	.vshift(crt_vshift),
+	.vsize(crt_vsize),
+	.cabinet_mode(crt_cabinet_mode),
 	.ce_pix_in(ce_pix),
 	.r_in(video_r),
 	.g_in(video_g),
@@ -293,24 +338,20 @@ am2r_crt_video crt_video
 	.hblank_in(hblank),
 	.vs_in(vsync),
 	.vblank_in(vblank),
-	.h_position($signed({status[13], status[13:10]})),
-	.v_position($signed({status[17], status[17:14]})),
-	.hscale_enable(status[18]),
-	.hscale($signed(status[23:19])),
 	.ce_pix_out(crt_ce_pix),
 	.r_out(crt_r),
 	.g_out(crt_g),
 	.b_out(crt_b),
 	.hs_out(crt_hsync),
+	.de_out(crt_de),
 	.hblank_out(crt_hblank),
 	.vs_out(crt_vsync),
-	.vblank_out(crt_vblank),
-	.hscale_active(crt_hscale_active)
+	.vblank_out(crt_vblank)
 );
 
 assign CLK_VIDEO = clk_video;
 assign CE_PIXEL  = crt_ce_pix;
-assign VGA_DE    = ~(crt_hblank | crt_vblank);
+assign VGA_DE    = crt_de;
 assign VGA_HS    = crt_hsync;
 assign VGA_VS    = crt_vsync;
 assign VGA_R     = crt_r;

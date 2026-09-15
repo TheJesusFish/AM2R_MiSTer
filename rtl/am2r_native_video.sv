@@ -1,8 +1,8 @@
 //============================================================================
 // AM2R native 320x240p scanout
 //
-// CLK_VIDEO is a dedicated 25 MHz PLL output. CE_PIXEL divides it by four for
-// a 6.25 MHz effective pixel clock. The 398x262 raster is
+// CLK_VIDEO is a dedicated 50 MHz PLL output. CE_PIXEL divides it by eight
+// for a 6.25 MHz effective pixel clock. The 398x262 raster is
 // 15.704 kHz / 59.94 Hz,
 // suitable for standard 15 kHz analog displays while retaining a framework-
 // compliant video clock for HDMI/ascal.
@@ -40,7 +40,7 @@ module am2r_native_video
 	localparam integer V_FP = 5;
 	localparam integer V_SYNC = 3;
 	localparam integer V_TOTAL = 262;
-	localparam integer CE_DIV = 4;
+	localparam integer CE_DIV = 8;
 
 	reg [3:0] ce_count = 0;
 	reg [8:0] h_count = 0;

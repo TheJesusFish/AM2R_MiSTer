@@ -119,10 +119,11 @@ textured draw cycle. Completed frames rotate among three HPS-DDR buffers so the
 GPU can avoid the immutable buffer currently in scanout without waiting a full
 raster; scanout still adopts only the newest complete buffer at a frame
 boundary. It prefetches each line through a show-ahead dual-clock FIFO. A
-dedicated 25 MHz video PLL with pixel enable
-divided by four produces a 398×262 total raster: 320×240 active, 15.704 kHz and
-59.94 Hz. `VGA_SCALER=0` keeps the core-owned 15 kHz raster on analog VGA while
-the framework can process the same timing for HDMI. ALSA feeds MiSTer's normal
+dedicated 50 MHz video PLL with pixel enable divided by eight produces a
+398×262 total raster: 320×240 active, 15.704 kHz and 59.94 Hz. The framework
+remains on its separate 20 MHz system clock. `VGA_SCALER=0` keeps the core-owned
+15 kHz raster on analog VGA while the framework can process the same timing for
+HDMI. ALSA feeds MiSTer's normal
 audio mixer independently. Input is sampled from `MiSTer virtual input` at the
 runtime event boundary. The HPS frontend traps normal/error exits and reloads
 `/media/fat/menu.rbf`; Weapon Select+Start requests a normal runner exit. The
@@ -140,9 +141,21 @@ position, and the display add latency outside that measurement. Native scanout
 adopts only a completed buffer at a frame boundary; removing that boundary
 would trade latency variance for tearing. There is no frame scaler queue,
 CRT-safe frame buffer, or intentional input delay in the core. The optional
-CRT horizontal-size adjustment uses a one-scanline DDA buffer and is an exact
-bypass when disabled. A controller-to-photodiode test is still required to
+core-side CRT-Adjust pipeline provides horizontal geometry and two experimental
+vertical-size methods; it is an exact zero-latency bypass when disabled. A
+controller-to-photodiode test is still required to
 establish end-to-end latency.
+
+The pinned framework tree under `sys/` is not patched. Quartus 17 expanded the
+framework's behavioral OSD arrays into registers after the vertical resizer was
+added, exceeding the Cyclone V logic budget. The project therefore selects the
+interface-identical core-local `rtl/am2r_osd.v` through `am2r_sys.tcl` and
+`am2r_sys.qip`; only the OSD storage is replaced by an explicit dual-clock M10K.
+The project also constrains ASCal's existing line, coefficient, and palette
+arrays to M10K RAM. Without those constraints Quartus 17 implements the three
+coefficient arrays alone as 30,720 flip-flops once CRT-Adjust raises overall
+M10K use. These core-local build choices change neither the framework split nor
+the CRT-Adjust video stream.
 
 ## Evidence policy
 

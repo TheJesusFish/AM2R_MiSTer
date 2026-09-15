@@ -29,8 +29,8 @@ licenses. Review their notices before the first public commit:
 | `sys/` and the MiSTer-derived top-level framework portions | MiSTer Template, GPL-2.0-or-later | Must remain an unmodified copy of Template commit `3ea1134cf05d62c2b1db30362277a823d739ced2`. |
 | `rtl/am2r_native_reader.sv` | 3S-ARM, GPL-2.0-or-later | Adapted source; its attribution header must remain. |
 | `rtl/jtframe_sdram/` | JTFRAME, GPL-3.0-or-later | Adapted SDRAM-control source with upstream notices. |
-| `rtl/am2r_crt_resync.sv` | JTFRAME, GPL-3.0-or-later | Adapted CRT sync positioning from commit `37c88797f66416c0f1c9b4d7d455b4a5b9a95899`. |
-| `rtl/am2r_video_hscale.sv`, `rtl/am2r_video_line_ram.sv` | Arcade-IGSPGM_MiSTer, GPL-3.0-or-later | Adapted analog H-Scale source from commit `6f757e42779a93e940134018c25f08aafaf95b93`. |
+| `rtl/crt_adjust.sv`, `rtl/crt_vsize.sv` | MiSTer-CRT-Adjust, GPL-3.0-or-later | Vendored at commit `c682de9f4acc61d8f4c7779efb48149d3baa3a8e`; no game data is present. |
+| `rtl/am2r_osd.v`, `am2r_sys.tcl`, `am2r_sys.qip` | MiSTer Template, GPL-2.0-or-later | Core-local derived integration files; the tracked `sys/` copy remains byte-for-byte upstream. |
 | `patches/butterscotch-*.patch` | Butterscotch, AGPL-3.0-only | Derived patch series; distributing a built runner also requires the corresponding source offer/license compliance. |
 | `patches/dmtcp-armv7-mister.patch` | DMTCP, LGPL-3.0-or-later | Derived portability patch. |
 | generated PLL/QIP sources under `rtl/` and `sys/` | Intel/Altera notices embedded in the files | Tool-generated build inputs; do not remove or replace their vendor notices. |

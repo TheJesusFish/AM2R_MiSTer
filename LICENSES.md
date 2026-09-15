@@ -11,8 +11,9 @@ licenses inherited from upstream projects.
 | `src/hps-wrapper/` | GPL-3.0-or-later | AM2R MiSTer frontend based on the MiSTer Main integration contract |
 | `AM2R.sv`, project RTL, and MiSTer framework files under `rtl/` and `sys/` | GPL-2.0-or-later unless an individual file says otherwise | MiSTer Template/framework; see file headers |
 | `rtl/am2r_native_reader.sv` | GPL-2.0-or-later | Adapted from the 3S-ARM native video reader, itself marked GPL-2.0-or-later |
-| `rtl/am2r_crt_resync.sv` | GPL-3.0-or-later | Adapted from JTFRAME `jtframe_resync`, commit `37c88797f66416c0f1c9b4d7d455b4a5b9a95899` |
-| `rtl/am2r_video_hscale.sv`, `rtl/am2r_video_line_ram.sv` | GPL-3.0-or-later | Adapted from Arcade-IGSPGM_MiSTer, commit `6f757e42779a93e940134018c25f08aafaf95b93` |
+| `rtl/crt_adjust.sv`, `rtl/crt_vsize.sv` | GPL-3.0-or-later | MiSTer-CRT-Adjust, commit `c682de9f4acc61d8f4c7779efb48149d3baa3a8e` |
+| `rtl/am2r_crt_pipeline.sv` | GPL-3.0-or-later | AM2R core-side integration glue for MiSTer-CRT-Adjust |
+| `rtl/am2r_osd.v`, `am2r_sys.tcl`, `am2r_sys.qip` | GPL-2.0-or-later | Core-local MiSTer Template integration; OSD storage changed to explicit Cyclone V M10K RAM |
 | `patches/butterscotch-*.patch` | AGPL-3.0-only | Modifications to Butterscotch, based on commit `7c2503efc25f20dddb9ba7b7cf7b46fd4f63ba08` |
 | `patches/dmtcp-armv7-mister.patch` | LGPL-3.0-or-later | Modification to DMTCP 3.2.0, based on commit `bc38d1a3bdfca87905f1a3adfada1e63d64042e5` |
 | Intel/Altera generated PLL files | Their embedded vendor notice | Generated Quartus IP output; see each file |

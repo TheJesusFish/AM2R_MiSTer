@@ -47,7 +47,7 @@ module am2r_native_reader_tb;
 	);
 
 	always #5 ddr_clk = ~ddr_clk;
-	always #20 clk_vid = ~clk_vid;
+	always #10 clk_vid = ~clk_vid;
 
 	// Give every DDR word a unique identity. A constant red/green pattern
 	// cannot detect a show-ahead FIFO word being duplicated or skipped.

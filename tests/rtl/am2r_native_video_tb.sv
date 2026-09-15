@@ -29,7 +29,7 @@ module am2r_native_video_tb;
 		.vsync(vsync), .new_frame(new_frame), .new_line(new_line), .r(r), .g(g), .b(b)
 	);
 
-	always #5 clk = ~clk;
+	always #10 clk = ~clk;
 
 	always @(posedge clk) begin
 		if (reset) begin
@@ -37,8 +37,8 @@ module am2r_native_video_tb;
 		end else begin
 			clocks_since_ce <= clocks_since_ce + 1;
 			if (ce_pix) begin
-				if (seen_ce && clocks_since_ce != 3) begin
-					$display("CE spacing was %0d clocks, expected 4", clocks_since_ce + 1);
+				if (seen_ce && clocks_since_ce != 7) begin
+					$display("CE spacing was %0d clocks, expected 8", clocks_since_ce + 1);
 					errors = errors + 1;
 				end
 				seen_ce <= 1;
@@ -73,7 +73,7 @@ module am2r_native_video_tb;
 			errors = errors + 1;
 		end
 		if (errors == 0)
-			$display("PASS: 320x240 active, 398x262 total, CE /4, 15.704 kHz and 59.94 Hz timing");
+			$display("PASS: 320x240 active, 398x262 total, CE /8, 15.704 kHz and 59.94 Hz timing");
 		else
 			$fatal(1, "FAIL: %0d errors", errors);
 		$finish;

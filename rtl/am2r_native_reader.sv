@@ -318,7 +318,7 @@ module am2r_native_reader (
 							// dcfifo is show-ahead: consume the current word only
 							// after displaying its high pixel. The registered pulse
 							// reaches dcfifo on the following clk_vid edge, well
-							// before the next ce_pix edge four cycles later.
+							// before the next ce_pix edge sixteen cycles later.
 							pixel_odd <= 0;
 							fifo_rd <= 1;
 						end else begin
