@@ -3,8 +3,6 @@
 module am2r_native_video_tb;
 	reg clk = 0;
 	reg reset = 1;
-	reg diagnostic = 0;
-	reg [1:0] pattern = 0;
 	reg frame_ready = 1;
 	reg [7:0] frame_r = 8'hff;
 	reg [7:0] frame_g = 0;
@@ -23,7 +21,7 @@ module am2r_native_video_tb;
 	reg seen_ce = 0;
 
 	am2r_native_video dut(
-		.clk(clk), .reset(reset), .diagnostic(diagnostic), .pattern(pattern),
+		.clk(clk), .reset(reset),
 		.frame_ready(frame_ready), .frame_r(frame_r), .frame_g(frame_g), .frame_b(frame_b),
 		.ce_pix(ce_pix), .hblank(hblank), .hsync(hsync), .vblank(vblank),
 		.vsync(vsync), .new_frame(new_frame), .new_line(new_line), .r(r), .g(g), .b(b)

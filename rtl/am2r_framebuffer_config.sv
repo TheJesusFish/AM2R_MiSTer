@@ -1,15 +1,14 @@
 //============================================================================
 // AM2R ARM framebuffer contract
 //
-// The HPS-visible XRGB8888 window remains configured for runner readback and
-// diagnostics, but display ownership stays with the FPGA native scanout.
+// The HPS-visible XRGB8888 window remains configured for runner readback, but
+// display ownership stays with the FPGA native scanout.
 //
 // SPDX-License-Identifier: GPL-2.0-or-later
 //============================================================================
 
 module am2r_framebuffer_config
 (
-	input         diagnostic,
 	output        fb_en,
 	output  [4:0] fb_format,
 	output [11:0] fb_width,

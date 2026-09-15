@@ -127,8 +127,8 @@ int main(int argc, char **argv)
 	    pulse(fd, KEY_HOME))
 		goto io_error;
 	if (reset) {
-		// Aspect, video source, diagnostic pattern, slot, save, load, reset.
-		for (int row = 0; row < 6; ++row) {
+		// Aspect, CRT adjustments, slot, save, load, reset.
+		for (int row = 0; row < 5; ++row) {
 			if (pulse(fd, KEY_DOWN)) goto io_error;
 		}
 		if (pulse(fd, KEY_ENTER)) goto io_error;
@@ -137,9 +137,9 @@ int main(int argc, char **argv)
 		if (sleep_ms(12000)) goto io_error;
 		goto done;
 	}
-	// A fresh core OSD starts at Aspect ratio. With the removed CRT safe-area
-	// option, Savestate slot is the fourth selectable row.
-	for (int row = 0; row < 3; ++row) {
+	// A fresh core OSD starts at Aspect ratio. Savestate slot is the third
+	// selectable row after the CRT-adjustment submenu.
+	for (int row = 0; row < 2; ++row) {
 		if (pulse(fd, KEY_DOWN)) goto io_error;
 	}
 	for (unsigned int slot = 1; !current_slot && slot < target_slot; ++slot) {

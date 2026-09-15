@@ -1,4 +1,3 @@
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/am2r_video_test.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/am2r_native_video.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/am2r_crt_resync.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/am2r_video_line_ram.sv

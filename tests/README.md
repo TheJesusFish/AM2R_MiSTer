@@ -2,8 +2,9 @@
 
 - `am2r-1.1/smoke-inputs.json` is the deterministic title-to-first-room keyboard
   sequence used by the Butterscotch smoke and persistence probe.
-- `rtl/am2r_video_test_tb.sv` checks a complete native raster, blanking and sync
-  intervals, including the frame wrap.
+- `rtl/am2r_video_test_tb.sv` checks a complete synthetic raster, blanking and
+  sync intervals, including the frame wrap. Its pattern generator is compiled
+  only by the testbench and is not part of the production RBF.
 - `renderer/am2r_axis_coverage_test.c` locks the pixel-center edge rule that
   prevents fractional sprite quads from sampling one extra atlas row.
 - `renderer/audit_sw_renderer.py` verifies that all 70 renderer vtable hooks are

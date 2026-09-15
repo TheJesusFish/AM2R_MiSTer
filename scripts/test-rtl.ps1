@@ -43,6 +43,12 @@ try {
     if ($topSource.Contains('CRT safe area') -or $topSource.Contains('.safe_area(')) {
         throw 'AM2R.sv must not expose or drive the removed CRT safe-area scaler.'
     }
+	if ($topSource.Contains('Video source') -or
+		$topSource.Contains('Diagnostic pattern') -or
+		$topSource.Contains('.diagnostic(') -or
+		$topSource.Contains('.pattern(')) {
+		throw 'AM2R.sv must not retain the removed production diagnostic-video controls.'
+	}
 	if (-not $topSource.Contains('CRT Adjustments') -or
 		-not $topSource.Contains('Analog H Position') -or
 		-not $topSource.Contains('Analog V Position') -or

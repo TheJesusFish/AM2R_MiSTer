@@ -14,8 +14,6 @@ module am2r_native_video
 (
 	input              clk,
 	input              reset,
-	input              diagnostic,
-	input       [1:0]  pattern,
 	input              frame_ready,
 	input       [7:0]  frame_r,
 	input       [7:0]  frame_g,
@@ -45,18 +43,9 @@ module am2r_native_video
 	reg [3:0] ce_count = 0;
 	reg [8:0] h_count = 0;
 	reg [8:0] v_count = 0;
-	reg [1:0] pattern_latched = 0;
-	reg       diagnostic_meta = 0;
-	reg       diagnostic_sync = 0;
-	reg [1:0] pattern_meta = 0;
-	reg [1:0] pattern_sync = 0;
 
 	wire active = (h_count < H_ACTIVE) && (v_count < V_ACTIVE);
 	always @(posedge clk) begin
-		diagnostic_meta <= diagnostic;
-		diagnostic_sync <= diagnostic_meta;
-		pattern_meta <= pattern;
-		pattern_sync <= pattern_meta;
 		ce_pix <= 0;
 		new_frame <= 0;
 		new_line <= 0;
@@ -70,7 +59,6 @@ module am2r_native_video
 			vsync <= 0;
 			new_frame <= 0;
 			new_line <= 0;
-			pattern_latched <= pattern_sync;
 			r <= 0;
 			g <= 0;
 			b <= 0;
@@ -88,42 +76,18 @@ module am2r_native_video
 				r <= 0;
 				g <= 0;
 				b <= 0;
-			end else if (!diagnostic_sync && frame_ready) begin
+			end else if (frame_ready) begin
 				r <= frame_r;
 				g <= frame_g;
 				b <= frame_b;
 			end else begin
-				case (pattern_latched)
-					2'd0: begin
-						if (h_count < 40)       {r,g,b} <= 24'hffffff;
-						else if (h_count < 80)  {r,g,b} <= 24'hffff00;
-						else if (h_count < 120) {r,g,b} <= 24'h00ffff;
-						else if (h_count < 160) {r,g,b} <= 24'h00ff00;
-						else if (h_count < 200) {r,g,b} <= 24'hff00ff;
-						else if (h_count < 240) {r,g,b} <= 24'hff0000;
-						else if (h_count < 280) {r,g,b} <= 24'h0000ff;
-						else                    {r,g,b} <= 24'h101010;
-					end
-					2'd1: begin
-						{r,g,b} <= ((h_count[4:0] == 0) || (v_count[4:0] == 0)) ?
-							24'h406080 : 24'h081018;
-						if ((h_count == 160) || (v_count == 120))
-							{r,g,b} <= 24'hffffff;
-					end
-					2'd2: begin
-						r <= {h_count[7:0]};
-						g <= v_count[7:0];
-						b <= h_count[7:0] ^ v_count[7:0];
-					end
-					default: {r,g,b} <= 24'h000000;
-				endcase
+				{r,g,b} <= 24'h000000;
 			end
 
 			if (h_count == H_TOTAL - 1) begin
 				h_count <= 0;
 				if (v_count == V_TOTAL - 1) begin
 					v_count <= 0;
-					pattern_latched <= pattern_sync;
 				end else begin
 					v_count <= v_count + 1'b1;
 				end

@@ -35,7 +35,7 @@ module am2r_native_reader_late_frame_tb;
 	reg [7:0] expected_tag;
 
 	am2r_native_video timing(
-		.clk(clk_vid), .reset(reset), .diagnostic(1'b0), .pattern(2'b0),
+		.clk(clk_vid), .reset(reset),
 		.frame_ready(frame_ready), .frame_r(r), .frame_g(g), .frame_b(b),
 		.ce_pix(ce_pix), .hblank(hblank), .hsync(hsync), .vblank(vblank),
 		.vsync(vsync), .new_frame(new_frame), .new_line(new_line),

@@ -24,8 +24,6 @@ module am2r_crt_video_tb;
 	am2r_native_video source(
 		.clk(clk),
 		.reset(reset),
-		.diagnostic(1'b1),
-		.pattern(2'd1),
 		.frame_ready(1'b0),
 		.frame_r(8'd0),
 		.frame_g(8'd0),

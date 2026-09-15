@@ -83,7 +83,7 @@ is intended for 15 kHz analog displays whose visible raster clips the native
 image. All controls default to zero/off; in that state the RTL is an exact
 clock, RGB, blanking, and sync bypass and adds no buffering.
 
-The experimental **CRT UI V Inset** option moves only UI pixels which enter the
+The **CRT UI V Inset** option moves only UI pixels which enter the
 top or bottom sixteen-line edge band, plus the title screen's separate version
 and URL overlays. It keeps those elements at their original pixel size: the
 320×240 game scene, camera, collision coordinates, title background, and other

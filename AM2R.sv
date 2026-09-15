@@ -56,8 +56,6 @@ localparam CONF_STR = {
 	"AM2R;;",
 	"-;",
 	"O[5:4],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
-	"O[1],Video source,ARM Framebuffer,Diagnostic;",
-	"O[3:2],Diagnostic pattern,Color Bars,Grid,Gradient,Black;",
 	"P1,CRT Adjustments;",
 	"P1O[13:10],Analog H Position,0,1,2,3,4,5,6,7,-8,-7,-6,-5,-4,-3,-2,-1;",
 	"P1O[17:14],Analog V Position,0,1,2,3,4,5,6,7,-8,-7,-6,-5,-4,-3,-2,-1;",
@@ -254,8 +252,6 @@ am2r_native_video native_video
 (
 	.clk(clk_video),
 	.reset(video_reset),
-	.diagnostic(status[1]),
-	.pattern(status[3:2]),
 	.frame_ready(native_frame_ready),
 	.frame_r(native_r),
 	.frame_g(native_g),

@@ -283,8 +283,8 @@ int main(int argc, char **argv)
 		// gameplay movement: callers can inspect the exact loaded save point.
 		if (pulse_button(fd, BTN_SOUTH, 120) || sleep_ms(700) ||
 		    pulse_button(fd, BTN_START, 250) || sleep_ms(7000) ||
-		    pulse_button(fd, BTN_SOUTH, 220) || sleep_ms(1400) ||
-		    pulse_button(fd, BTN_SOUTH, 220) || sleep_ms(5000)) goto io_error;
+		    pulse_button(fd, BTN_EAST, 220) || sleep_ms(1400) ||
+		    pulse_button(fd, BTN_EAST, 220) || sleep_ms(5000)) goto io_error;
 	} else if (select_save) {
 		// Continue from a save selector that is already visible. The first Walk
 		// edge is consumed while assigning this short-lived controller to P1;
