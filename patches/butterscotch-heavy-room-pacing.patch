@@ -1,0 +1,632 @@
+diff --git a/src/instance.h b/src/instance.h
+index 8789436..2c9f9c1 100644
+--- a/src/instance.h
++++ b/src/instance.h
+@@ -41,6 +41,13 @@ struct Instance {
+     uint16_t activeAlarmMask;
+     int32_t maskIndex; // collision mask sprite override (-1 = use spriteIndex)
+     int32_t* collisionCells; // Used to track where we are
++    // Exact bbox used for the current collisionCells membership. AM2R
++    // repeatedly deactivates room objects and then activates small regions;
++    // retained inactive cells remain immutable, so reusing this bbox avoids
++    // rebuilding sprite geometry for every candidate every frame.
++    GMLReal collisionGridLeft, collisionGridRight;
++    GMLReal collisionGridTop, collisionGridBottom;
++    bool collisionGridBBoxValid;
+     uint32_t lastCollisionQueryId;
+ 
+     // Per-instance self variable storage (sparse open-addressed hashmap, keyed by varID).
+diff --git a/src/loop.c b/src/loop.c
+index a261848..401acd6 100644
+--- a/src/loop.c
++++ b/src/loop.c
+@@ -1448,13 +1448,7 @@ int loop(CommandLineArgs args, const char *argv0) {
+                 }
+ 
+                 // Run one game step (Begin Step, Keyboard, Alarms, Step, End Step, room transitions)
+-#ifdef USE_MISTER
+-                uint64_t misterProfileStepStart = nowNanos();
+-#endif
+                 Runner_step(runner);
+-#ifdef USE_MISTER
+-                uint64_t misterProfileStepEnd = nowNanos();
+-#endif
+ 
+                 if (freeCamActive) {
+                     memcpy(runner->keyboard->keyDown, currentKeyDown, sizeof(runner->keyboard->keyDown));
+@@ -1504,9 +1498,6 @@ int loop(CommandLineArgs args, const char *argv0) {
+                 }
+ 
+                 // Clear the default framebuffer (window background) to black
+-#ifdef USE_MISTER
+-                uint64_t misterProfileDrawStart = nowNanos();
+-#endif
+ #ifdef ENABLE_SW_RENDERER
+                 if (gfx == SOFTWARE)
+                     SWRenderer_clearFrameBuffer(renderer, 0);
+@@ -1578,9 +1569,6 @@ int loop(CommandLineArgs args, const char *argv0) {
+                 Runner_drawPost(runner, fbWidth, fbHeight);
+                 renderer->vtable->endFrameEnd(renderer);
+                 Runner_drawGUI(runner, fbWidth, fbHeight, gameW, gameH);
+-#ifdef USE_MISTER
+-                uint64_t misterProfileDrawEnd = nowNanos();
+-#endif
+ 
+ #ifdef ENABLE_SCREENSHOTS
+                 // Capture screenshot if this frame matches a requested frame
+@@ -1612,32 +1600,9 @@ int loop(CommandLineArgs args, const char *argv0) {
+                 }
+ 
+                 // Only swap when there isn't a room change to match the original runner.
+-#ifdef USE_MISTER
+-                uint64_t misterProfilePresentStart = nowNanos();
+-#endif
+                 if (runner->pendingRoom == -1)
+                     platformSwapBuffers();
+                 Runner_handlePendingRoomChange(runner);
+-#ifdef USE_MISTER
+-                uint64_t misterProfilePresentEnd = nowNanos();
+-                double misterProfileTotalMs = (int64_t)(misterProfilePresentEnd - frameStartNow) / 1000000.0;
+-                if (misterProfileTotalMs > 20.0) {
+-                    static uint32_t misterSlowFrameLogs = 0;
+-                    if (misterSlowFrameLogs < 600) {
+-                        logInfo("MiSTer slow frame %d: total=%.2f step=%.2f draw=%.2f present=%.2f other=%.2f ms\n",
+-                                runner->frameCount,
+-                                misterProfileTotalMs,
+-                                (int64_t)(misterProfileStepEnd - misterProfileStepStart) / 1000000.0,
+-                                (int64_t)(misterProfileDrawEnd - misterProfileDrawStart) / 1000000.0,
+-                                (int64_t)(misterProfilePresentEnd - misterProfilePresentStart) / 1000000.0,
+-                                misterProfileTotalMs -
+-                                    (int64_t)(misterProfileStepEnd - misterProfileStepStart) / 1000000.0 -
+-                                    (int64_t)(misterProfileDrawEnd - misterProfileDrawStart) / 1000000.0 -
+-                                    (int64_t)(misterProfilePresentEnd - misterProfilePresentStart) / 1000000.0);
+-                        misterSlowFrameLogs++;
+-                    }
+-                }
+-#endif
+             }
+ 
+             if (RunnerKeyboard_checkPressed(runner->keyboard, VK_BACKSPACE)) {
+@@ -1657,11 +1622,36 @@ int loop(CommandLineArgs args, const char *argv0) {
+                 }
+                 fastForwardTabPrev = fastForwardTabNow;
+                 double effectiveSpeed = (args.fastForwardSpeed > 0.0 && fastForwardActive) ? args.fastForwardSpeed : args.speedMultiplier;
+-                uint64_t targetFrameTime = 1000000000 / (runner->currentRoom->speed * effectiveSpeed);
++                uint64_t targetFrameTime;
++#ifdef USE_MISTER
++                // The core's native raster is exactly 6.25 MHz / (398 * 262),
++                // or 59.9371 Hz. Running AM2R's nominal 60 Hz rooms against a
++                // 60.000 Hz software timer advances one game frame every
++                // ~15.9 seconds and makes scanout skip it. Pace all room rates
++                // as divisors of the native raster so game and video never
++                // beat against each other.
++                const double misterFrameNanos = 16684160.0;
++                targetFrameTime = (uint64_t)(misterFrameNanos * 60.0 /
++                                  (runner->currentRoom->speed * effectiveSpeed));
++#else
++                targetFrameTime = 1000000000 / (runner->currentRoom->speed * effectiveSpeed);
++#endif
+                 uint64_t nextFrameTime = lastFrameTime + targetFrameTime;
+                 platformSleepUntil(nextFrameTime);
++#ifdef USE_MISTER
++                // Retain the raster-matched absolute phase through ordinary
++                // scheduler jitter. If execution falls more than a complete
++                // frame behind, rebase instead of running an unbounded burst
++                // of catch-up ticks.
++                uint64_t framePaceNow = nowNanos();
++                lastFrameTime = framePaceNow > nextFrameTime + targetFrameTime ?
++                                framePaceNow : nextFrameTime;
++#else
++                lastFrameTime = nowNanos();
++#endif
++            } else {
++                lastFrameTime = nowNanos();
+             }
+-            lastFrameTime = nowNanos();
+         }
+ 
+         saveInputRecording();
+diff --git a/src/runner.c b/src/runner.c
+index 6da2513..d687e16 100644
+--- a/src/runner.c
++++ b/src/runner.c
+@@ -1530,6 +1530,7 @@ static Instance** takePersistentInstances(Runner* runner) {
+ 
+             // The spatial grid is recreated per room, so any cell coordinates the instance was tracking belong to the old grid and must not be reused.
+             arrsetlen(inst->collisionCells, 0);
++            inst->collisionGridBBoxValid = false;
+             inst->spatialGridDirty = false;
+ 
+             arrput(carriedPersistent, inst);
+diff --git a/src/runner.h b/src/runner.h
+index 616a74f..efe3b58 100644
+--- a/src/runner.h
++++ b/src/runner.h
+@@ -899,14 +899,16 @@ static inline void Runner_setActiveState(Runner* runner, Instance* instance, boo
+     // deactivate-object/activate-region cycle.  A pending/moved instance must
+     // be removed before its dirty queue entry is discarded, however.
+     if (!active && runner->spatialGrid != nullptr && instance->spatialGridDirty)
+-        SpatialGrid_removeInstance(runner->spatialGrid, instance);
++        SpatialGrid_removeInstanceTracked(runner->spatialGrid, instance);
+ 
+     instance->active = active;
+ 
+-    // An inactive instance can have no cells when it was deactivated before
+-    // its first insert or when a script moved it while inactive.  Queue only
+-    // that case on activation; clean retained cells need no work.
+-    if (active && runner->spatialGrid != nullptr && arrlen(instance->collisionCells) == 0)
++    // Every non-destroyed game instance gets a grid cell, including inactive
++    // and sprite-less instances. Queue a cell-less transition immediately so
++    // activation-region queries never need a full-room fallback scan.
++    if (runner->spatialGrid != nullptr &&
++        arrlen(instance->collisionCells) == 0 &&
++        !instance->spatialGridDirty)
+         SpatialGrid_markInstanceAsDirty(runner->spatialGrid, instance);
+ }
+ 
+diff --git a/src/spatial_grid.c b/src/spatial_grid.c
+index d40658e..ea034eb 100644
+--- a/src/spatial_grid.c
++++ b/src/spatial_grid.c
+@@ -107,6 +107,7 @@ static void SpatialGrid_removeInstanceFromAllCells(SpatialGrid* grid, Instance*
+ 
+ static void SpatialGrid_finishInstanceRemoval(Instance* instance) {
+     arrsetlen(instance->collisionCells, 0);
++    instance->collisionGridBBoxValid = false;
+     instance->spatialGridDirty = false;
+ }
+ 
+@@ -118,9 +119,15 @@ void SpatialGrid_removeInstance(SpatialGrid* grid, Instance* instance) {
+     SpatialGrid_finishInstanceRemoval(instance);
+ }
+ 
+-static void SpatialGrid_removeInstanceForSync(SpatialGrid* grid, Instance* instance) {
++void SpatialGrid_removeInstanceTracked(SpatialGrid* grid, Instance* instance) {
+     // A normally moving active instance has an exact cell cache.  Only scan the
+     // full room grid if that invariant is absent or has been broken.
++    // An empty cache on this path means the instance was queued but had not yet
++    // been inserted. Lifecycle removal has its own exhaustive entry point.
++    if (arrlen(instance->collisionCells) == 0) {
++        SpatialGrid_finishInstanceRemoval(instance);
++        return;
++    }
+     if (!SpatialGrid_removeInstanceFromTrackedCells(grid, instance))
+         SpatialGrid_removeInstanceFromAllCells(grid, instance);
+ 
+@@ -144,15 +151,15 @@ void SpatialGrid_syncGrid(Runner* runner, SpatialGrid* grid) {
+         int32_t instanceId = grid->dirtyInstances[i];
+         Instance* instance = hmget(runner->instancesById, instanceId);
+ 
+-        // We do not care about removed/inactive/destroyed instances, because they would've been already been removed from the grid on the "SpatialGrid_markInstanceAsDirty" call
+-        // We also do not care if the spatial grid is not dirty
++        // Destroyed instances must leave no stale pointers. Inactive instances
++        // still belong in the grid: activation-region queries filter them from
++        // collisions but use their retained cell to avoid scanning the room.
+         if (instance == nullptr)
+             continue;
+-        if (!instance->active || instance->destroyed) {
+-            // The queued ID is about to be discarded with the dirty list.
+-            // Remove any old cells and clear the dirty bit so a future
+-            // activation can enqueue an instance that has no retained cells.
+-            SpatialGrid_removeInstance(grid, instance);
++        if (instance->destroyed) {
++            if (instance->spatialGridDirty) {
++                SpatialGrid_removeInstance(grid, instance);
++            }
+             continue;
+         }
+         if (!instance->spatialGridDirty)
+@@ -161,16 +168,27 @@ void SpatialGrid_syncGrid(Runner* runner, SpatialGrid* grid) {
+         instance->spatialGridDirty = false;
+ 
+         // Remove from old cells
+-        SpatialGrid_removeInstanceForSync(grid, instance);
++        SpatialGrid_removeInstanceTracked(grid, instance);
+ 
+         InstanceBBox bbox = Collision_computeBBox(runner, instance);
+ 
+         arrsetlen(instance->collisionCells, 0);
++        instance->collisionGridBBoxValid = bbox.valid;
++        if (bbox.valid) {
++            instance->collisionGridLeft = bbox.left;
++            instance->collisionGridRight = bbox.right;
++            instance->collisionGridTop = bbox.top;
++            instance->collisionGridBottom = bbox.bottom;
++        }
+ 
+-        if (!bbox.valid)
+-            continue;
+-
+-        SpatialGridRange range = SpatialGrid_computeCellRange(grid, bbox.left, bbox.top, bbox.right, bbox.bottom);
++        // Sprite-less instances do not collide, but GameMaker activation
++        // regions still test their origin. Index that point so they do not
++        // require a separate full-room activation scan.
++        SpatialGridRange range = bbox.valid
++            ? SpatialGrid_computeCellRange(grid, bbox.left, bbox.top,
++                                           bbox.right, bbox.bottom)
++            : SpatialGrid_computeCellRange(grid, instance->x, instance->y,
++                                           instance->x, instance->y);
+ 
+         for (int32_t gx = range.minGridX; range.maxGridX >= gx; gx++) {
+             for (int32_t gy = range.minGridY; range.maxGridY >= gy; gy++) {
+@@ -190,13 +208,26 @@ void SpatialGrid_markInstanceAsDirty(SpatialGrid* grid, Instance* dirtyInstance)
+     if (dirtyInstance->objectIndex == STRUCT_OBJECT_INDEX)
+         return;
+ 
+-    if (!dirtyInstance->active || dirtyInstance->destroyed) {
+-        // Destroyed instances are updated instantly because, if we didn't, we would need to track the ID + all grids that the instance is in
+-        // Guard against stale entries left behind by room transitions or earlier clears of collisionCells.
++    if (dirtyInstance->destroyed) {
++        // Destruction is a lifecycle boundary, so retain the exhaustive stale
++        // pointer defence used by room transitions.
+         SpatialGrid_removeInstance(grid, dirtyInstance);
+         return;
+     }
+ 
++    if (!dirtyInstance->active) {
++        // Inactive movement cannot participate in collision queries, but its
++        // new cell is needed by instance_activate_region. Reindex it on the
++        // next synchronization instead of leaving it in a room-wide fallback
++        // list.
++        if (dirtyInstance->spatialGridDirty)
++            return;
++        SpatialGrid_removeInstanceTracked(grid, dirtyInstance);
++        dirtyInstance->spatialGridDirty = true;
++        arrput(grid->dirtyInstances, dirtyInstance->instanceId);
++        return;
++    }
++
+     if (dirtyInstance->spatialGridDirty)
+         return;
+ 
+diff --git a/src/spatial_grid.h b/src/spatial_grid.h
+index 78b38b9..0fbb5b5 100644
+--- a/src/spatial_grid.h
++++ b/src/spatial_grid.h
+@@ -82,9 +82,32 @@ static inline bool SpatialGrid_instanceOverlapsRange(Instance* instance, Spatial
+     return false;
+ }
+ 
++// An instance inserted into a cell necessarily intersects that cell. If any
++// tracked cell is wholly inside an activation region, the instance overlaps
++// the region without requiring its comparatively expensive exact sprite bbox.
++static inline bool SpatialGrid_instanceHasCellFullyInsideBounds(
++    Instance* instance, GMLReal left, GMLReal top,
++    GMLReal right, GMLReal bottom) {
++    repeat(arrlen(instance->collisionCells), i) {
++        GMLReal cellLeft = (GMLReal)SpatialGrid_unpackGridX(instance->collisionCells[i]) *
++                           SPATIAL_GRID_CELL_SIZE;
++        GMLReal cellTop = (GMLReal)SpatialGrid_unpackGridY(instance->collisionCells[i]) *
++                          SPATIAL_GRID_CELL_SIZE;
++        GMLReal cellRight = cellLeft + SPATIAL_GRID_CELL_SIZE - 1;
++        GMLReal cellBottom = cellTop + SPATIAL_GRID_CELL_SIZE - 1;
++        if (cellLeft >= left && cellRight <= right &&
++            cellTop >= top && cellBottom <= bottom)
++            return true;
++    }
++    return false;
++}
++
+ SpatialGrid* SpatialGrid_create(uint32_t gridWidth, uint32_t gridHeight);
+ void SpatialGrid_free(SpatialGrid* grid);
+ void SpatialGrid_removeInstance(SpatialGrid* grid, Instance* instance);
++// Normal movement/deactivation removal. Uses the instance's exact tracked
++// cells and falls back to an exhaustive scan only when that cache is invalid.
++void SpatialGrid_removeInstanceTracked(SpatialGrid* grid, Instance* instance);
+ 
+ void SpatialGrid_syncGrid(Runner* runner, SpatialGrid* grid);
+ void SpatialGrid_markInstanceAsDirty(SpatialGrid* grid, Instance* instance);
+diff --git a/src/sw_raster_bounds.h b/src/sw_raster_bounds.h
+index 6444526..c6c8cbc 100644
+--- a/src/sw_raster_bounds.h
++++ b/src/sw_raster_bounds.h
+@@ -1,5 +1,6 @@
+ #pragma once
+ 
++#include <stdbool.h>
+ #include <math.h>
+ #include <stdint.h>
+ 
+@@ -9,3 +10,22 @@ static inline int32_t swPixelCoverageEdge(float edge)
+ {
+     return (int32_t)ceilf(edge - 0.5f);
+ }
++
++// Conservative geometry-level rejection for an axis-aligned quad. Touching a
++// scissor edge cannot cover a pixel inside its half-open rectangle.
++static inline bool swAxisBoundsOutsideScissor(float x0, float y0,
++                                              float x1, float y1,
++                                              int32_t scissorX,
++                                              int32_t scissorY,
++                                              int32_t scissorW,
++                                              int32_t scissorH)
++{
++    const float minX = fminf(x0, x1);
++    const float minY = fminf(y0, y1);
++    const float maxX = fmaxf(x0, x1);
++    const float maxY = fmaxf(y0, y1);
++    const float scissorRight = (float)(scissorX + scissorW);
++    const float scissorBottom = (float)(scissorY + scissorH);
++    return maxX <= (float)scissorX || minX >= scissorRight ||
++           maxY <= (float)scissorY || minY >= scissorBottom;
++}
+diff --git a/src/sw_renderer.c b/src/sw_renderer.c
+index 228c267..906ab5a 100644
+--- a/src/sw_renderer.c
++++ b/src/sw_renderer.c
+@@ -1242,6 +1242,28 @@ static inline void worldToScreen(SWRenderer* sw, float wx, float wy, float* sx,
+     Matrix4f_transformPoint(&sw->worldToScreen, wx, wy, sx, sy);
+ }
+ 
++// Room tile layers contain thousands of legacy draw calls, including tiles
++// far outside the current view. Reject the common non-rotated case before
++// texture lookup, matrix construction, vertex setup, and raster dispatch.
++// Rotated sprites/views retain the complete path below.
++static inline bool swAxisAlignedQuadOutsideView(SWRenderer* sw,
++                                                float wx0, float wy0,
++                                                float wx1, float wy1,
++                                                float angleDeg) {
++    const float epsilon = 1e-6f;
++    if (fabsf(angleDeg) >= epsilon ||
++        fabsf(sw->worldToScreen.m[1]) >= epsilon ||
++        fabsf(sw->worldToScreen.m[4]) >= epsilon)
++        return false;
++
++    float sx0, sy0, sx1, sy1;
++    worldToScreen(sw, wx0, wy0, &sx0, &sy0);
++    worldToScreen(sw, wx1, wy1, &sx1, &sy1);
++    return swAxisBoundsOutsideScissor(sx0, sy0, sx1, sy1,
++                                     sw->scissorX, sw->scissorY,
++                                     sw->scissorW, sw->scissorH);
++}
++
+ // ===[ Sprite Drawing ]===
+ 
+ static void swDrawSprite(Renderer* renderer, int32_t tpagIndex, float x, float y, float originX, float originY, float xscale, float yscale, float angleDeg, uint32_t color, float alpha) {
+@@ -1251,6 +1273,18 @@ static void swDrawSprite(Renderer* renderer, int32_t tpagIndex, float x, float y
+     if (0 > tpagIndex || dw->tpag.count <= (uint32_t) tpagIndex) return;
+ 
+     TexturePageItem* tpag = &dw->tpag.items[tpagIndex];
++    float localX0 = (float) tpag->targetX - originX;
++    float localY0 = (float) tpag->targetY - originY;
++    float localX1 = localX0 + (float) tpag->sourceWidth;
++    float localY1 = localY0 + (float) tpag->sourceHeight;
++    if (swAxisAlignedQuadOutsideView(sw,
++                                     x + localX0 * xscale,
++                                     y + localY0 * yscale,
++                                     x + localX1 * xscale,
++                                     y + localY1 * yscale,
++                                     angleDeg))
++        return;
++
+     int16_t pageId = tpag->texturePageId;
+     if (0 > pageId || sw->textureCount <= (uint32_t) pageId) return;
+     if (!swEnsureTextureLoaded(sw, (uint32_t)pageId)) return;
+@@ -1267,11 +1301,6 @@ static void swDrawSprite(Renderer* renderer, int32_t tpagIndex, float x, float y
+     float v1 = (float) (tpag->sourceY + tpag->sourceHeight) / (float) texH;
+ 
+     // Compute local quad corners (with target offset and origin)
+-    float localX0 = (float) tpag->targetX - originX;
+-    float localY0 = (float) tpag->targetY - originY;
+-    float localX1 = localX0 + (float) tpag->sourceWidth;
+-    float localY1 = localY0 + (float) tpag->sourceHeight;
+-
+     // Build 2D model transform
+     float angleRad = -angleDeg * ((float) M_PI / 180.0f);
+     Matrix4f transform;
+@@ -1319,6 +1348,12 @@ static void swDrawSpritePart(Renderer* renderer, int32_t tpagIndex, int32_t srcO
+     if (0 > tpagIndex || dw->tpag.count <= (uint32_t) tpagIndex) return;
+ 
+     TexturePageItem* tpag = &dw->tpag.items[tpagIndex];
++    if (swAxisAlignedQuadOutsideView(sw, x, y,
++                                     x + (float)srcW * xscale,
++                                     y + (float)srcH * yscale,
++                                     angleDeg))
++        return;
++
+     int16_t pageId = tpag->texturePageId;
+     if (0 > pageId || sw->textureCount <= (uint32_t) pageId) return;
+     if (!swEnsureTextureLoaded(sw, (uint32_t)pageId)) return;
+diff --git a/src/vm_builtins.c b/src/vm_builtins.c
+index 1091b1f..e56df51 100644
+--- a/src/vm_builtins.c
++++ b/src/vm_builtins.c
+@@ -8615,6 +8615,33 @@ static RValue builtin_instance_deactivate_object(VMContext* ctx, RValue* args, i
+     return RValue_makeUndefined();
+ }
+ 
++static bool instanceOutsideActivationRegion(Runner* runner, DataWin* dataWin,
++                                            Instance* inst, GMLReal left,
++                                            GMLReal top, GMLReal right,
++                                            GMLReal bottom) {
++    // A clean instance with retained collision cells cannot have moved since
++    // the grid computed this exact bbox. This is the overwhelmingly common
++    // AM2R activation path and avoids recomputing sprite transforms and
++    // compatibility rounding for every small-region query.
++    if (inst->collisionGridBBoxValid &&
++        arrlen(inst->collisionCells) != 0) {
++        return inst->collisionGridRight < left ||
++               inst->collisionGridLeft > right ||
++               inst->collisionGridBottom < top ||
++               inst->collisionGridTop > bottom;
++    }
++
++    Sprite* spr = Collision_getSprite(dataWin, inst);
++    if (spr != nullptr) {
++        InstanceBBox bbox = Collision_computeBBox(runner, inst);
++        return bbox.right < left || bbox.left > right ||
++               bbox.bottom < top || bbox.top > bottom;
++    }
++
++    return inst->x > right || left > inst->x ||
++           inst->y > bottom || top > inst->y;
++}
++
+ static RValue builtin_instance_activate_region(VMContext* ctx, RValue* args, int32_t argCount) {
+     if (5 > argCount) return RValue_makeUndefined();
+     Runner* runner = ctx->runner;
+@@ -8628,25 +8655,49 @@ static RValue builtin_instance_activate_region(VMContext* ctx, RValue* args, int
+     GMLReal right = left + width - 1;
+     GMLReal bottom = top + height - 1;
+ 
+-    // We don't use SpatialGrid here because inactive instances are NOT included in the SpatialGrid
++    // AM2R keeps clean deactivated instances in their existing grid cells so
++    // collision queries can ignore them without rebuilding the entire room on
++    // every deactivate-object/activate-region cycle. For the common "activate
++    // inside" form, those retained cells also provide a conservative candidate
++    // set. Exact bounding-box checks below preserve GameMaker semantics.
++    if (wantInside && runner->spatialGrid != nullptr &&
++        right >= left && bottom >= top) {
++        SpatialGrid* grid = runner->spatialGrid;
++        // Flush newly created or moved inactive instances before choosing
++        // candidates. The grid indexes sprite-less origins as well as sprite
++        // bboxes, so this is the complete GameMaker activation set.
++        SpatialGrid_syncGrid(runner, grid);
++        SpatialGridRange range = SpatialGrid_computeCellRange(grid, left, top, right, bottom);
++        uint32_t queryId = ++runner->collisionQueryCounter;
++
++        for (int32_t gx = range.minGridX; gx <= range.maxGridX; gx++) {
++            for (int32_t gy = range.minGridY; gy <= range.maxGridY; gy++) {
++                Instance** cell = grid->grid[SpatialGrid_cellIndex(grid, gx, gy)];
++                repeat(arrlen(cell), i) {
++                    Instance* inst = cell[i];
++                    if (inst->active || inst->destroyed) continue;
++                    if (inst->lastCollisionQueryId == queryId) continue;
++                    inst->lastCollisionQueryId = queryId;
++                    if (SpatialGrid_instanceHasCellFullyInsideBounds(
++                            inst, left, top, right, bottom) ||
++                        !instanceOutsideActivationRegion(runner, dataWin, inst,
++                                                         left, top, right, bottom))
++                        Runner_setActiveState(runner, inst, true);
++                }
++            }
++        }
++
++        return RValue_makeUndefined();
++    }
++
++    // Activating everything outside a region cannot be reduced to a small
++    // grid query, so retain the complete compatibility path for that form.
+     int instances = arrlen(runner->instances);
+     repeat(instances, i) {
+         Instance* inst = runner->instances[i];
+         if (inst->active || inst->destroyed) continue;
+-
+-        bool outside = false;
+-        Sprite* spr = Collision_getSprite(dataWin, inst);
+-        if (spr != nullptr) {
+-            InstanceBBox bbox = Collision_computeBBox(runner, inst);
+-            if (bbox.right < left || bbox.left > right || bbox.bottom < top || bbox.top > bottom) {
+-                outside = true;
+-            }
+-        } else {
+-            if (inst->x > right || left > inst->x || inst->y > bottom || top > inst->y) {
+-                outside = true;
+-            }
+-        }
+-
++        bool outside = instanceOutsideActivationRegion(runner, dataWin, inst,
++                                                       left, top, right, bottom);
+         if (outside != wantInside) Runner_setActiveState(ctx->runner, inst, true);
+     }
+     return RValue_makeUndefined();
+@@ -12029,6 +12080,42 @@ static RValue builtin_place_meeting(VMContext* ctx, RValue* args, int32_t argCou
+ // GameMaker rounds the coordinates when in collision compatibility mode
+ static inline GMLReal compatRoundCoord(GMLReal v) { return GMLReal_bankersRound(v); }
+ 
++// Mark the instances whose spatial cells overlap a collision query. Callers
++// still walk their normal per-object snapshot afterwards, so GameMaker's
++// first-match/creation ordering is preserved exactly; this only avoids doing
++// transformed bbox and precise-mask work for distant instances.
++static uint32_t markCollisionCandidatesInBounds(Runner* runner,
++                                                GMLReal left, GMLReal top,
++                                                GMLReal right, GMLReal bottom,
++                                                int32_t target) {
++    SpatialGrid_syncGrid(runner, runner->spatialGrid);
++    SpatialGridQuery query = SpatialGrid_prepareQuery(
++        runner, left, top, right, bottom, target);
++
++    for (int32_t gx = query.range.minGridX;
++         gx <= query.range.maxGridX; ++gx) {
++        for (int32_t gy = query.range.minGridY;
++             gy <= query.range.maxGridY; ++gy) {
++            Instance** cell = runner->spatialGrid->grid[
++                SpatialGrid_cellIndex(runner->spatialGrid, gx, gy)];
++            repeat(arrlen(cell), ci) {
++                Instance* inst = cell[ci];
++                if (inst->lastCollisionQueryId == query.queryId) continue;
++                if (!inst->active || inst->destroyed) continue;
++                if (!query.matchAll && query.filterByObject &&
++                    !VM_isObjectOrDescendant(runner->dataWin,
++                                             inst->objectIndex, target))
++                    continue;
++                if (!query.matchAll && query.filterByInstanceId &&
++                    inst->instanceId != (uint32_t)target)
++                    continue;
++                inst->lastCollisionQueryId = query.queryId;
++            }
++        }
++    }
++    return query.queryId;
++}
++
+ // collision_line(x1, y1, x2, y2, obj, prec, notme)
+ static RValue builtin_collision_line(VMContext* ctx, RValue* args, int32_t argCount) {
+     if (7 > argCount) return RValue_makeReal((GMLReal) INSTANCE_NOONE);
+@@ -12042,6 +12129,9 @@ static RValue builtin_collision_line(VMContext* ctx, RValue* args, int32_t argCo
+     int32_t prec = RValue_toInt32(args[5]);
+     int32_t notme = RValue_toInt32(args[6]);
+ 
++    if (targetObjIndex == INSTANCE_NOONE)
++        return RValue_makeReal((GMLReal) INSTANCE_NOONE);
++
+     if (runner->collisionCompatibilityMode) {
+         lx1 = compatRoundCoord(lx1); ly1 = compatRoundCoord(ly1);
+         lx2 = compatRoundCoord(lx2); ly2 = compatRoundCoord(ly2);
+@@ -12049,6 +12139,10 @@ static RValue builtin_collision_line(VMContext* ctx, RValue* args, int32_t argCo
+ 
+     Instance* self = ctx->currentInstance;
+ 
++    uint32_t candidateQueryId = markCollisionCandidatesInBounds(
++        runner, GMLReal_fmin(lx1, lx2), GMLReal_fmin(ly1, ly2),
++        GMLReal_fmax(lx1, lx2), GMLReal_fmax(ly1, ly2), targetObjIndex);
++
+     int32_t resultId = INSTANCE_NOONE;
+     int32_t snapBase = Runner_pushInstancesForTarget(runner, targetObjIndex);
+     int32_t snapEnd  = (int32_t) arrlen(runner->instanceSnapshots);
+@@ -12056,6 +12150,7 @@ static RValue builtin_collision_line(VMContext* ctx, RValue* args, int32_t argCo
+         Instance* inst = runner->instanceSnapshots[snapIdx];
+         if (!inst->active) continue;
+         if (notme && inst == self) continue;
++        if (inst->lastCollisionQueryId != candidateQueryId) continue;
+ 
+         if (!Collision_lineOverlapsInstance(ctx->runner, inst, lx1, ly1, lx2, ly2)) continue;
+         InstanceBBox bbox = Collision_computeBBox(ctx->runner, inst);
+@@ -12217,6 +12312,9 @@ static RValue builtin_collision_rectangle(VMContext* ctx, RValue* args, int32_t
+     int32_t prec = RValue_toInt32(args[5]);
+     int32_t notme = RValue_toInt32(args[6]);
+ 
++    if (targetObjIndex == INSTANCE_NOONE)
++        return RValue_makeReal((GMLReal) INSTANCE_NOONE);
++
+     if (runner->collisionCompatibilityMode) {
+         x1 = compatRoundCoord(x1); y1 = compatRoundCoord(y1);
+         x2 = compatRoundCoord(x2); y2 = compatRoundCoord(y2);
+@@ -12228,6 +12326,9 @@ static RValue builtin_collision_rectangle(VMContext* ctx, RValue* args, int32_t
+ 
+     Instance* self = ctx->currentInstance;
+ 
++    uint32_t candidateQueryId = markCollisionCandidatesInBounds(
++        runner, x1, y1, x2, y2, targetObjIndex);
++
+     int32_t resultId = INSTANCE_NOONE;
+     int32_t snapBase = Runner_pushInstancesForTarget(runner, targetObjIndex);
+     int32_t snapEnd  = (int32_t) arrlen(runner->instanceSnapshots);
+@@ -12235,6 +12336,7 @@ static RValue builtin_collision_rectangle(VMContext* ctx, RValue* args, int32_t
+         Instance* inst = runner->instanceSnapshots[snapIdx];
+         if (!inst->active) continue;
+         if (notme && inst == self) continue;
++        if (inst->lastCollisionQueryId != candidateQueryId) continue;
+ 
+         if (!Collision_rectOverlapsInstance(ctx->runner, inst, x1, y1, x2, y2)) continue;
+ 

@@ -121,9 +121,17 @@ int main(int argc, char **argv)
 	bool left_walk = false;
 	bool left_traverse = false;
 	bool right_traverse = false;
+	bool door_right = false;
+	bool pacing_loop = false;
+	bool pacing_long = false;
+	bool pacing_morph = false;
+	bool pacing_jump = false;
 	bool metroid_test = false;
+	bool robot_test = false;
 	bool continue_save = false;
 	bool select_save = false;
+	bool subscreen_cycle = false;
+	bool subscreen_logs = false;
 	bool have_delay = false;
 	for (int i = 1; i < argc; ++i) {
 		if (!strcmp(argv[i], "--gameplay")) {
@@ -165,28 +173,53 @@ int main(int argc, char **argv)
 		} else if (!strcmp(argv[i], "--right-traverse")) {
 			if (right_traverse) goto usage;
 			right_traverse = true;
+		} else if (!strcmp(argv[i], "--door-right")) {
+			if (door_right) goto usage;
+			door_right = true;
+		} else if (!strcmp(argv[i], "--pacing-loop")) {
+			if (pacing_loop) goto usage;
+			pacing_loop = true;
+		} else if (!strcmp(argv[i], "--pacing-long")) {
+			if (pacing_long) goto usage;
+			pacing_long = true;
+		} else if (!strcmp(argv[i], "--pacing-morph")) {
+			if (pacing_morph) goto usage;
+			pacing_morph = true;
+		} else if (!strcmp(argv[i], "--pacing-jump")) {
+			if (pacing_jump) goto usage;
+			pacing_jump = true;
 		} else if (!strcmp(argv[i], "--metroid-test")) {
 			if (metroid_test) goto usage;
 			metroid_test = true;
+		} else if (!strcmp(argv[i], "--robot-test")) {
+			if (robot_test) goto usage;
+			robot_test = true;
 		} else if (!strcmp(argv[i], "--continue-save")) {
 			if (continue_save) goto usage;
 			continue_save = true;
 		} else if (!strcmp(argv[i], "--select-save")) {
 			if (select_save) goto usage;
 			select_save = true;
+		} else if (!strcmp(argv[i], "--subscreen-cycle")) {
+			if (subscreen_cycle) goto usage;
+			subscreen_cycle = true;
+		} else if (!strcmp(argv[i], "--subscreen-logs")) {
+			if (subscreen_logs) goto usage;
+			subscreen_logs = true;
 		} else {
 			if (have_delay || parse_delay(argv[i], &initial_delay_ms)) goto usage;
 			have_delay = true;
 		}
 	}
 	if ((traverse && !gameplay) ||
-	    ((bindings || bindable_save || mapped_save || install_bindable_map || start_only || jump_loop || left_fall || right_walk || left_walk || left_traverse || right_traverse || metroid_test || continue_save || select_save) &&
+	    ((bindings || bindable_save || mapped_save || install_bindable_map || start_only || jump_loop || left_fall || right_walk || left_walk || left_traverse || right_traverse || door_right || pacing_loop || pacing_long || pacing_morph || pacing_jump || metroid_test || robot_test || continue_save || select_save || subscreen_cycle || subscreen_logs) &&
 	     (gameplay || traverse)) ||
 	    ((int)bindings + (int)bindable_save + (int)mapped_save +
 	     (int)install_bindable_map + (int)start_only +
 	     (int)jump_loop + (int)left_fall + (int)right_walk + (int)left_walk +
-	     (int)left_traverse + (int)right_traverse + (int)metroid_test +
-	     (int)continue_save + (int)select_save > 1)) goto usage;
+	     (int)left_traverse + (int)right_traverse + (int)door_right + (int)pacing_loop + (int)pacing_long + (int)pacing_morph + (int)pacing_jump + (int)metroid_test + (int)robot_test +
+	     (int)continue_save + (int)select_save + (int)subscreen_cycle +
+	     (int)subscreen_logs > 1)) goto usage;
 
 	if (install_bindable_map) {
 		// Install before launching the core so Main reads this controller's
@@ -270,9 +303,17 @@ int main(int argc, char **argv)
 	       left_walk ? "left-walk" :
 	       left_traverse ? "left-traverse" :
 	       right_traverse ? "right-traverse" :
+	       door_right ? "door-right" :
+	       pacing_loop ? "pacing-loop" :
+	       pacing_long ? "pacing-long" :
+	       pacing_morph ? "pacing-morph" :
+	       pacing_jump ? "pacing-jump" :
 	       metroid_test ? "metroid-test" :
+	       robot_test ? "robot-test" :
 	       continue_save ? "continue-save" :
 	       select_save ? "select-save" :
+	       subscreen_cycle ? "subscreen-cycle" :
+	       subscreen_logs ? "subscreen-logs" :
 	       (bindings ? "bindings" : (gameplay ? "gameplay" : "boot")),
 	       initial_delay_ms);
 	fflush(stdout);
@@ -292,6 +333,47 @@ int main(int argc, char **argv)
 		if (pulse_button(fd, BTN_SOUTH, 120) || sleep_ms(1000) ||
 		    pulse_button(fd, BTN_EAST, 220) || sleep_ms(1800) ||
 		    pulse_button(fd, BTN_EAST, 220) || sleep_ms(5000)) goto io_error;
+	} else if (subscreen_cycle) {
+		// AM2R enters the subscreen through Start. Its MenuCancel action is the
+		// core's Missiles button, and the four-way chooser selects Map (up),
+		// Equipment (right), Logs (left), or Options (down). Exercise every page
+		// and dwell on Equipment while moving the selection so capture can expose
+		// both static flicker and per-input cadence problems.
+		if (pulse_button(fd, BTN_SOUTH, 120) || sleep_ms(7000) ||
+		    pulse_button(fd, BTN_START, 200) || sleep_ms(2500) ||
+		    pulse_button(fd, BTN_NORTH, 160) || sleep_ms(500) ||
+		    emit(fd, EV_ABS, ABS_HAT0Y, -1) || sync_event(fd) ||
+		    sleep_ms(160) || emit(fd, EV_ABS, ABS_HAT0Y, 0) || sync_event(fd) ||
+		    sleep_ms(3500) ||
+		    pulse_button(fd, BTN_NORTH, 160) || sleep_ms(500) ||
+		    emit(fd, EV_ABS, ABS_HAT0X, 1) || sync_event(fd) ||
+		    sleep_ms(160) || emit(fd, EV_ABS, ABS_HAT0X, 0) || sync_event(fd) ||
+		    sleep_ms(2500)) goto io_error;
+		for (int move = 0; move < 12; ++move) {
+			int direction = (move & 1) ? -1 : 1;
+			if (emit(fd, EV_ABS, ABS_HAT0Y, direction) || sync_event(fd) ||
+			    sleep_ms(120) || emit(fd, EV_ABS, ABS_HAT0Y, 0) ||
+			    sync_event(fd) || sleep_ms(650)) goto io_error;
+		}
+		if (pulse_button(fd, BTN_NORTH, 160) || sleep_ms(500) ||
+		    emit(fd, EV_ABS, ABS_HAT0X, -1) || sync_event(fd) ||
+		    sleep_ms(160) || emit(fd, EV_ABS, ABS_HAT0X, 0) || sync_event(fd) ||
+		    sleep_ms(3500) ||
+		    pulse_button(fd, BTN_NORTH, 160) || sleep_ms(500) ||
+		    emit(fd, EV_ABS, ABS_HAT0Y, 1) || sync_event(fd) ||
+		    sleep_ms(160) || emit(fd, EV_ABS, ABS_HAT0Y, 0) || sync_event(fd) ||
+		    sleep_ms(3500) || pulse_button(fd, BTN_START, 200) ||
+		    sleep_ms(3000)) goto io_error;
+	} else if (subscreen_logs) {
+		// Enter the subscreen, open the four-way page chooser, and select Logs.
+		// Keep the controller alive so the page remains suitable for long-run
+		// video and renderer profiling without another hot-plug assignment.
+		if (pulse_button(fd, BTN_SOUTH, 120) || sleep_ms(1000) ||
+		    pulse_button(fd, BTN_START, 200) || sleep_ms(2500) ||
+		    pulse_button(fd, BTN_NORTH, 160) || sleep_ms(500) ||
+		    emit(fd, EV_ABS, ABS_HAT0X, -1) || sync_event(fd) ||
+		    sleep_ms(160) || emit(fd, EV_ABS, ABS_HAT0X, 0) || sync_event(fd) ||
+		    sleep_ms(15000)) goto io_error;
 	} else if (metroid_test) {
 		// The save owns missiles but starts with the beam selected. Arm them with
 		// the dedicated Missiles/Y action (Weapon Select/Select is a different
@@ -311,6 +393,29 @@ int main(int argc, char **argv)
 		}
 		if (emit(fd, EV_KEY, BTN_TR, 0) ||
 		    sync_event(fd) || sleep_ms(3000)) goto io_error;
+	} else if (robot_test) {
+		// The attached robot checkpoint places Samus immediately to the right of
+		// a tall target. The supplied checkpoint already has missiles selected;
+		// pressing the cycle-style Missiles action here turns them *off*. Preserve
+		// that checkpoint state, face left, and sweep separated jump heights so a
+		// real missile intersects Torizo's upper collision object.
+		if (pulse_button(fd, BTN_SOUTH, 120) || sleep_ms(300) ||
+		    emit(fd, EV_ABS, ABS_HAT0X, -1) || sync_event(fd) ||
+		    sleep_ms(180) || emit(fd, EV_ABS, ABS_HAT0X, 0) ||
+		    sync_event(fd) || sleep_ms(250)) goto io_error;
+		const unsigned long rise_ms[] = {
+			100, 160, 220, 280, 340, 400, 460, 520,
+		};
+		for (size_t shot = 0; shot < sizeof(rise_ms) / sizeof(rise_ms[0]); ++shot) {
+			printf("robot head shot %zu/8 rise_ms=%lu\n",
+			       shot + 1, rise_ms[shot]);
+			fflush(stdout);
+			if (emit(fd, EV_KEY, BTN_EAST, 1) || sync_event(fd) ||
+			    sleep_ms(rise_ms[shot]) || pulse_button(fd, BTN_WEST, 140) ||
+			    sleep_ms(90) || emit(fd, EV_KEY, BTN_EAST, 0) ||
+			    sync_event(fd) || sleep_ms(1100)) goto io_error;
+		}
+		if (sleep_ms(2500)) goto io_error;
 	} else if (jump_loop) {
 		// Assign the newly created controller before the measured sequence, then
 		// let MiSTer's transient controller-map notification disappear. BTN_SOUTH
@@ -323,6 +428,19 @@ int main(int argc, char **argv)
 			if (pulse_button(fd, BTN_EAST, 180) || sleep_ms(1000))
 				goto io_error;
 		}
+	} else if (door_right) {
+		// Open a door Samus is already facing, then cross the boundary. This is
+		// deliberately separate from traversal so hardware QA never fires while
+		// merely measuring room pacing.
+		if (pulse_button(fd, BTN_SOUTH, 120) || sleep_ms(1000) ||
+		    pulse_button(fd, BTN_WEST, 250) || sleep_ms(900) ||
+		    emit(fd, EV_ABS, ABS_HAT0X, 1) || sync_event(fd)) goto io_error;
+		for (int jump = 0; jump < 12; ++jump) {
+			if (pulse_button(fd, BTN_EAST, 550) || sleep_ms(250))
+				goto io_error;
+		}
+		if (emit(fd, EV_ABS, ABS_HAT0X, 0) || sync_event(fd) ||
+		    sleep_ms(3000)) goto io_error;
 	} else if (left_traverse || right_traverse) {
 		if (pulse_button(fd, BTN_SOUTH, 120) || sleep_ms(1500) ||
 		    emit(fd, EV_ABS, ABS_HAT0X, right_traverse ? 1 : -1) || sync_event(fd)) goto io_error;
@@ -334,6 +452,77 @@ int main(int argc, char **argv)
 		}
 		if (emit(fd, EV_ABS, ABS_HAT0X, 0) || sync_event(fd) ||
 		    sleep_ms(5000)) goto io_error;
+	} else if (pacing_loop) {
+		// Assign once, wait for MiSTer's transient controller notification to
+		// disappear, then oscillate inside the current room. Short legs avoid
+		// room exits so a capture measures steady frame cadence rather than
+		// texture loading or controller hot-plug work.
+		if (pulse_button(fd, BTN_SOUTH, 120) || sleep_ms(7000)) goto io_error;
+		for (int pass = 0; pass < 20; ++pass) {
+			int direction = (pass & 1) ? 1 : -1;
+			if (emit(fd, EV_ABS, ABS_HAT0X, direction) || sync_event(fd) ||
+			    sleep_ms(500)) goto io_error;
+		}
+		if (emit(fd, EV_ABS, ABS_HAT0X, 0) || sync_event(fd) ||
+		    sleep_ms(3000)) goto io_error;
+	} else if (pacing_long) {
+		// Use long, separately identifiable legs for frame-cadence capture. The
+		// short pacing loop can produce identical frames exactly when direction
+		// changes, which adjacent-frame hashes cannot distinguish from a miss.
+		if (pulse_button(fd, BTN_SOUTH, 120) || sleep_ms(7000)) goto io_error;
+		for (int pass = 0; pass < 8; ++pass) {
+			int direction = (pass & 1) ? 1 : -1;
+			printf("pacing leg %d/8 direction=%d\n", pass + 1, direction);
+			fflush(stdout);
+			if (emit(fd, EV_ABS, ABS_HAT0X, direction) || sync_event(fd) ||
+			    sleep_ms(1500)) goto io_error;
+		}
+		if (emit(fd, EV_ABS, ABS_HAT0X, 0) || sync_event(fd) ||
+		    sleep_ms(3000)) goto io_error;
+	} else if (pacing_morph) {
+		// Slot 2's morph-ball corridor is only about 52 pixels wide. A 300 ms
+		// leg reaches a wall and turns the intended pacing sample into collision
+		// and reversal delay. Reverse after 150 ms so the ball remains in the
+		// corridor's free span while repeatedly traversing the same scenery.
+		// Send Down twice before the measured route as well: that is AM2R's
+		// native Morph Ball command and is harmless when a checkpoint already
+		// contains a transformed Samus.
+		if (pulse_button(fd, BTN_SOUTH, 120) || sleep_ms(7000) ||
+		    emit(fd, EV_ABS, ABS_HAT0Y, 1) || sync_event(fd) ||
+		    sleep_ms(120) || emit(fd, EV_ABS, ABS_HAT0Y, 0) || sync_event(fd) ||
+		    sleep_ms(180) || emit(fd, EV_ABS, ABS_HAT0Y, 1) || sync_event(fd) ||
+		    sleep_ms(120) || emit(fd, EV_ABS, ABS_HAT0Y, 0) || sync_event(fd) ||
+		    sleep_ms(1000)) goto io_error;
+		for (int pass = 0; pass < 80; ++pass) {
+			int direction = (pass & 1) ? 1 : -1;
+			printf("morph leg %d/80 direction=%d\n", pass + 1, direction);
+			fflush(stdout);
+			if (emit(fd, EV_ABS, ABS_HAT0X, direction) || sync_event(fd) ||
+			    sleep_ms(150)) goto io_error;
+		}
+		if (emit(fd, EV_ABS, ABS_HAT0X, 0) || sync_event(fd) ||
+		    sleep_ms(3000)) goto io_error;
+	} else if (pacing_jump) {
+		// Alternate half-second diagonal jumps exactly as requested for the
+		// supplied pacing room. Direction remains held for the complete 500 ms
+		// leg while Jump is held for its first 220 ms. Releasing direction between
+		// legs makes every reversal visible in both input and motion telemetry.
+		if (pulse_button(fd, BTN_SOUTH, 120) || sleep_ms(7000)) goto io_error;
+		for (int pass = 0; pass < 24; ++pass) {
+			int direction = (pass & 1) ? 1 : -1;
+			printf("diagonal jump %d/24 direction=%d\n", pass + 1, direction);
+			fflush(stdout);
+			// The MiSTer mapper assigns this synthetic pad's BTN_EAST to the
+			// core's Jump action (shared mask bit 5), irrespective of the Linux
+			// face-position name. Keep this aligned with the verified mask log.
+			if (emit(fd, EV_ABS, ABS_HAT0X, direction) ||
+			    emit(fd, EV_KEY, BTN_EAST, 1) || sync_event(fd) ||
+			    sleep_ms(220) || emit(fd, EV_KEY, BTN_EAST, 0) ||
+			    sync_event(fd) || sleep_ms(280) ||
+			    emit(fd, EV_ABS, ABS_HAT0X, 0) || sync_event(fd) ||
+			    sleep_ms(300)) goto io_error;
+		}
+		if (sleep_ms(3000)) goto io_error;
 	} else if (right_walk || left_walk) {
 		if (pulse_button(fd, BTN_SOUTH, 120) || sleep_ms(1500) ||
 		    emit(fd, EV_ABS, ABS_HAT0X, right_walk ? 1 : -1) || sync_event(fd) ||
@@ -433,7 +622,7 @@ int main(int argc, char **argv)
 	// south face button to core B. Use east here so the sequence confirms menu
 	// choices as well as proving that the game-facing A mapping survives the
 	// Main_MiSTer bridge.
-	if (bindings || bindable_save || mapped_save || start_only || jump_loop || left_fall || right_walk || left_walk || left_traverse || right_traverse || metroid_test || continue_save || select_save) {
+	if (bindings || bindable_save || mapped_save || start_only || jump_loop || left_fall || right_walk || left_walk || left_traverse || right_traverse || door_right || pacing_loop || pacing_long || pacing_morph || pacing_jump || metroid_test || continue_save || select_save || subscreen_cycle || subscreen_logs) {
 		// The semantic binding sequence above is complete.
 	} else if (traverse) {
 		if (emit(fd, EV_ABS, ABS_HAT0X, 1) || sync_event(fd)) goto io_error;
@@ -451,14 +640,14 @@ int main(int argc, char **argv)
 		    emit(fd, EV_ABS, ABS_HAT0X, 0) || sync_event(fd) || sleep_ms(1500)) goto io_error;
 	}
 
-	if (!bindings && !bindable_save && !mapped_save && !start_only && !jump_loop && !left_fall && !right_walk && !left_walk && !left_traverse && !metroid_test && !continue_save && !select_save)
+	if (!bindings && !bindable_save && !mapped_save && !start_only && !jump_loop && !left_fall && !right_walk && !left_walk && !left_traverse && !right_traverse && !door_right && !pacing_loop && !pacing_long && !pacing_morph && !pacing_jump && !metroid_test && !continue_save && !select_save && !subscreen_cycle && !subscreen_logs)
 		printf("A/d-pad sequence sent\n");
 	ioctl(fd, UI_DEV_DESTROY);
 	close(fd);
 	return 0;
 
 usage:
-	fprintf(stderr, "usage: %s [initial-delay-ms] [--gameplay] [--traverse] [--bindings|--bindable-save|--mapped-save|--install-bindable-map|--start-only|--jump-loop|--left-fall|--right-walk|--left-walk|--left-traverse|--right-traverse|--metroid-test|--continue-save|--select-save]\n", argv[0]);
+	fprintf(stderr, "usage: %s [initial-delay-ms] [--gameplay] [--traverse] [--bindings|--bindable-save|--mapped-save|--install-bindable-map|--start-only|--jump-loop|--left-fall|--right-walk|--left-walk|--left-traverse|--right-traverse|--door-right|--pacing-loop|--pacing-long|--pacing-morph|--pacing-jump|--metroid-test|--robot-test|--continue-save|--select-save|--subscreen-cycle|--subscreen-logs]\n", argv[0]);
 	return 2;
 
 io_error:

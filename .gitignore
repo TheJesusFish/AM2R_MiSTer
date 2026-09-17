@@ -10,6 +10,7 @@ __MACOSX/
 
 # Local data
 /data/
+/build/
 
 # Machine-specific engineering instructions, target inventory, and test logs
 /AGENTS.md

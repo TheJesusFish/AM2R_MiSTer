@@ -6,17 +6,33 @@ FPGA GPU handles the dominant clear, fill, blit, affine, alpha, additive, and
 presentation operations. Native 320×240, 59.94 Hz scanout feeds MiSTer's
 standard HDMI and analog-video paths.
 
-The current v24 engineering build launches as a normal MiSTer core, reaches
+The current engineering build launches as a normal MiSTer core, reaches
 gameplay, supports standard in-game saves and four persistent process-level
 save-state slots, and has been exercised on real MiSTer hardware. It remains a
 tester build rather than a claim of complete-game compatibility.
+
+The current runtime removes full-room collision-grid work from ordinary
+movement and local collision queries, retains exact indexed bounds across
+AM2R's repeated object activation cycle, and phase-locks ordinary 60 Hz game
+steps to a native-vblank heartbeat published by the FPGA. A corrected
+Morph Ball reproduction in the supplied room dropped from five repeated frames
+in 720 moving frames to one; the second affected room likewise had one repeat
+in 600 moving frames. That remaining repeat is expected when a 59.937 Hz source
+is recorded at 60.000 fps; live telemetry stayed near 59.8–60.1 fps. Older RBFs
+retain the compatible raster-period timer fallback.
+
+The in-game subscreen has also been exercised page-by-page on real hardware.
+Map, Equipment, Logs, and Options now stay in one atomic FPGA command stream;
+the Equipment connector-line and Logs gradient fallbacks that produced partial
+flashing frames are removed. The four-way chooser caches its quarter-turned
+art for the paired blitter, keeping repeated page changes at native cadence.
 
 This repository contains no AM2R game data. Testers must provide their own
 lawfully obtained AM2R 1.1 files and place the required files into a ZIP.
 
 ## Install a tester build
 
-Download `AM2R_MiSTer_Discord_Test_v24.zip` from the project's GitHub Release
+Download `AM2R_MiSTer_runtime.zip` from the project's GitHub Release
 and extract it at the root of the MiSTer SD card. It installs this layout:
 
 ```text
@@ -39,7 +55,9 @@ it to `/media/fat/games/am2r/AM2R.zip`. Any normal ZIP program can create it;
 compression level does not matter. Do not distribute the resulting archive.
 
 Launch **AM2R** from MiSTer's **Other** folder. The first launch validates and
-extracts the archive into RAM, so it takes longer than a warm relaunch.
+extracts the archive into a generated `.runtime-cache` beside `AM2R.zip`, so it
+takes longer than a warm relaunch. Later launches reuse the cache while the
+archive's size and modification time are unchanged.
 
 ## Files and saves
 
@@ -52,9 +70,15 @@ extracts the archive into RAM, so it takes longer than a warm relaunch.
 
 Normal AM2R saves and MiSTer save states are separate. Save states are full
 DMTCP process checkpoints, are tied to the exact frontend/runner build, and
-are intentionally rejected when incompatible. Saving a checkpoint can take
-about a minute on current hardware; loading is much faster. A near-instant
-implementation would require a game-specific serializer.
+are intentionally rejected when incompatible. Checkpoints are staged directly
+under `/media/fat/savestates/AM2R`, not in RAM; this prevents the Linux OOM
+killer from terminating the game while DMTCP creates a 150–180 MB image. At
+least 256 MiB must be free before capture begins. If it is not, the request is
+rejected, the previous slot remains valid, and gameplay resumes. The final file
+is published by an atomic same-filesystem rename. Wait for the **Save state
+written** message before loading or copying that slot. Save time depends heavily
+on SD/network storage and can approach 90 seconds on a nearly full card;
+hardware-tested loads completed in a few seconds.
 
 ## Controls
 
@@ -103,7 +127,7 @@ one scanline, not a frame; the UI inset adds no video buffering.
 
 ```text
 AM2R.zip
-   │ validated extraction to RAM
+   │ validated extraction to generated local cache
    ▼
 patched Butterscotch runner on ARM
    │ commands, textures, audio, input

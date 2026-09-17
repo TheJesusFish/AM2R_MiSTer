@@ -1,0 +1,211 @@
+diff --git a/src/backends/mister.c b/src/backends/mister.c
+index 9810f1c..5490a2a 100644
+--- a/src/backends/mister.c
++++ b/src/backends/mister.c
+@@ -153,6 +153,7 @@ static bool g_initialized = false;
+ static uint64_t g_gpu_opaque_coverage[MISTER_HEIGHT][MISTER_WIDTH / 64];
+ 
+ static bool openJoyShared(void);
++static void openVirtualInput(void);
+ 
+ static bool mapFramebuffer(void) {
+     g_fb_fd = open("/dev/fb0", O_RDWR | O_SYNC | O_CLOEXEC);
+@@ -2313,13 +2314,20 @@ bool MisterGpu_prepareSaveState(void) {
+         record->shadow_valid = true;
+     }
+ 
+-    // The wrapper owns and recreates this shared file on every core launch.
+-    // Never ask DMTCP to restore a mapping to the previous launch's inode.
++    // Event node numbers are assigned dynamically and can differ after a
++    // reboot or on another MiSTer.  Likewise, the wrapper recreates the joy
++    // shared file on every core launch.  Neither endpoint belongs in a
++    // portable checkpoint; rediscover both after the timeline is restored.
++    if (g_input_fd >= 0) {
++        close(g_input_fd);
++        g_input_fd = -1;
++    }
+     closeJoyShared();
+     return true;
+ }
+ 
+ void MisterGpu_afterSaveStateRestore(void) {
++    if (g_input_fd < 0) openVirtualInput();
+     if (g_joy_shm == NULL && !openJoyShared())
+         logWarn("MiSTer input: shared controller could not be reattached\n");
+     if (!g_gpu_available) return;
+diff --git a/src/loop.c b/src/loop.c
+index ddef2cb..a261848 100644
+--- a/src/loop.c
++++ b/src/loop.c
+@@ -67,6 +67,7 @@
+ #ifdef USE_MISTER
+ #include "am2r_savestate.h"
+ #include "backends/mister_gpu.h"
++#include <dlfcn.h>
+ #include <sys/socket.h>
+ #include <sys/syscall.h>
+ #include <sys/types.h>
+@@ -483,10 +484,46 @@ static void PreProcessedStuff_free(void) {
+ 
+ #ifdef USE_MISTER
+ static int am2rStateFd = -1;
++static void* am2rStateUnwindLibrary = nullptr;
+ static struct sockaddr_un am2rStateWrapperAddress;
+ static volatile sig_atomic_t am2rStateSignalAction = 0;
+ static volatile sig_atomic_t am2rStateSignalSlot = 0;
+ 
++// Calling libc's syscall() is not sufficient here: DMTCP interposes that
++// function too.  A checkpoint may be requested as soon as SNAPSHOT_READY is
++// sent, so every kernel operation from that point until the resume marker is
++// consumed must bypass DMTCP's wrapper locks completely.  MiSTer uses the ARM
++// EABI, whose syscall convention is r7 = number and r0-r5 = arguments.
++static inline long am2rRawSyscall6(long number, long argument0, long argument1,
++                                   long argument2, long argument3,
++                                   long argument4, long argument5) {
++    register long r0 __asm__("r0") = argument0;
++    register long r1 __asm__("r1") = argument1;
++    register long r2 __asm__("r2") = argument2;
++    register long r3 __asm__("r3") = argument3;
++    register long r4 __asm__("r4") = argument4;
++    register long r5 __asm__("r5") = argument5;
++    register long r7 __asm__("r7") = number;
++    __asm__ volatile("svc 0"
++                     : "+r"(r0)
++                     : "r"(r1), "r"(r2), "r"(r3), "r"(r4), "r"(r5), "r"(r7)
++                     : "memory", "cc");
++    return r0;
++}
++
++static inline long am2rRawSyscall3(long number, long argument0,
++                                   long argument1, long argument2) {
++    return am2rRawSyscall6(number, argument0, argument1, argument2, 0, 0, 0);
++}
++
++static inline long am2rRawSyscall1(long number, long argument0) {
++    return am2rRawSyscall6(number, argument0, 0, 0, 0, 0, 0);
++}
++
++static inline void am2rRawUnlink(const char* path) {
++    am2rRawSyscall3(SYS_unlinkat, AT_FDCWD, (long)path, 0);
++}
++
+ static void am2rStateSignalHandler(int signalNumber) {
+     int offset = signalNumber - SIGRTMIN;
+     if (offset >= 0 && offset < AM2R_STATE_SLOT_COUNT) {
+@@ -503,28 +540,29 @@ static void am2rStateClose(void) {
+     // plugin. Unix datagrams are unsupported there, and retaining their
+     // connection metadata makes an otherwise valid image crash on restart.
+     // This endpoint is always closed before capture and recreated afterward.
+-    if (am2rStateFd >= 0) syscall(SYS_close, am2rStateFd);
++    if (am2rStateFd >= 0) am2rRawSyscall1(SYS_close, am2rStateFd);
+     am2rStateFd = -1;
+-    unlink(AM2R_STATE_RUNNER_SOCKET);
++    am2rRawUnlink(AM2R_STATE_RUNNER_SOCKET);
+ }
+ 
+ static bool am2rStateOpen(void) {
+     am2rStateClose();
+-    am2rStateFd = (int)syscall(SYS_socket, AF_UNIX, SOCK_DGRAM, 0);
++    am2rStateFd = (int)am2rRawSyscall3(SYS_socket, AF_UNIX, SOCK_DGRAM, 0);
+     if (am2rStateFd < 0) return false;
+ 
+     struct sockaddr_un runnerAddress = {0};
+     runnerAddress.sun_family = AF_UNIX;
+     strncpy(runnerAddress.sun_path, AM2R_STATE_RUNNER_SOCKET,
+             sizeof(runnerAddress.sun_path) - 1);
+-    if (syscall(SYS_bind, am2rStateFd, (struct sockaddr*)&runnerAddress,
+-                sizeof(runnerAddress)) != 0) {
++    if (am2rRawSyscall3(SYS_bind, am2rStateFd,
++                        (long)(struct sockaddr*)&runnerAddress,
++                        sizeof(runnerAddress)) != 0) {
+         am2rStateClose();
+         return false;
+     }
+-    int flags = (int)syscall(SYS_fcntl, am2rStateFd, F_GETFL, 0);
++    int flags = (int)am2rRawSyscall3(SYS_fcntl, am2rStateFd, F_GETFL, 0);
+     if (flags >= 0)
+-        syscall(SYS_fcntl, am2rStateFd, F_SETFL, flags | O_NONBLOCK);
++        am2rRawSyscall3(SYS_fcntl, am2rStateFd, F_SETFL, flags | O_NONBLOCK);
+ 
+     memset(&am2rStateWrapperAddress, 0, sizeof(am2rStateWrapperAddress));
+     am2rStateWrapperAddress.sun_family = AF_UNIX;
+@@ -534,6 +572,15 @@ static bool am2rStateOpen(void) {
+ }
+ 
+ static void am2rStateInit(void) {
++    // glibc lazily opens libgcc_s on the first pthread-cancellation path.
++    // DMTCP's reconstructed checkpoint thread can be the first caller, where
++    // entering the dynamic loader on its temporary restore stack is unsafe on
++    // ARM.  Make the dependency and its loader bookkeeping part of the stable
++    // process image before any application or checkpoint threads are frozen.
++    am2rStateUnwindLibrary = dlopen("libgcc_s.so.1", RTLD_NOW | RTLD_GLOBAL);
++    if (am2rStateUnwindLibrary == nullptr)
++        logWarn("AM2R save states: could not preload libgcc_s: %s\n", dlerror());
++
+     struct sigaction action = {0};
+     action.sa_handler = am2rStateSignalHandler;
+     sigemptyset(&action.sa_mask);
+@@ -555,32 +602,40 @@ static bool am2rStateSend(Am2rStateMessageType type, int slot, int frame, int er
+         .frame = frame,
+         .error = error,
+     };
+-    return syscall(SYS_sendto, am2rStateFd, &message, sizeof(message), MSG_NOSIGNAL,
+-                   (struct sockaddr*)&am2rStateWrapperAddress,
+-                   sizeof(am2rStateWrapperAddress)) == (ssize_t)sizeof(message);
++    return am2rRawSyscall6(SYS_sendto, am2rStateFd, (long)&message,
++                           sizeof(message), MSG_NOSIGNAL,
++                           (long)(struct sockaddr*)&am2rStateWrapperAddress,
++                           sizeof(am2rStateWrapperAddress)) == (ssize_t)sizeof(message);
+ }
+ 
+ static bool am2rStateReceive(Am2rStateMessage* message) {
+     if (am2rStateFd < 0) return false;
+-    ssize_t count = syscall(SYS_recvfrom, am2rStateFd, message, sizeof(*message),
+-                            MSG_DONTWAIT, nullptr, nullptr);
++    ssize_t count = am2rRawSyscall6(SYS_recvfrom, am2rStateFd, (long)message,
++                                    sizeof(*message), MSG_DONTWAIT, 0, 0);
+     return count == (ssize_t)sizeof(*message) && message->magic == AM2R_STATE_MAGIC;
+ }
+ 
+ static int am2rStateWaitForResume(void) {
+-    // The wrapper creates this marker only after the checkpoint image has been
+-    // completely copied into its durable slot. The same wait is restored from
+-    // disk, so no inherited pipe or socket is required across a core exit.
++    // The wrapper publishes this marker atomically after the checkpoint image
++    // is complete. The same wait is restored from disk, so no inherited pipe
++    // or socket is required across a core exit.
+     for (int wait = 0; wait < 180000; ++wait) {
+-        int marker = open(AM2R_STATE_RESUME_PATH, O_RDONLY);
++        int marker = (int)am2rRawSyscall6(SYS_openat, AT_FDCWD,
++                                          (long)AM2R_STATE_RESUME_PATH,
++                                          O_RDONLY | O_CLOEXEC, 0, 0, 0);
+         if (marker >= 0) {
+             char result[24] = {0};
+-            ssize_t count = read(marker, result, sizeof(result) - 1);
+-            close(marker);
+-            unlink(AM2R_STATE_RESUME_PATH);
+-            return count > 0 ? atoi(result) : EIO;
++            ssize_t count = am2rRawSyscall3(SYS_read, marker, (long)result,
++                                            sizeof(result) - 1);
++            am2rRawSyscall1(SYS_close, marker);
++            if (count > 0) {
++                am2rRawUnlink(AM2R_STATE_RESUME_PATH);
++                return atoi(result);
++            }
+         }
+-        usleep(1000);
++        struct timespec delay = { .tv_sec = 0, .tv_nsec = 1000000 };
++        while (am2rRawSyscall3(SYS_nanosleep, (long)&delay,
++                               (long)&delay, 0) == -EINTR) {}
+     }
+     return ETIMEDOUT;
+ }
+@@ -604,7 +659,7 @@ static bool am2rStateSave(Runner* runner, int slot) {
+         return false;
+     }
+     fflush(nullptr);
+-    unlink(AM2R_STATE_RESUME_PATH);
++    am2rRawUnlink(AM2R_STATE_RESUME_PATH);
+     if (!am2rStateSend(AM2R_STATE_SNAPSHOT_READY, slot, runner->frameCount, 0)) {
+         int savedError = errno;
+ #ifdef USE_MINIAUDIO

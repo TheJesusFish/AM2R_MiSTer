@@ -28,6 +28,7 @@ module am2r_native_reader (
 	input      [31:0]  source_frame,
 	input       [1:0]  source_buffer,
 	output             frame_ready,
+	output     [31:0]  scanout_frame,
 	output reg         buffer_in_use_valid,
 	output reg  [1:0]  buffer_in_use,
 	output reg  [7:0]  r_out,
@@ -48,11 +49,12 @@ module am2r_native_reader (
 	localparam integer FIFO_WORDS = 8192;
 	localparam [8:0] PRELOAD_LINES = 9'd32;
 	localparam [12:0] REFILL_THRESHOLD = PRELOAD_LINES * LINE_WORDS - LINE_WORDS;
-	// A completed GPU frame that arrives just after the nominal vblank edge
-	// should not wait an additional 16.7 ms before scanout.  The first four
-	// blank lines leave ample time to discard the speculative preload and fetch
-	// 32 lines from the newly published buffer before active video begins.
-	localparam [2:0] LATE_LATCH_LINES = 3'd4;
+	// A completed GPU frame that arrives during vertical blank should not wait
+	// an additional 16.7 ms before scanout.  Sixteen blank lines cover the
+	// measured publication jitter while still leaving six complete scanlines
+	// (about 382 us) to discard the speculative FIFO contents and fetch the
+	// 32-line preload from the newly published buffer before active video.
+	localparam [4:0] LATE_LATCH_LINES = 5'd16;
 
 	reg [1:0] new_frame_sync = 0;
 	reg [1:0] new_line_sync = 0;
@@ -96,10 +98,11 @@ module am2r_native_reader (
 	reg [7:0] burst_words = 0;
 	reg preloading = 0;
 	reg [31:0] latched_source_frame = 0;
-	reg [2:0] vblank_line_count = 0;
+	reg [4:0] vblank_line_count = 0;
 	reg restart_pending = 0;
 	reg [31:0] pending_source_frame = 0;
 	reg [1:0] pending_source_buffer = 0;
+	assign scanout_frame = latched_source_frame;
 
 	function automatic [28:0] buffer_address;
 		input [1:0] buffer_index;

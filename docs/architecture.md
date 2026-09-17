@@ -41,7 +41,7 @@ scripted opening route remains an explicit user-test boundary.
 ## Component boundaries
 
 ```text
-User-supplied AM2R.zip → validated RAM extraction
+User-supplied AM2R.zip → validated generated local cache
                     |
 HPS frontend: normal core lifecycle, OSD, DMTCP slot coordinator
                     |
@@ -63,6 +63,8 @@ The command ABI is implemented in `rtl/am2r_gpu.sv` and
 `third_party/Butterscotch/src/backends/mister_gpu.h`:
 
 - control block `0x23ff0000` (`A2GP` magic);
+- native-vblank counter and `VBLK` capability word at control-block offsets
+  `0x40` and `0x44`;
 - alternating 64 KiB descriptor buffers at `0x23fe0000` and `0x23fd0000`;
 - texture pool beginning at `0x24000000`;
 - three 320×240 XRGB8888 native presentation buffers beginning at
@@ -89,20 +91,27 @@ not used.
 
 The normal-core frontend is `/media/fat/MiSTer_AM2R`, selected by the `[AM2R]`
 `main` mapping in `MiSTer.ini`. It validates the 45 required members in
-`/media/fat/games/am2r/AM2R.zip`, checks CRCs while extracting them to RAM,
+`/media/fat/games/am2r/AM2R.zip`, checks CRCs while extracting them to a
+generated cache beside the archive,
 starts the runner, services MiSTer OSD save/load triggers, and returns to the
 stock menu after the runner exits.
 
 Save states are DMTCP process checkpoints retained in four disk slots under
 `/media/fat/savestates/AM2R`. Before a checkpoint the runner waits for FPGA GPU
 completion, tears down the miniaudio worker/device, and disconnects its
-frontend socket. The wrapper waits for the coordinator to finish the image,
-then atomically commits both the uncompressed checkpoint and exact-build
-metadata. Format-3 metadata includes both the frontend build identifier and a
-CRC32 of the installed runner. Because DMTCP restores executable memory as well
-as game data, the wrapper rejects either mismatch before terminating the live
-game; this prevents an older checkpoint from silently replacing newer runtime
-fixes. An interrupted write cannot replace the previous good slot.
+frontend socket and dynamically numbered input endpoints. The coordinator
+captures the image in a hidden session directory beside the persistent slots,
+not in RAM; this avoids exhausting Linux memory while the live game process is
+resident. The frontend requires 256 MiB free before capture and releases the
+quiesced runner with `ENOSPC` without touching the prior slot when that check
+fails. After capture the game resumes and a background writer atomically
+publishes both the uncompressed checkpoint and exact-build metadata through a
+same-filesystem rename. Format-3 metadata includes both the frontend build
+identifier and a CRC32 of the installed runner. Because DMTCP restores
+executable memory as well as game data, the wrapper rejects either mismatch
+before terminating the live game; this prevents an older checkpoint from
+silently replacing newer runtime fixes. An interrupted write cannot replace
+the previous good slot, and a slot still being written cannot be loaded.
 
 On restore, DMTCP reconstructs the selected GameMaker/runner process. The
 runner re-uploads every CPU-shadowed texture to shared DDR, reconstructs the
@@ -113,7 +122,12 @@ game running; corrupt or incompatible states are rejected and recover to a new
 game instead of stranding the core. Normal AM2R save files remain separately
 persistent under `/media/fat/saves/AM2R` on the SD card.
 
-Game stepping is paced at 60 Hz and the GPU runs at 88 MHz. Its paired-pixel
+The FPGA increments a shared-DDR heartbeat at each native vblank. Ordinary
+60 Hz game rooms wait on that edge so ARM game ticks and frame publication are
+phase-locked to the actual 59.937 Hz scanout, rather than merely using the same
+nominal period on an independent HPS clock. Older RBFs, lower room rates, and
+explicit speed overrides retain an absolute timer derived from the raster
+period. The GPU runs at 88 MHz. Its paired-pixel
 fast path resolves two adjacent opaque or transparent pixels per common
 textured draw cycle. Completed frames rotate among three HPS-DDR buffers so the
 GPU can avoid the immutable buffer currently in scanout without waiting a full

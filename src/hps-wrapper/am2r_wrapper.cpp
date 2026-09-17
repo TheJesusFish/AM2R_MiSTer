@@ -17,6 +17,7 @@
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/types.h>
 #include <sys/un.h>
 #include <sys/wait.h>
@@ -77,9 +78,11 @@ constexpr const char *kSavePath = "/media/fat/saves/AM2R";
 constexpr const char *kConfigPath = "/media/fat/saves/AM2R/config.ini";
 constexpr const char *kLegacySavePath = "/media/fat/games/am2r/saves";
 constexpr const char *kLogPath = "/media/fat/games/am2r/logs/last-run.log";
-constexpr const char *kRuntimeDirectory = "/tmp/am2r-runtime";
+constexpr const char *kRuntimeDirectory = "/media/fat/games/am2r/.runtime-cache";
+constexpr const char *kRuntimeDataPath = "/media/fat/games/am2r/.runtime-cache/data.win";
+constexpr const char *kRuntimeLangDirectory = "/media/fat/games/am2r/.runtime-cache/lang";
 constexpr const char *kSessionLogPath = "/tmp/am2r-session.log";
-constexpr const char *kStampPath = "/tmp/am2r-runtime/.archive-stamp";
+constexpr const char *kStampPath = "/media/fat/games/am2r/.runtime-cache/.archive-stamp";
 constexpr const char *kMenuExec = "/media/fat/MiSTer";
 constexpr const char *kTestPlaybackTrigger = "/tmp/am2r-test-playback";
 constexpr const char *kStateRoot = "/media/fat/savestates/AM2R";
@@ -88,8 +91,12 @@ constexpr const char *kDmtcpCoordinator = "/media/fat/games/am2r/dmtcp/bin/dmtcp
 constexpr const char *kDmtcpCommand = "/media/fat/games/am2r/dmtcp/bin/dmtcp_command";
 constexpr const char *kDmtcpLaunch = "/media/fat/games/am2r/dmtcp/bin/dmtcp_launch";
 constexpr const char *kDmtcpRestart = "/media/fat/games/am2r/dmtcp/bin/dmtcp_restart";
+constexpr uint64_t kCheckpointFreeSpaceFloor = 256ull * 1024ull * 1024ull;
 constexpr const char *kStateBuild =
-    "am2r-state-v24-main-915ca339-dmtcp-3.2.0-mister1";
+    // The save pipeline changed only in the frontend: process images still
+    // restore the exact v30 runner, whose CRC32 is checked independently.
+    // Retaining this identity keeps existing v30 checkpoints loadable.
+    "am2r-state-v30-main-915ca339-dmtcp-3.2.0-mister1";
 uint32_t gRuntimeCrc32 = 0;
 
 constexpr const char *kRequiredArchiveFiles[] = {
@@ -158,6 +165,9 @@ struct StateControl {
     uint32_t previousLoadTrigger = 0;
     uint64_t saveRequestNs[AM2R_STATE_SLOT_COUNT] = {};
     uint64_t loadRequestNs[AM2R_STATE_SLOT_COUNT] = {};
+    pid_t persistencePid = -1;
+    int persistenceSlot = -1;
+    uint64_t persistenceStartedNs = 0;
 };
 
 uint64_t monotonic_ns()
@@ -222,6 +232,8 @@ bool request_runner_state(StateControl &state, Am2rStateMessageType type,
 }
 
 bool checkpoint_slot(StateControl &state, int slot, FILE *log);
+bool reap_state_persistence(StateControl &state, bool block, FILE *log,
+                            bool notify);
 enum StateSlotStatus {
     STATE_SLOT_MISSING,
     STATE_SLOT_INCOMPATIBLE,
@@ -252,6 +264,15 @@ void handle_state_events(StateControl &state, pid_t active, FILE *log)
             break;
         }
         case AM2R_STATE_REQUEST_LOAD: {
+            if (state.persistenceSlot == message.slot &&
+                !reap_state_persistence(state, false, log, true)) {
+                send_state_message(state.wrapperFd, AM2R_STATE_LOAD_MISSING,
+                                   message.slot);
+                log_line(log, "savestate_load_pending slot=%d",
+                         message.slot + 1);
+                InfoMessage("Save state is still writing", 1600, "AM2R");
+                break;
+            }
             StateSlotStatus slotStatus = state_slot_status(message.slot);
             if (slotStatus == STATE_SLOT_READY) {
                 state.loadSlot = message.slot;
@@ -509,7 +530,7 @@ bool prepare_directories(FILE *log, char *error, size_t errorSize)
         "/media/fat/games/am2r/logs",
         "/media/fat/savestates",
         kRuntimeDirectory,
-        "/tmp/am2r-runtime/lang",
+        kRuntimeLangDirectory,
     };
     for (const char *path : paths) {
         if (make_directory(path)) continue;
@@ -546,11 +567,17 @@ bool file_exists(const char *path)
 bool remove_ephemeral_tree(const char *path)
 {
     const char *tmpPrefix = "/tmp/am2r-dmtcp-";
+    const char *oldStateTmpPrefix = "/tmp/am2r-state-session-";
+    const char *ramStatePrefix = "/dev/shm/am2r-state-session-";
     const size_t stateRootLength = strlen(kStateRoot);
     const bool stateScratch = path &&
         strncmp(path, kStateRoot, stateRootLength) == 0 &&
         strncmp(path + stateRootLength, "/.session-", 10) == 0;
-    if (!path || (strncmp(path, tmpPrefix, strlen(tmpPrefix)) != 0 && !stateScratch))
+    if (!path ||
+        (strncmp(path, tmpPrefix, strlen(tmpPrefix)) != 0 &&
+         strncmp(path, oldStateTmpPrefix, strlen(oldStateTmpPrefix)) != 0 &&
+         strncmp(path, ramStatePrefix, strlen(ramStatePrefix)) != 0 &&
+         !stateScratch))
         return false;
     struct stat st = {};
     if (lstat(path, &st) != 0) return errno == ENOENT;
@@ -808,10 +835,10 @@ bool copy_checkpoint_atomic(const char *source, int slot, off_t expectedSize, FI
     snprintf(temporary, sizeof(temporary), "%s/slot%d.dmtcp.new",
              kStateRoot, slot + 1);
 
-    // The DMTCP session and persistent slots are siblings on /media/fat.
-    // Rename the completed image into the atomic staging name instead of
-    // reading and writing the entire checkpoint a second time.  Retain the
-    // copy path for an unexpected cross-filesystem deployment.
+    // Rename is instantaneous when source and destination share a filesystem.
+    // Current checkpoints are staged beside the slots, while the copy fallback
+    // retains compatibility with legacy or diagnostic staging locations. The
+    // .new name keeps the previous durable slot valid until fsync finishes.
     unlink(temporary);
     bool renamed = rename(source, temporary) == 0;
     off_t copied = renamed ? expectedSize : 0;
@@ -879,16 +906,90 @@ bool copy_checkpoint_atomic(const char *source, int slot, off_t expectedSize, FI
     return true;
 }
 
+void state_persistence_finished(StateControl &state, int status, FILE *log,
+                                bool notify)
+{
+    const int slot = state.persistenceSlot;
+    const bool okay = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    log_line(log, "savestate_save_complete slot=%d elapsed_ms=%.1f result=%d",
+             slot + 1, elapsed_ms(state.persistenceStartedNs), okay ? 0 : EIO);
+    state.persistencePid = -1;
+    state.persistenceSlot = -1;
+    state.persistenceStartedNs = 0;
+    if (slot >= 0 && slot < AM2R_STATE_SLOT_COUNT)
+        state.saveRequestNs[slot] = 0;
+    if (notify)
+        InfoMessage(okay ? "Save state written" : "Save state failed",
+                    okay ? 1200 : 1800, "AM2R");
+}
+
+bool reap_state_persistence(StateControl &state, bool block, FILE *log,
+                            bool notify)
+{
+    if (state.persistencePid <= 0) return true;
+    int status = 0;
+    pid_t result;
+    do {
+        result = waitpid(state.persistencePid, &status, block ? 0 : WNOHANG);
+    } while (result < 0 && errno == EINTR);
+    if (result == 0) return false;
+    if (result == state.persistencePid) {
+        state_persistence_finished(state, status, log, notify);
+        return true;
+    }
+    log_line(log, "savestate_writer_lost pid=%d errno=%d",
+             state.persistencePid, errno);
+    state.persistencePid = -1;
+    state.persistenceSlot = -1;
+    state.persistenceStartedNs = 0;
+    return true;
+}
+
+bool start_state_persistence(StateControl &state, const char *source, int slot,
+                             off_t size, uint64_t started, FILE *log)
+{
+    if (state.persistencePid > 0 &&
+        !reap_state_persistence(state, false, log, true)) {
+        errno = EBUSY;
+        return false;
+    }
+
+    pid_t writer = fork();
+    if (writer < 0) return false;
+    if (writer == 0) {
+        if (state.wrapperFd >= 0) close(state.wrapperFd);
+        FILE *writerLog = fopen("/tmp/am2r-wrapper.log", "a");
+        bool okay = copy_checkpoint_atomic(source, slot, size, writerLog);
+        if (okay) unlink(source);
+        if (writerLog) fclose(writerLog);
+        _exit(okay ? 0 : 1);
+    }
+
+    state.persistencePid = writer;
+    state.persistenceSlot = slot;
+    state.persistenceStartedNs = started;
+    log_line(log, "savestate_writer_started slot=%d pid=%d bytes=%lld",
+             slot + 1, writer, (long long)size);
+    return true;
+}
+
 void release_quiesced_runner(int error, FILE *log)
 {
-    int marker = open(AM2R_STATE_RESUME_PATH,
+    char temporary[PATH_MAX] = {};
+    snprintf(temporary, sizeof(temporary), "%s.new", AM2R_STATE_RESUME_PATH);
+    unlink(temporary);
+    int marker = open(temporary,
                       O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
     if (marker >= 0) {
         char value[24] = {};
         int length = snprintf(value, sizeof(value), "%d\n", error);
-        write(marker, value, (size_t)length);
-        fsync(marker);
-        close(marker);
+        bool okay = write(marker, value, (size_t)length) == length;
+        if (okay && fsync(marker) != 0) okay = false;
+        if (close(marker) != 0) okay = false;
+        if (okay && rename(temporary, AM2R_STATE_RESUME_PATH) == 0) return;
+        int savedError = errno ? errno : EIO;
+        unlink(temporary);
+        log_line(log, "savestate_resume_marker_failed errno=%d", savedError);
     } else {
         log_line(log, "savestate_resume_marker_failed errno=%d", errno);
     }
@@ -901,11 +1002,30 @@ bool checkpoint_slot(StateControl &state, int slot, FILE *log)
     int error = 0;
     char source[PATH_MAX] = {};
     off_t size = 0;
-    int result = dmtcp_command(state, "--bcheckpoint", log);
-    if (result != 0) {
+    struct statvfs filesystem = {};
+    uint64_t available = 0;
+    if (statvfs(kStateRoot, &filesystem) != 0) {
+        error = errno ? errno : EIO;
+        log_line(log, "savestate_space_check_failed slot=%d errno=%d",
+                 slot + 1, error);
+    } else {
+        const uint64_t blockSize = filesystem.f_frsize ?
+                                   filesystem.f_frsize : filesystem.f_bsize;
+        available = (uint64_t)filesystem.f_bavail * blockSize;
+        if (available < kCheckpointFreeSpaceFloor) {
+            error = ENOSPC;
+            log_line(log,
+                     "savestate_space_insufficient slot=%d available=%llu required=%llu",
+                     slot + 1, (unsigned long long)available,
+                     (unsigned long long)kCheckpointFreeSpaceFloor);
+        }
+    }
+
+    int result = error ? -1 : dmtcp_command(state, "--bcheckpoint", log);
+    if (!error && result != 0) {
         error = EIO;
         log_line(log, "savestate_checkpoint_failed slot=%d code=%d", slot + 1, result);
-    } else {
+    } else if (!error) {
         bool complete = false;
         bool observedBusy = false;
         for (int wait = 0; wait < 1800; ++wait) {
@@ -921,19 +1041,22 @@ bool checkpoint_slot(StateControl &state, int slot, FILE *log)
         if (!complete) {
             error = ETIMEDOUT;
             log_line(log, "savestate_image_timeout slot=%d", slot + 1);
-        } else if (!copy_checkpoint_atomic(source, slot, size, log)) {
+        } else if (!start_state_persistence(state, source, slot, size, started,
+                                            log)) {
             error = errno ? errno : EIO;
-            log_line(log, "savestate_copy_failed slot=%d errno=%d", slot + 1, error);
+            log_line(log, "savestate_writer_failed slot=%d errno=%d",
+                     slot + 1, error);
         }
     }
     release_quiesced_runner(error, log);
-    log_line(log, "savestate_save_complete slot=%d elapsed_ms=%.1f result=%d",
+    log_line(log, "savestate_capture_complete slot=%d elapsed_ms=%.1f result=%d",
              slot + 1, elapsed_ms(started), error);
-    state.saveRequestNs[slot] = 0;
-    if (error == 0)
-        InfoMessage("Save state written", 1200, "AM2R");
-    else
+    if (error == 0) {
+        InfoMessage("Save state writing", 1200, "AM2R");
+    } else {
+        state.saveRequestNs[slot] = 0;
         InfoMessage("Save state failed", 1800, "AM2R");
+    }
     return error == 0;
 }
 
@@ -965,7 +1088,7 @@ bool archive_stamp_matches(const struct stat &archiveStat)
     fclose(stamp);
     return read == 2 && size == (long long)archiveStat.st_size &&
            mtime == (long long)archiveStat.st_mtime &&
-           file_exists("/tmp/am2r-runtime/data.win");
+           file_exists(kRuntimeDataPath);
 }
 
 bool write_archive_stamp(const struct stat &archiveStat)
@@ -1185,7 +1308,7 @@ pid_t spawn_runtime(StateControl &state, int session, const char *testPlayback,
             const_cast<char *>("--no-gzip"),
             const_cast<char *>("--quiet"),
             const_cast<char *>(kRuntimeBinary),
-            const_cast<char *>("/tmp/am2r-runtime/data.win"),
+            const_cast<char *>(kRuntimeDataPath),
             const_cast<char *>("--renderer"),
             const_cast<char *>("software"),
             const_cast<char *>("--disable-log-colours"),
@@ -1249,8 +1372,14 @@ int run_child(FILE *wrapperLog)
 
     StateControl state;
     cleanup_ephemeral_children("/tmp", "am2r-dmtcp-", wrapperLog);
+    cleanup_ephemeral_children("/dev/shm", "am2r-state-session-", wrapperLog);
     cleanup_ephemeral_children(kStateRoot, ".session-", wrapperLog);
     state.coordinatorPort = 43000 + ((int)getpid() % 900);
+    // DMTCP briefly needs both the live 150+ MB process and its checkpoint
+    // writer's copy-on-write working set. Keeping the 100+ MB image in tmpfs
+    // can exhaust the HPS memory available to Linux during capture. Stage on the
+    // persistent filesystem; copy_checkpoint_atomic() promotes the completed
+    // sibling with a same-filesystem rename, so this adds no second copy.
     snprintf(state.sessionDirectory, sizeof(state.sessionDirectory),
              "%s/.session-%d", kStateRoot, (int)getpid());
     snprintf(state.tempDirectory, sizeof(state.tempDirectory),
@@ -1320,6 +1449,10 @@ int run_child(FILE *wrapperLog)
         }
 
         pid_t result = waitpid(-1, &status, WNOHANG);
+        if (result > 0 && result == state.persistencePid) {
+            state_persistence_finished(state, status, wrapperLog, true);
+            continue;
+        }
         if (result > 0 && result != child) {
             log_line(wrapperLog, "auxiliary_reaped pid=%d", result);
             continue;
@@ -1409,6 +1542,7 @@ int run_child(FILE *wrapperLog)
 
     gChild = -1;
     stop_dmtcp(state, wrapperLog);
+    reap_state_persistence(state, true, wrapperLog, false);
     int auxiliaryStatus = 0;
     pid_t auxiliary = -1;
     while ((auxiliary = waitpid(-1, &auxiliaryStatus, WNOHANG)) > 0)

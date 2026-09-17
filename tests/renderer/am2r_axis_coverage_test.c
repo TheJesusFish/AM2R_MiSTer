@@ -30,6 +30,19 @@ int main(void)
     // the next tile with atlas row 600. Pixel-center coverage is 12 rows.
     failed |= check(0.00003f, 12.00003f, 0, 12);
 
+    // Conservative early rejection agrees with the rasterizer's half-open
+    // scissor convention and handles mirrored (negative-scale) bounds.
+    if (!swAxisBoundsOutsideScissor(-32.0f, 8.0f, 0.0f, 24.0f,
+                                     0, 0, 320, 240)) failed = 1;
+    if (!swAxisBoundsOutsideScissor(320.0f, 8.0f, 352.0f, 24.0f,
+                                     0, 0, 320, 240)) failed = 1;
+    if (!swAxisBoundsOutsideScissor(352.0f, 8.0f, 320.0f, 24.0f,
+                                     0, 0, 320, 240)) failed = 1;
+    if (swAxisBoundsOutsideScissor(-0.25f, 8.0f, 0.75f, 24.0f,
+                                    0, 0, 320, 240)) failed = 1;
+    if (swAxisBoundsOutsideScissor(319.25f, 8.0f, 320.25f, 24.0f,
+                                    0, 0, 320, 240)) failed = 1;
+
     if (failed)
         return 1;
 

@@ -1,0 +1,621 @@
+diff --git a/src/backends/mister.c b/src/backends/mister.c
+index 4ee0d06..82ad264 100644
+--- a/src/backends/mister.c
++++ b/src/backends/mister.c
+@@ -70,6 +70,7 @@ typedef struct { uint64_t word[8]; } MisterGpuCommand;
+ typedef struct {
+     const void* source;
+     void* shadow;
++    void* shadow_alt;
+     size_t bytes;
+     uint32_t physical[2];
+     uint32_t last_upload_frame;
+@@ -79,6 +80,7 @@ typedef struct {
+     bool dynamic;
+     bool source_revision_valid;
+     bool shadow_valid;
++    bool sparse;
+     uint64_t *opaque_pixels;
+     size_t opaque_word_count;
+     uint32_t opaque_generation;
+@@ -159,6 +161,7 @@ static uint32_t g_vblank_last_counter = 0;
+ static bool g_vblank_counter_initialized = false;
+ static bool g_vblank_status_disabled = false;
+ static bool g_vblank_sync_reported = false;
++static uint32_t g_vblank_timeout_count = 0;
+ static uint64_t g_gpu_opaque_coverage[MISTER_HEIGHT][MISTER_WIDTH / 64];
+ 
+ static bool openJoyShared(void);
+@@ -279,6 +282,7 @@ static void unmapGpuHardware(void) {
+     g_vblank_counter_initialized = false;
+     g_vblank_status_disabled = false;
+     g_vblank_sync_reported = false;
++    g_vblank_timeout_count = 0;
+ }
+ 
+ static bool waitGpuCompletion(uint32_t* cycles) {
+@@ -381,6 +385,7 @@ static bool initGpu(void) {
+     g_vblank_counter_initialized = false;
+     g_vblank_status_disabled = false;
+     g_vblank_sync_reported = false;
++    g_vblank_timeout_count = 0;
+     g_gpu_write_buffer = 0;
+     g_gpu_pending = false;
+     g_gpu_last_completed_cycles = 0;
+@@ -492,6 +497,7 @@ uint32_t MisterGpu_uploadTexture(const void* rgbaPixels, size_t bytes) {
+     MisterGpuTexture* record = &g_gpu_texture_records[g_gpu_texture_record_count++];
+     record->source = rgbaPixels;
+     record->shadow = shadow;
++    record->shadow_alt = NULL;
+     record->bytes = bytes;
+     record->physical[0] = physical;
+     record->physical[1] = 0;
+@@ -502,6 +508,7 @@ uint32_t MisterGpu_uploadTexture(const void* rgbaPixels, size_t bytes) {
+     record->dynamic = false;
+     record->source_revision_valid = false;
+     record->shadow_valid = true;
++    record->sparse = false;
+     record->opaque_pixels = NULL;
+     record->opaque_word_count = 0;
+     record->opaque_generation = 0;
+@@ -510,6 +517,112 @@ uint32_t MisterGpu_uploadTexture(const void* rgbaPixels, size_t bytes) {
+     return physical;
+ }
+ 
++static uint32_t uploadDynamicTexture(const void* rgbaPixels, size_t bytes,
++                                     bool sourceRevisionValid,
++                                     uint32_t sourceRevision);
++
++static uint32_t uploadSparseDynamicTexture(const void* rgbaPixels, size_t bytes,
++                                           size_t rowBytes,
++                                           uint32_t sourceRevision) {
++    if (!g_gpu_available || rgbaPixels == NULL || bytes == 0 || rowBytes == 0)
++        return 0;
++    for (uint32_t i = 0; i < g_gpu_texture_record_count; ++i) {
++        MisterGpuTexture* record = &g_gpu_texture_records[i];
++        if (record->source != rgbaPixels || record->bytes != bytes) continue;
++        if (!record->sparse) return uploadDynamicTexture(
++            rgbaPixels, bytes, true, sourceRevision);
++        if (record->source_revision_valid &&
++            record->source_revision == sourceRevision)
++            return record->physical[record->active];
++        if (gpuBuffersEqual(record->shadow, rgbaPixels, bytes)) {
++            record->source_revision = sourceRevision;
++            record->source_revision_valid = true;
++            return record->physical[record->active];
++        }
++
++        bool switchBuffer = record->last_upload_frame != g_gpu_frame_serial;
++        uint8_t target = switchBuffer ? (record->active ^ 1u) : record->active;
++        uint8_t* targetShadow = switchBuffer ?
++            (uint8_t*)record->shadow_alt : (uint8_t*)record->shadow;
++        uint8_t* targetPixels = g_gpu_textures +
++            (record->physical[target] - GPU_TEXTURE_PHYS);
++        const uint8_t* sourcePixels = (const uint8_t*)rgbaPixels;
++        bool wrotePixels = false;
++        for (size_t rowOffset = 0; rowOffset < bytes; rowOffset += rowBytes) {
++            size_t rowLength = bytes - rowOffset;
++            if (rowLength > rowBytes) rowLength = rowBytes;
++            const uint8_t* sourceRow = sourcePixels + rowOffset;
++            uint8_t* shadowRow = targetShadow + rowOffset;
++            if (gpuBuffersEqual(shadowRow, sourceRow, rowLength)) continue;
++
++            size_t first = 0;
++            while (first < rowLength && shadowRow[first] == sourceRow[first]) first++;
++            size_t last = rowLength;
++            while (last > first && shadowRow[last - 1] == sourceRow[last - 1]) last--;
++            first &= ~(size_t)3u;
++            last = (last + 3u) & ~(size_t)3u;
++            if (last > rowLength) last = rowLength;
++            memcpy(shadowRow + first, sourceRow + first, last - first);
++            memcpy(targetPixels + rowOffset + first,
++                   sourceRow + first, last - first);
++            wrotePixels = true;
++        }
++        if (wrotePixels) __sync_synchronize();
++        if (switchBuffer) {
++            void* previousShadow = record->shadow;
++            record->shadow = record->shadow_alt;
++            record->shadow_alt = previousShadow;
++            record->active = target;
++        }
++        record->last_upload_frame = g_gpu_frame_serial;
++        record->generation = nextTextureGeneration();
++        record->source_revision = sourceRevision;
++        record->source_revision_valid = true;
++        record->shadow_valid = true;
++        return record->physical[record->active];
++    }
++
++    if (g_gpu_texture_record_count >= GPU_TEXTURE_RECORDS) return 0;
++    void* shadow0 = malloc(bytes);
++    void* shadow1 = malloc(bytes);
++    if (shadow0 == NULL || shadow1 == NULL) {
++        free(shadow0);
++        free(shadow1);
++        return 0;
++    }
++    uint32_t physical0 = reserveGpuTexture(bytes);
++    uint32_t physical1 = reserveGpuTexture(bytes);
++    if (physical0 == 0 || physical1 == 0) {
++        free(shadow0);
++        free(shadow1);
++        return 0;
++    }
++    memcpy(shadow0, rgbaPixels, bytes);
++    memcpy(shadow1, rgbaPixels, bytes);
++    memcpy(g_gpu_textures + (physical0 - GPU_TEXTURE_PHYS), rgbaPixels, bytes);
++    memcpy(g_gpu_textures + (physical1 - GPU_TEXTURE_PHYS), rgbaPixels, bytes);
++    __sync_synchronize();
++    MisterGpuTexture* record = &g_gpu_texture_records[g_gpu_texture_record_count++];
++    record->source = rgbaPixels;
++    record->shadow = shadow0;
++    record->shadow_alt = shadow1;
++    record->bytes = bytes;
++    record->physical[0] = physical0;
++    record->physical[1] = physical1;
++    record->last_upload_frame = g_gpu_frame_serial;
++    record->generation = nextTextureGeneration();
++    record->source_revision = sourceRevision;
++    record->active = 0;
++    record->dynamic = true;
++    record->source_revision_valid = true;
++    record->shadow_valid = true;
++    record->sparse = true;
++    record->opaque_pixels = NULL;
++    record->opaque_word_count = 0;
++    record->opaque_generation = 0;
++    return physical0;
++}
++
+ static uint32_t uploadDynamicTexture(const void* rgbaPixels, size_t bytes,
+                                      bool sourceRevisionValid,
+                                      uint32_t sourceRevision) {
+@@ -518,6 +631,9 @@ static uint32_t uploadDynamicTexture(const void* rgbaPixels, size_t bytes,
+         if (g_gpu_texture_records[i].source == rgbaPixels &&
+             g_gpu_texture_records[i].bytes == bytes) {
+             MisterGpuTexture* record = &g_gpu_texture_records[i];
++            if (record->sparse)
++                return uploadSparseDynamicTexture(
++                    rgbaPixels, bytes, bytes, sourceRevision);
+             // A GameMaker surface may be composited hundreds of times in one
+             // frame. Its renderer-owned revision is an exact write barrier,
+             // so do not rescan the entire pixel allocation for every draw.
+@@ -579,6 +695,7 @@ static uint32_t uploadDynamicTexture(const void* rgbaPixels, size_t bytes,
+     MisterGpuTexture* record = &g_gpu_texture_records[g_gpu_texture_record_count++];
+     record->source = rgbaPixels;
+     record->shadow = shadow;
++    record->shadow_alt = NULL;
+     record->bytes = bytes;
+     record->physical[0] = physical0;
+     record->physical[1] = physical1;
+@@ -589,6 +706,7 @@ static uint32_t uploadDynamicTexture(const void* rgbaPixels, size_t bytes,
+     record->dynamic = true;
+     record->source_revision_valid = sourceRevisionValid;
+     record->shadow_valid = true;
++    record->sparse = false;
+     record->opaque_pixels = NULL;
+     record->opaque_word_count = 0;
+     record->opaque_generation = 0;
+@@ -606,6 +724,13 @@ uint32_t MisterGpu_uploadDynamicTextureRevision(const void* rgbaPixels, size_t b
+     return uploadDynamicTexture(rgbaPixels, bytes, true, sourceRevision);
+ }
+ 
++uint32_t MisterGpu_uploadSparseDynamicTextureRevision(const void* rgbaPixels,
++                                                      size_t bytes,
++                                                      size_t rowBytes,
++                                                      uint32_t sourceRevision) {
++    return uploadSparseDynamicTexture(rgbaPixels, bytes, rowBytes, sourceRevision);
++}
++
+ uint32_t MisterGpu_prepareDynamicTextureGpuWrite(const void* rgbaPixels, size_t bytes,
+                                                  uint32_t sourceRevision) {
+     if (!g_gpu_available || rgbaPixels == NULL || bytes == 0) return 0;
+@@ -631,11 +756,13 @@ uint32_t MisterGpu_prepareDynamicTextureGpuWrite(const void* rgbaPixels, size_t
+         record = &g_gpu_texture_records[g_gpu_texture_record_count++];
+         record->source = rgbaPixels;
+         record->shadow = shadow;
++        record->shadow_alt = NULL;
+         record->bytes = bytes;
+         record->physical[0] = physical0;
+         record->physical[1] = physical1;
+         record->active = 0;
+         record->dynamic = true;
++        record->sparse = false;
+         record->opaque_pixels = NULL;
+         record->opaque_word_count = 0;
+         record->opaque_generation = 0;
+@@ -2452,6 +2579,8 @@ bool MisterGpu_afterSaveStateRestore(void) {
+         MisterGpuTexture* record = &g_gpu_texture_records[i];
+         if (record->shadow == NULL || record->bytes == 0 || !record->shadow_valid)
+             continue;
++        if (record->sparse && record->shadow_alt != NULL)
++            memcpy(record->shadow_alt, record->shadow, record->bytes);
+         for (uint32_t copy = 0; copy < (record->dynamic ? 2u : 1u); ++copy) {
+             size_t offset = (size_t)(record->physical[copy] - GPU_TEXTURE_PHYS);
+             if (offset <= GPU_TEXTURE_BYTES && record->bytes <= GPU_TEXTURE_BYTES - offset)
+@@ -2603,6 +2732,8 @@ void platformExit(void) {
+     for (uint32_t i = 0; i < g_gpu_texture_record_count; ++i) {
+         free(g_gpu_texture_records[i].shadow);
+         g_gpu_texture_records[i].shadow = NULL;
++        free(g_gpu_texture_records[i].shadow_alt);
++        g_gpu_texture_records[i].shadow_alt = NULL;
+         free(g_gpu_texture_records[i].opaque_pixels);
+         g_gpu_texture_records[i].opaque_pixels = NULL;
+         g_gpu_texture_records[i].opaque_word_count = 0;
+@@ -2871,6 +3002,15 @@ bool platformWaitForVblank(uint32_t timeoutUsec) {
+         g_vblank_counter_initialized = true;
+     }
+ 
++    // Pace from an edge observed after this frame has finished. If rendering
++    // crossed a heartbeat, returning immediately on that stale edge starts the
++    // next game step at an arbitrary phase and can make completions alternate
++    // across the scanout publication cutoff. Consume the current value as the
++    // wait baseline, then require one fresh FPGA edge. A genuinely late frame
++    // therefore drops a tick instead of issuing a catch-up frame.
++    uint32_t waitBaseline = current;
++    uint32_t priorCounter = g_vblank_last_counter;
++
+     uint64_t deadline = nowNanos() + (uint64_t)timeoutUsec * 1000u;
+     while (nowNanos() < deadline) {
+         __sync_synchronize();
+@@ -2879,33 +3019,53 @@ bool platformWaitForVblank(uint32_t timeoutUsec) {
+             return false;
+         }
+         current = g_gpu_control[GPU_VBLANK_COUNTER_WORD];
+-        if (current != g_vblank_last_counter) {
+-            uint32_t elapsedFrames = current - g_vblank_last_counter;
+-            g_vblank_last_counter = current;
+-            if (!g_vblank_sync_reported) {
+-                logInfo("MiSTer pacing: synchronized to FPGA native vblank\n");
+-                g_vblank_sync_reported = true;
+-            }
+-            if (elapsedFrames > 1) {
+-                static uint32_t missedVblankLogs = 0;
+-                if (missedVblankLogs < 100) {
+-                    logWarn("MiSTer pacing: %u raster intervals elapsed during one game tick\n",
+-                            elapsedFrames);
+-                    missedVblankLogs++;
+-                }
+-            }
+-            return true;
+-        }
++        if (current != waitBaseline) goto observed_vblank;
+         // The heartbeat write is normally visible within a small fraction of
+         // a scanline. A short sleep avoids burning an HPS core for the entire
+         // frame while keeping the game-step phase tightly behind vblank.
+         usleep(50);
+     }
+ 
++    // usleep() may occasionally return after the nominal deadline under Linux
++    // scheduler pressure. Sample once more before declaring a timeout; the
++    // FPGA edge can have arrived while this thread was descheduled.
++    __sync_synchronize();
++    if (g_gpu_control[GPU_VBLANK_MAGIC_WORD] != GPU_VBLANK_MAGIC) {
++        g_vblank_status_disabled = true;
++        return false;
++    }
++    current = g_gpu_control[GPU_VBLANK_COUNTER_WORD];
++    if (current != waitBaseline) goto observed_vblank;
++
+     // A stale magic word can remain in DDR when a newer runner is paired with
+-    // an older RBF. Disable further polling for this process and use the
+-    // established absolute-timer path instead of adding a timeout every tick.
+-    g_vblank_status_disabled = true;
+-    logWarn("MiSTer pacing: FPGA vblank heartbeat unavailable; using timer fallback\n");
++    // an older RBF. Require three consecutive no-progress timeouts before
++    // permanently selecting the compatible timer fallback, so one scheduling
++    // outlier cannot silently desynchronize an otherwise healthy new core.
++    if (++g_vblank_timeout_count >= 3) {
++        g_vblank_status_disabled = true;
++        logWarn("MiSTer pacing: FPGA vblank heartbeat unavailable; using timer fallback\n");
++    } else {
++        logWarn("MiSTer pacing: transient FPGA heartbeat timeout\n");
++    }
+     return false;
++
++observed_vblank:
++    {
++        uint32_t elapsedFrames = current - priorCounter;
++        g_vblank_last_counter = current;
++        g_vblank_timeout_count = 0;
++        if (!g_vblank_sync_reported) {
++            logInfo("MiSTer pacing: synchronized to FPGA native vblank\n");
++            g_vblank_sync_reported = true;
++        }
++        if (elapsedFrames > 1) {
++            static uint32_t missedVblankLogs = 0;
++            if (missedVblankLogs < 100) {
++                logWarn("MiSTer pacing: %u raster intervals elapsed during one game tick\n",
++                        elapsedFrames);
++                missedVblankLogs++;
++            }
++        }
++        return true;
++    }
+ }
+diff --git a/src/backends/mister_gpu.h b/src/backends/mister_gpu.h
+index caebb78..7e4361b 100644
+--- a/src/backends/mister_gpu.h
++++ b/src/backends/mister_gpu.h
+@@ -12,6 +12,10 @@ uint32_t MisterGpu_uploadTexture(const void* rgbaPixels, size_t bytes);
+ uint32_t MisterGpu_uploadDynamicTexture(const void* rgbaPixels, size_t bytes);
+ uint32_t MisterGpu_uploadDynamicTextureRevision(const void* rgbaPixels, size_t bytes,
+                                                 uint32_t sourceRevision);
++uint32_t MisterGpu_uploadSparseDynamicTextureRevision(const void* rgbaPixels,
++                                                      size_t bytes,
++                                                      size_t rowBytes,
++                                                      uint32_t sourceRevision);
+ uint32_t MisterGpu_prepareDynamicTextureGpuWrite(const void* rgbaPixels, size_t bytes,
+                                                  uint32_t sourceRevision);
+ bool MisterGpu_addClear(uint32_t rgba);
+diff --git a/src/instance.h b/src/instance.h
+index 2c9f9c1..c4645f2 100644
+--- a/src/instance.h
++++ b/src/instance.h
+@@ -49,6 +49,11 @@ struct Instance {
+     GMLReal collisionGridTop, collisionGridBottom;
+     bool collisionGridBBoxValid;
+     uint32_t lastCollisionQueryId;
++    // Monotonic sequence assigned whenever this instance is appended to the
++    // per-object lists.  Every object/ancestor bucket receives the append at
++    // the same time, so this preserves the exact native bucket order while a
++    // spatial query works with only its nearby candidates.
++    uint32_t objectListOrder;
+ 
+     // Per-instance self variable storage (sparse open-addressed hashmap, keyed by varID).
+     IntRValueHashMap selfVars;
+diff --git a/src/runner.c b/src/runner.c
+index d687e16..27ad406 100644
+--- a/src/runner.c
++++ b/src/runner.c
+@@ -94,6 +94,7 @@ static int32_t findEventCodeIdAndOwner(Runner* runner, int32_t objectIndex, int3
+ 
+ void Runner_addInstanceToObjectLists(Runner* runner, Instance* inst) {
+     DataWin* dataWin = runner->dataWin;
++    inst->objectListOrder = ++runner->nextObjectListOrder;
+     int32_t currentObj = inst->objectIndex;
+     int32_t depth = 0;
+     while (currentObj >= 0 && dataWin->objt.count > (uint32_t) currentObj && 32 > depth) {
+@@ -4851,6 +4852,8 @@ void Runner_free(Runner* runner) {
+     runner->cachedDrawables = nullptr;
+     arrfree(runner->instanceSnapshots);
+     runner->instanceSnapshots = nullptr;
++    arrfree(runner->collisionCandidates);
++    runner->collisionCandidates = nullptr;
+     arrfree(runner->eventDispatchInstances);
+     runner->eventDispatchInstances = nullptr;
+     ResolvedEventTable_free(&runner->eventTable);
+diff --git a/src/runner.h b/src/runner.h
+index efe3b58..ca22c53 100644
+--- a/src/runner.h
++++ b/src/runner.h
+@@ -606,8 +606,13 @@ struct Runner {
+     // Any loop that might fire user code iterates a copy so that in-flight mutations (instance_change swap-remove, spawns, destroys) don't corrupt it.
+     // Each call pushes its snapshot (append) and pops on normal loop exit; nesting is safe because pushes/pops are LIFO and outer ranges stay untouched under newer pushes.
+     Instance** instanceSnapshots;
++    // Read-only collision builtins do not dispatch user code, so they can use
++    // this reusable spatial-query result directly.  Candidates are sorted by
++    // Instance.objectListOrder to retain GameMaker's first-hit semantics.
++    Instance** collisionCandidates;
+     SpatialGrid* spatialGrid;
+     uint32_t collisionQueryCounter;
++    uint32_t nextObjectListOrder;
+     int32_t pendingRoom;  // -1 = none
+     bool gameStartFired;
+     int frameCount;
+diff --git a/src/sw_renderer.c b/src/sw_renderer.c
+index 906ab5a..9b9d094 100644
+--- a/src/sw_renderer.c
++++ b/src/sw_renderer.c
+@@ -751,13 +751,16 @@ static bool rasterizeAxisAlignedQuad(SWRenderer* sw, SWVertex v[4], const uint8_
+     }
+     if(compatibleTexture){
+ #ifdef USE_MISTER
++        int32_t sparseSurface = -1;
+         // AM2R's Draw-GUI surface reaches this common textured-quad path as a
+         // full 320x240 draw, but its alpha data normally occupies only the
+         // top 32 rows. Detect that exact 1:1 surface quad here (after every
+-        // draw API has converged), pack its non-transparent rows into a stable
+-        // 320x64 texture, and tighten the destination rectangle. This avoids
+-        // both the 307 KiB per-frame dynamic upload and tens of thousands of
+-        // transparent FPGA samples.
++        // draw API has converged), expose its contiguous non-transparent rows
++        // as a shallow texture view, and tighten the destination rectangle.
++        // This avoids both the 307 KiB per-frame dynamic upload and tens of
++        // thousands of transparent FPGA samples. No staging copy is needed:
++        // each source row already has the 320-pixel stride required by the
++        // FPGA blitter.
+         if (sw->gpuFrameEligible && swGpuIsOutputTarget(sw) &&
+             texW == 320 && texH == 240 &&
+             fabsf(dx - 320.0f) < 0.0001f && fabsf(dy - 240.0f) < 0.0001f &&
+@@ -783,16 +786,12 @@ static bool rasterizeAxisAlignedQuad(SWRenderer* sw, SWVertex v[4], const uint8_
+                 if (minSourceX < maxSourceX && cropHeight > 0 && cropHeight <= 64) {
+                     int32_t hudOffset = CrtUi_verticalOffset(240,
+                         minSourceY, maxSourceY, MisterGpu_getCrtUiInset());
+-                    if (sw->gpuHudScratch == nullptr)
+-                        sw->gpuHudScratch = (uint8_t*)safeCalloc(320u * 64u, 4u);
+-                    for (int32_t py = 0; py < cropHeight; ++py)
+-                        memcpy(sw->gpuHudScratch + (size_t)py * 320u * 4u,
+-                               texPixels + (size_t)(minSourceY + py) * 320u * 4u,
+-                               320u * 4u);
+-                    texPixels = sw->gpuHudScratch;
+-                    texH = 64;
+-                    v[0].v = v[1].v = -(float)minSourceY / 64.0f;
+-                    v[2].v = v[3].v = (240.0f - (float)minSourceY) / 64.0f;
++                    texPixels += (size_t)minSourceY * 320u * 4u;
++                    texH = cropHeight;
++                    sparseSurface = sourceSurface;
++                    v[0].v = v[1].v = -(float)minSourceY / (float)cropHeight;
++                    v[2].v = v[3].v =
++                        (240.0f - (float)minSourceY) / (float)cropHeight;
+                     for (int i = 0; i < 4; ++i) v[i].y += (float)hudOffset;
+                     minY += hudOffset;
+                     maxY += hudOffset;
+@@ -801,8 +800,9 @@ static bool rasterizeAxisAlignedQuad(SWRenderer* sw, SWVertex v[4], const uint8_
+                     minY += minSourceY;
+                     maxY -= 240 - maxSourceY;
+                     if (sw->gpuHudCropLogs < 8) {
+-                        logInfo("MiSTer AM2R HUD crop: bounds=%d,%d..%d,%d staged=320x64\n",
+-                                minSourceX, minSourceY, maxSourceX, maxSourceY);
++                        logInfo("MiSTer AM2R HUD crop: bounds=%d,%d..%d,%d view=320x%d\n",
++                                minSourceX, minSourceY, maxSourceX, maxSourceY,
++                                cropHeight);
+                         sw->gpuHudCropLogs++;
+                     }
+                 }
+@@ -827,8 +827,16 @@ static bool rasterizeAxisAlignedQuad(SWRenderer* sw, SWVertex v[4], const uint8_
+             int32_t gpuU=(int32_t)startX,gpuV=(int32_t)startY;
+             int32_t gpuDu=(int32_t)stepX,gpuDv=(int32_t)stepYDouble;
+             uint32_t gpuStride=0;
+-            uint32_t textureAddress=coordinatesFit ? swGpuPrepareAxisTexture(sw,texPixels,texW,texH,
+-                maxX-minX,maxY-minY,&gpuU,&gpuV,&gpuDu,&gpuDv,&gpuStride) : 0;
++            uint32_t textureAddress = 0;
++            if (coordinatesFit && sparseSurface >= 0) {
++                gpuStride = (uint32_t)texW * 4u;
++                textureAddress = MisterGpu_uploadSparseDynamicTextureRevision(
++                    texPixels, (size_t)texW * texH * 4u, gpuStride,
++                    sw->surfaceRevisions[sparseSurface]);
++            } else if (coordinatesFit) {
++                textureAddress = swGpuPrepareAxisTexture(sw,texPixels,texW,texH,
++                    maxX-minX,maxY-minY,&gpuU,&gpuV,&gpuDu,&gpuDv,&gpuStride);
++            }
+             if (textureAddress != 0 && coordinatesFit &&
+                 MisterGpu_addBlit(textureAddress, gpuStride,
+                     (int16_t)minX, (int16_t)minY, (uint16_t)(maxX-minX), (uint16_t)(maxY-minY),
+@@ -1061,7 +1069,6 @@ static void swDestroy(Renderer* renderer) {
+ #ifdef USE_MISTER
+     free(sw->gpuTextureAddresses);
+     for (uint32_t i = 0; i < 8; ++i) free(sw->gpuDynamicScratch[i]);
+-    free(sw->gpuHudScratch);
+     free(sw->surfaceContentMinX);
+     free(sw->surfaceContentMinY);
+     free(sw->surfaceContentMaxX);
+diff --git a/src/sw_renderer.h b/src/sw_renderer.h
+index ba2de86..9885070 100644
+--- a/src/sw_renderer.h
++++ b/src/sw_renderer.h
+@@ -94,11 +94,6 @@ typedef struct {
+     uint32_t gpuDynamicScratchIndex;
+     uint32_t gpuDynamicResampleLogs;
+ 
+-    // AM2R builds its persistent HUD into a transparent 320x240 surface even
+-    // though the visible pixels occupy only a shallow strip. Keep a stable,
+-    // compact staging allocation so that composite does not upload and scan
+-    // all 76,800 transparent pixels every frame.
+-    uint8_t* gpuHudScratch;
+     uint32_t gpuHudCropLogs;
+ 
+     // Conservative bounds for pixels which may be non-transparent in each
+diff --git a/src/vm_builtins.c b/src/vm_builtins.c
+index e56df51..1802976 100644
+--- a/src/vm_builtins.c
++++ b/src/vm_builtins.c
+@@ -12089,6 +12089,7 @@ static uint32_t markCollisionCandidatesInBounds(Runner* runner,
+                                                 GMLReal right, GMLReal bottom,
+                                                 int32_t target) {
+     SpatialGrid_syncGrid(runner, runner->spatialGrid);
++    arrsetlen(runner->collisionCandidates, 0);
+     SpatialGridQuery query = SpatialGrid_prepareQuery(
+         runner, left, top, right, bottom, target);
+ 
+@@ -12110,9 +12111,29 @@ static uint32_t markCollisionCandidatesInBounds(Runner* runner,
+                     inst->instanceId != (uint32_t)target)
+                     continue;
+                 inst->lastCollisionQueryId = query.queryId;
++                arrput(runner->collisionCandidates, inst);
+             }
+         }
+     }
++
++    // Per-object lists are stable append-order arrays.  Spatial cells are not
++    // ordered, so restore that exact order over the usually tiny nearby set.
++    // This is deliberately limited to object targets: INSTANCE_ALL follows a
++    // different global list whose order is not changed by instance_change.
++    if (target >= 0 && (uint32_t)target < runner->dataWin->objt.count) {
++        int32_t count = (int32_t)arrlen(runner->collisionCandidates);
++        for (int32_t i = 1; i < count; ++i) {
++            Instance* candidate = runner->collisionCandidates[i];
++            int32_t j = i;
++            while (j > 0 &&
++                   runner->collisionCandidates[j - 1]->objectListOrder >
++                       candidate->objectListOrder) {
++                runner->collisionCandidates[j] = runner->collisionCandidates[j - 1];
++                --j;
++            }
++            runner->collisionCandidates[j] = candidate;
++        }
++    }
+     return query.queryId;
+ }
+ 
+@@ -12144,10 +12165,21 @@ static RValue builtin_collision_line(VMContext* ctx, RValue* args, int32_t argCo
+         GMLReal_fmax(lx1, lx2), GMLReal_fmax(ly1, ly2), targetObjIndex);
+ 
+     int32_t resultId = INSTANCE_NOONE;
+-    int32_t snapBase = Runner_pushInstancesForTarget(runner, targetObjIndex);
+-    int32_t snapEnd  = (int32_t) arrlen(runner->instanceSnapshots);
+-    for (int32_t snapIdx = snapBase; snapEnd > snapIdx; snapIdx++) {
+-        Instance* inst = runner->instanceSnapshots[snapIdx];
++    bool orderedCandidates = targetObjIndex >= 0 &&
++        (uint32_t)targetObjIndex < runner->dataWin->objt.count;
++    int32_t snapBase = -1;
++    Instance** candidates = runner->collisionCandidates;
++    int32_t candidateStart = 0;
++    int32_t candidateEnd = (int32_t)arrlen(candidates);
++    if (!orderedCandidates) {
++        snapBase = Runner_pushInstancesForTarget(runner, targetObjIndex);
++        candidates = runner->instanceSnapshots;
++        candidateStart = snapBase;
++        candidateEnd = (int32_t)arrlen(candidates);
++    }
++    for (int32_t candidateIndex = candidateStart;
++         candidateIndex < candidateEnd; ++candidateIndex) {
++        Instance* inst = candidates[candidateIndex];
+         if (!inst->active) continue;
+         if (notme && inst == self) continue;
+         if (inst->lastCollisionQueryId != candidateQueryId) continue;
+@@ -12231,7 +12263,7 @@ static RValue builtin_collision_line(VMContext* ctx, RValue* args, int32_t argCo
+         resultId = inst->instanceId;
+         break;
+     }
+-    Runner_popInstanceSnapshot(runner, snapBase);
++    if (snapBase >= 0) Runner_popInstanceSnapshot(runner, snapBase);
+ 
+     return RValue_makeReal((GMLReal) resultId);
+ }
+@@ -12330,10 +12362,21 @@ static RValue builtin_collision_rectangle(VMContext* ctx, RValue* args, int32_t
+         runner, x1, y1, x2, y2, targetObjIndex);
+ 
+     int32_t resultId = INSTANCE_NOONE;
+-    int32_t snapBase = Runner_pushInstancesForTarget(runner, targetObjIndex);
+-    int32_t snapEnd  = (int32_t) arrlen(runner->instanceSnapshots);
+-    for (int32_t snapIdx = snapBase; snapEnd > snapIdx; snapIdx++) {
+-        Instance* inst = runner->instanceSnapshots[snapIdx];
++    bool orderedCandidates = targetObjIndex >= 0 &&
++        (uint32_t)targetObjIndex < runner->dataWin->objt.count;
++    int32_t snapBase = -1;
++    Instance** candidates = runner->collisionCandidates;
++    int32_t candidateStart = 0;
++    int32_t candidateEnd = (int32_t)arrlen(candidates);
++    if (!orderedCandidates) {
++        snapBase = Runner_pushInstancesForTarget(runner, targetObjIndex);
++        candidates = runner->instanceSnapshots;
++        candidateStart = snapBase;
++        candidateEnd = (int32_t)arrlen(candidates);
++    }
++    for (int32_t candidateIndex = candidateStart;
++         candidateIndex < candidateEnd; ++candidateIndex) {
++        Instance* inst = candidates[candidateIndex];
+         if (!inst->active) continue;
+         if (notme && inst == self) continue;
+         if (inst->lastCollisionQueryId != candidateQueryId) continue;
+@@ -12372,7 +12415,7 @@ static RValue builtin_collision_rectangle(VMContext* ctx, RValue* args, int32_t
+         resultId = inst->instanceId;
+         break;
+     }
+-    Runner_popInstanceSnapshot(runner, snapBase);
++    if (snapBase >= 0) Runner_popInstanceSnapshot(runner, snapBase);
+ 
+     return RValue_makeReal((GMLReal) resultId);
+ }

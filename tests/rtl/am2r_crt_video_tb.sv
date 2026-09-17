@@ -35,6 +35,7 @@ module am2r_crt_video_tb;
 		.vsync(vsync),
 		.new_frame(new_frame),
 		.new_line(new_line),
+		.pace_tick(),
 		.r(source_r),
 		.g(source_g),
 		.b(source_b)

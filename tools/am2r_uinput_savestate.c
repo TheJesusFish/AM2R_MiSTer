@@ -51,20 +51,22 @@ int main(int argc, char **argv)
 	bool inspect;
 	bool reset;
 	bool toggle;
+	bool close_osd;
 	bool current_slot = false;
 	unsigned int target_slot = 4;
 	unsigned long initial_delay_ms = 1000;
 	if (argc < 2 || argc > 5 ||
 	    (strcmp(argv[1], "--save") && strcmp(argv[1], "--load") &&
 	     strcmp(argv[1], "--inspect") && strcmp(argv[1], "--reset") &&
-	     strcmp(argv[1], "--toggle"))) {
-		fprintf(stderr, "usage: %s --save|--load|--inspect|--reset|--toggle [--current|--slot 1..4] [initial-delay-ms]\n", argv[0]);
+	     strcmp(argv[1], "--toggle") && strcmp(argv[1], "--close"))) {
+		fprintf(stderr, "usage: %s --save|--load|--inspect|--reset|--toggle|--close [--current|--slot 1..4] [initial-delay-ms]\n", argv[0]);
 		return 2;
 	}
 	load = !strcmp(argv[1], "--load");
 	inspect = !strcmp(argv[1], "--inspect");
 	reset = !strcmp(argv[1], "--reset");
 	toggle = !strcmp(argv[1], "--toggle");
+	close_osd = !strcmp(argv[1], "--close");
 	bool have_delay = false;
 	for (int i = 2; i < argc; ++i) {
 		if (!strcmp(argv[i], "--current")) {
@@ -95,7 +97,7 @@ int main(int argc, char **argv)
 	}
 	if (ioctl(fd, UI_SET_EVBIT, EV_KEY) || ioctl(fd, UI_SET_EVBIT, EV_SYN))
 		goto ioctl_error;
-	const unsigned short keys[] = {KEY_F12, KEY_ENTER, KEY_DOWN, KEY_HOME};
+	const unsigned short keys[] = {KEY_F12, KEY_ESC, KEY_ENTER, KEY_DOWN, KEY_HOME};
 	for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); ++i) {
 		if (ioctl(fd, UI_SET_KEYBIT, keys[i])) goto ioctl_error;
 	}
@@ -110,9 +112,12 @@ int main(int argc, char **argv)
 	if (write(fd, &device, sizeof(device)) != (ssize_t)sizeof(device) ||
 	    ioctl(fd, UI_DEV_CREATE)) goto ioctl_error;
 
-	printf("keyboard ready; %s%s through OSD in %lu ms\n",
-	       toggle ? "toggling" :
-	       (reset ? "resetting" : (inspect ? "inspecting " : (load ? "loading " : "saving "))),
+	const char *operation = close_osd ? "closing OSD " :
+	                        (toggle ? "toggling" :
+	                        (reset ? "resetting" :
+	                        (inspect ? "inspecting " :
+	                        (load ? "loading " : "saving "))));
+	printf("keyboard ready; %s%s through OSD in %lu ms\n", operation,
 	       reset ? "" : (current_slot ? "current slot" :
 	       (target_slot == 1 ? "slot 1" : target_slot == 2 ? "slot 2" :
 	       target_slot == 3 ? "slot 3" : "slot 4")), initial_delay_ms);
@@ -120,6 +125,12 @@ int main(int argc, char **argv)
 	if (toggle) {
 		if (sleep_ms(initial_delay_ms) || pulse(fd, KEY_F12)) goto io_error;
 		printf("OSD toggle sent\n");
+		fflush(stdout);
+		goto done;
+	}
+	if (close_osd) {
+		if (sleep_ms(initial_delay_ms) || pulse(fd, KEY_ESC)) goto io_error;
+		printf("OSD close sent\n");
 		fflush(stdout);
 		goto done;
 	}

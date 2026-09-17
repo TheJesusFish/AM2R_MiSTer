@@ -1,0 +1,381 @@
+diff --git a/src/platformdefs.h b/src/platformdefs.h
+index b5024fd..239888f 100644
+--- a/src/platformdefs.h
++++ b/src/platformdefs.h
+@@ -135,6 +135,12 @@ bool platformGetScaledWindowSize(int32_t* outW, int32_t* outH);
+ void platformSetWindowSize(int32_t width, int32_t height);
+ void platformSetWindowTitle(const char* title);
+ void platformSleepUntil(uint64_t time);
++#ifdef USE_MISTER
++// Wait for the core-local native-raster heartbeat when the installed RBF
++// supports it. Returns false for older cores or a stalled heartbeat so callers
++// can retain their timer-based pacing fallback.
++bool platformWaitForVblank(uint32_t timeoutUsec);
++#endif
+ 
+ extern InputRecording *globalInputRecording;
+ 
+diff --git a/src/backends/mister.c b/src/backends/mister.c
+index 5490a2a..f0455f9 100644
+--- a/src/backends/mister.c
++++ b/src/backends/mister.c
+@@ -39,6 +39,9 @@
+ #define GPU_NATIVE_WINDOW_BYTES (GPU_NATIVE_BUFFER_OFFSET + GPU_NATIVE_BUFFER_COUNT * GPU_NATIVE_BUFFER_BYTES)
+ #define GPU_CONTROL_MAGIC 0x50473241u
+ #define GPU_CONTROL_BYTES 4096u
++#define GPU_VBLANK_COUNTER_WORD 16u
++#define GPU_VBLANK_MAGIC_WORD 17u
++#define GPU_VBLANK_MAGIC 0x56424c4bu
+ #define GPU_COMMAND_BYTES 65536u
+ #define GPU_COMMAND_CAPACITY (GPU_COMMAND_BYTES / sizeof(MisterGpuCommand))
+ #define GPU_COMMAND_BUFFER_COUNT 2u
+@@ -150,6 +153,12 @@ static uint32_t *g_next_frame = NULL;
+ static int32_t g_next_width = 0;
+ static int32_t g_next_height = 0;
+ static bool g_initialized = false;
++static bool g_savestate_had_framebuffer = false;
++static bool g_savestate_had_gpu = false;
++static uint32_t g_vblank_last_counter = 0;
++static bool g_vblank_counter_initialized = false;
++static bool g_vblank_status_disabled = false;
++static bool g_vblank_sync_reported = false;
+ static uint64_t g_gpu_opaque_coverage[MISTER_HEIGHT][MISTER_WIDTH / 64];
+ 
+ static bool openJoyShared(void);
+@@ -228,6 +237,50 @@ static void* mapPhysical(int fd, uint32_t address, size_t bytes) {
+     return result == MAP_FAILED ? NULL : result;
+ }
+ 
++static void unmapFramebuffer(void) {
++    if (g_fb != NULL) {
++        munmap(g_fb, MISTER_FB_BYTES);
++        g_fb = NULL;
++    }
++    if (g_fb_fd >= 0) {
++        close(g_fb_fd);
++        g_fb_fd = -1;
++    }
++}
++
++static void unmapGpuHardware(void) {
++    g_gpu_available = false;
++    g_gpu_pending = false;
++    g_gpu_commands = NULL;
++    if (g_gpu_textures != NULL) {
++        munmap(g_gpu_textures, GPU_TEXTURE_BYTES);
++        g_gpu_textures = NULL;
++    }
++    if (g_gpu_native_mapping != NULL) {
++        munmap(g_gpu_native_mapping, GPU_NATIVE_WINDOW_BYTES);
++        g_gpu_native_mapping = NULL;
++    }
++    for (uint32_t i = 0; i < GPU_NATIVE_BUFFER_COUNT; ++i)
++        g_gpu_native_buffers[i] = NULL;
++    for (uint32_t i = 0; i < GPU_COMMAND_BUFFER_COUNT; ++i) {
++        if (g_gpu_command_buffers[i] != NULL) {
++            munmap(g_gpu_command_buffers[i], GPU_COMMAND_BYTES);
++            g_gpu_command_buffers[i] = NULL;
++        }
++    }
++    if (g_gpu_control != NULL) {
++        munmap((void*)g_gpu_control, GPU_CONTROL_BYTES);
++        g_gpu_control = NULL;
++    }
++    if (g_mem_fd >= 0) {
++        close(g_mem_fd);
++        g_mem_fd = -1;
++    }
++    g_vblank_counter_initialized = false;
++    g_vblank_status_disabled = false;
++    g_vblank_sync_reported = false;
++}
++
+ static bool waitGpuCompletion(uint32_t* cycles) {
+     if (cycles != NULL) *cycles = g_gpu_last_completed_cycles;
+     if (!g_gpu_available) return false;
+@@ -297,11 +350,11 @@ static bool appendGpuEnd(void) {
+     return true;
+ }
+ 
+-static void initGpu(void) {
++static bool initGpu(void) {
+     g_mem_fd = open("/dev/mem", O_RDWR | O_SYNC | O_CLOEXEC);
+     if (g_mem_fd < 0) {
+         logWarn("MiSTer GPU: cannot open /dev/mem: %s\n", strerror(errno));
+-        return;
++        return false;
+     }
+     g_gpu_control = mapPhysical(g_mem_fd, GPU_CONTROL_PHYS, GPU_CONTROL_BYTES);
+     g_gpu_command_buffers[0] = mapPhysical(g_mem_fd, GPU_COMMAND_PHYS, GPU_COMMAND_BYTES);
+@@ -320,10 +373,14 @@ static void initGpu(void) {
+         g_gpu_command_buffers[1] == NULL || g_gpu_textures == NULL ||
+         g_gpu_native_mapping == NULL) {
+         logWarn("MiSTer GPU: cannot map shared DDR command/texture regions\n");
+-        return;
++        unmapGpuHardware();
++        return false;
+     }
+ 
+     g_gpu_sequence = g_gpu_control[6];
++    g_vblank_counter_initialized = false;
++    g_vblank_status_disabled = false;
++    g_vblank_sync_reported = false;
+     g_gpu_write_buffer = 0;
+     g_gpu_pending = false;
+     g_gpu_last_completed_cycles = 0;
+@@ -337,6 +394,11 @@ static void initGpu(void) {
+     if (submitGpuCommandsAsync() && waitGpuCompletion(&cycles))
+         logInfo("MiSTer FPGA GPU: online (probe %u cycles)\n", cycles);
+     g_gpu_presented = false;
++    if (!g_gpu_available) {
++        unmapGpuHardware();
++        return false;
++    }
++    return true;
+ }
+ 
+ bool MisterGpu_isAvailable(void) { return g_gpu_available; }
+@@ -2294,8 +2356,7 @@ void MisterGpu_useSoftwareFrame(void) {
+ }
+ 
+ bool MisterGpu_prepareSaveState(void) {
+-    if (!g_gpu_available) return true;
+-    if (!waitGpuCompletion(NULL)) return false;
++    if (g_gpu_available && !waitGpuCompletion(NULL)) return false;
+ 
+     // FPGA-exported GameMaker surfaces normally stay GPU-resident. Materialize
+     // them before checkpointing so DMTCP never captures a stale CPU shadow and
+@@ -2304,6 +2365,7 @@ bool MisterGpu_prepareSaveState(void) {
+         MisterGpuTexture* record = &g_gpu_texture_records[i];
+         if (record->shadow_valid || !record->dynamic || record->shadow == NULL)
+             continue;
++        if (!g_gpu_available || g_gpu_textures == NULL) return false;
+         uint32_t physical = record->physical[record->active];
+         if (physical < GPU_TEXTURE_PHYS ||
+             record->bytes > GPU_TEXTURE_BYTES - (physical - GPU_TEXTURE_PHYS))
+@@ -2314,23 +2376,35 @@ bool MisterGpu_prepareSaveState(void) {
+         record->shadow_valid = true;
+     }
+ 
+-    // Event node numbers are assigned dynamically and can differ after a
+-    // reboot or on another MiSTer.  Likewise, the wrapper recreates the joy
+-    // shared file on every core launch.  Neither endpoint belongs in a
+-    // portable checkpoint; rediscover both after the timeline is restored.
++    // Device mappings and node numbers are machine- and kernel-specific. A
++    // checkpoint created through fbdev may be restored on a MiSTer that needs
++    // the /dev/mem framebuffer fallback (or vice versa), and FPGA DDR/mailbox
++    // mappings are external state rather than part of the GameMaker timeline.
++    // Capture neither class of endpoint; rediscover all of them after DMTCP
++    // resumes either the original or restored timeline.
++    g_savestate_had_framebuffer = g_fb != NULL;
++    g_savestate_had_gpu = g_gpu_available;
+     if (g_input_fd >= 0) {
+         close(g_input_fd);
+         g_input_fd = -1;
+     }
+     closeJoyShared();
++    unmapGpuHardware();
++    unmapFramebuffer();
+     return true;
+ }
+ 
+-void MisterGpu_afterSaveStateRestore(void) {
++bool MisterGpu_afterSaveStateRestore(void) {
++    bool restored = true;
++    if (g_savestate_had_framebuffer && g_fb == NULL && !mapFramebuffer())
++        restored = false;
++    if (g_savestate_had_gpu && !g_gpu_available && !initGpu())
++        restored = false;
+     if (g_input_fd < 0) openVirtualInput();
+     if (g_joy_shm == NULL && !openJoyShared())
+         logWarn("MiSTer input: shared controller could not be reattached\n");
+-    if (!g_gpu_available) return;
++    if (g_savestate_had_gpu && !g_gpu_available) return false;
++    if (!g_gpu_available) return restored;
+ 
+     // The CPU address space came from the selected snapshot, while the shared
+     // DDR texture pool and FPGA mailbox were most recently used by another
+@@ -2376,6 +2450,7 @@ void MisterGpu_afterSaveStateRestore(void) {
+     __sync_synchronize();
+     logInfo("MiSTer GPU: restored %u texture records after save-state load\n",
+             g_gpu_texture_record_count);
++    return restored;
+ }
+ 
+ static int linuxKeyToGml(uint16_t code) {
+@@ -2504,7 +2579,7 @@ bool platformInit(int32_t reqW, int32_t reqH, const char *title, bool headless)
+         g_fb_fd = -1;
+         return false;
+     }
+-    initGpu();
++    (void)initGpu();
+     g_initialized = true;
+     logInfo("MiSTer framebuffer backend: %dx%d XRGB8888\n", MISTER_WIDTH, MISTER_HEIGHT);
+     return true;
+@@ -2554,31 +2629,8 @@ void platformExit(void) {
+         g_input_fd = -1;
+     }
+     closeJoyShared();
+-    if (g_gpu_textures != NULL) { munmap(g_gpu_textures, GPU_TEXTURE_BYTES); g_gpu_textures = NULL; }
+-    if (g_gpu_native_mapping != NULL) {
+-        munmap(g_gpu_native_mapping, GPU_NATIVE_WINDOW_BYTES);
+-        g_gpu_native_mapping = NULL;
+-        for (uint32_t i = 0; i < GPU_NATIVE_BUFFER_COUNT; ++i)
+-            g_gpu_native_buffers[i] = NULL;
+-    }
+-    for (uint32_t i = 0; i < GPU_COMMAND_BUFFER_COUNT; ++i) {
+-        if (g_gpu_command_buffers[i] != NULL) {
+-            munmap(g_gpu_command_buffers[i], GPU_COMMAND_BYTES);
+-            g_gpu_command_buffers[i] = NULL;
+-        }
+-    }
+-    g_gpu_commands = NULL;
+-    if (g_gpu_control != NULL) { munmap((void*)g_gpu_control, GPU_CONTROL_BYTES); g_gpu_control = NULL; }
+-    if (g_mem_fd >= 0) { close(g_mem_fd); g_mem_fd = -1; }
+-    g_gpu_available = false;
+-    if (g_fb != NULL) {
+-        munmap(g_fb, MISTER_FB_BYTES);
+-        g_fb = NULL;
+-    }
+-    if (g_fb_fd >= 0) {
+-        close(g_fb_fd);
+-        g_fb_fd = -1;
+-    }
++    unmapGpuHardware();
++    unmapFramebuffer();
+     g_initialized = false;
+ }
+ 
+@@ -2793,3 +2845,54 @@ void platformSleepUntil(uint64_t target) {
+     }
+     while (nowNanos() < target) YIELD();
+ }
++
++bool platformWaitForVblank(uint32_t timeoutUsec) {
++    if (g_gpu_control == NULL || g_vblank_status_disabled) return false;
++
++    __sync_synchronize();
++    if (g_gpu_control[GPU_VBLANK_MAGIC_WORD] != GPU_VBLANK_MAGIC) return false;
++
++    uint32_t current = g_gpu_control[GPU_VBLANK_COUNTER_WORD];
++    if (!g_vblank_counter_initialized) {
++        g_vblank_last_counter = current;
++        g_vblank_counter_initialized = true;
++    }
++
++    uint64_t deadline = nowNanos() + (uint64_t)timeoutUsec * 1000u;
++    while (nowNanos() < deadline) {
++        __sync_synchronize();
++        if (g_gpu_control[GPU_VBLANK_MAGIC_WORD] != GPU_VBLANK_MAGIC) {
++            g_vblank_status_disabled = true;
++            return false;
++        }
++        current = g_gpu_control[GPU_VBLANK_COUNTER_WORD];
++        if (current != g_vblank_last_counter) {
++            uint32_t elapsedFrames = current - g_vblank_last_counter;
++            g_vblank_last_counter = current;
++            if (!g_vblank_sync_reported) {
++                logInfo("MiSTer pacing: synchronized to FPGA native vblank\n");
++                g_vblank_sync_reported = true;
++            }
++            if (elapsedFrames > 1) {
++                static uint32_t missedVblankLogs = 0;
++                if (missedVblankLogs < 100) {
++                    logWarn("MiSTer pacing: %u raster intervals elapsed during one game tick\n",
++                            elapsedFrames);
++                    missedVblankLogs++;
++                }
++            }
++            return true;
++        }
++        // The heartbeat write is normally visible within a small fraction of
++        // a scanline. A short sleep avoids burning an HPS core for the entire
++        // frame while keeping the game-step phase tightly behind vblank.
++        usleep(50);
++    }
++
++    // A stale magic word can remain in DDR when a newer runner is paired with
++    // an older RBF. Disable further polling for this process and use the
++    // established absolute-timer path instead of adding a timeout every tick.
++    g_vblank_status_disabled = true;
++    logWarn("MiSTer pacing: FPGA vblank heartbeat unavailable; using timer fallback\n");
++    return false;
++}
+diff --git a/src/backends/mister_gpu.h b/src/backends/mister_gpu.h
+index 3468793..caebb78 100644
+--- a/src/backends/mister_gpu.h
++++ b/src/backends/mister_gpu.h
+@@ -46,6 +46,6 @@ bool MisterGpu_readbackLastPresentedRgba(uint8_t* rgba, int32_t width, int32_t h
+ void MisterGpu_continueFrame(void);
+ void MisterGpu_useSoftwareFrame(void);
+ bool MisterGpu_prepareSaveState(void);
+-void MisterGpu_afterSaveStateRestore(void);
++bool MisterGpu_afterSaveStateRestore(void);
+ 
+ #endif
+diff --git a/src/loop.c b/src/loop.c
+index 401acd6..273b6cb 100644
+--- a/src/loop.c
++++ b/src/loop.c
+@@ -662,6 +662,7 @@ static bool am2rStateSave(Runner* runner, int slot) {
+     am2rRawUnlink(AM2R_STATE_RESUME_PATH);
+     if (!am2rStateSend(AM2R_STATE_SNAPSHOT_READY, slot, runner->frameCount, 0)) {
+         int savedError = errno;
++        MisterGpu_afterSaveStateRestore();
+ #ifdef USE_MINIAUDIO
+         MaAudioSystem_restoreSaveState(runner->audioSystem);
+ #else
+@@ -677,7 +678,7 @@ static bool am2rStateSave(Runner* runner, int slot) {
+     // timelines reconnect to whichever native wrapper is currently running.
+     am2rStateClose();
+     int checkpointError = am2rStateWaitForResume();
+-    MisterGpu_afterSaveStateRestore();
++    bool hardwareRestored = MisterGpu_afterSaveStateRestore();
+ #ifdef USE_MINIAUDIO
+     bool audioRestored = MaAudioSystem_restoreSaveState(runner->audioSystem);
+ #else
+@@ -685,7 +686,8 @@ static bool am2rStateSave(Runner* runner, int slot) {
+     bool audioRestored = true;
+ #endif
+     bool endpointRestored = am2rStateOpen();
+-    if (checkpointError != 0 || !audioRestored || !endpointRestored) {
++    if (checkpointError != 0 || !hardwareRestored || !audioRestored ||
++        !endpointRestored) {
+         int savedError = checkpointError != 0 ? checkpointError : EIO;
+         am2rStateSend(AM2R_STATE_SNAPSHOT_ERROR, slot, runner->frameCount, savedError);
+         logWarn("AM2R save state %d failed after quiesce: %s\n",
+@@ -1622,14 +1624,27 @@ int loop(CommandLineArgs args, const char *argv0) {
+                 }
+                 fastForwardTabPrev = fastForwardTabNow;
+                 double effectiveSpeed = (args.fastForwardSpeed > 0.0 && fastForwardActive) ? args.fastForwardSpeed : args.speedMultiplier;
++
++#ifdef USE_MISTER
++                // A nominally matching HPS timer and FPGA raster still derive
++                // from independent oscillators, so their phase inevitably
++                // drifts and occasionally makes scanout repeat a frame. Newer
++                // AM2R cores publish a vblank heartbeat through shared DDR.
++                // Start each ordinary 60 Hz game tick from that hardware edge;
++                // older RBFs fall through to the compatible timer path below.
++                bool rasterPaced = runner->currentRoom->speed == 60 &&
++                                   effectiveSpeed == 1.0 &&
++                                   platformWaitForVblank(25000);
++                if (rasterPaced) {
++                    lastFrameTime = nowNanos();
++                    continue;
++                }
++#endif
++
+                 uint64_t targetFrameTime;
+ #ifdef USE_MISTER
+-                // The core's native raster is exactly 6.25 MHz / (398 * 262),
+-                // or 59.9371 Hz. Running AM2R's nominal 60 Hz rooms against a
+-                // 60.000 Hz software timer advances one game frame every
+-                // ~15.9 seconds and makes scanout skip it. Pace all room rates
+-                // as divisors of the native raster so game and video never
+-                // beat against each other.
++                // Backward-compatible fallback for an older core without the
++                // heartbeat, non-60 Hz rooms, and explicit speed overrides.
+                 const double misterFrameNanos = 16684160.0;
+                 targetFrameTime = (uint64_t)(misterFrameNanos * 60.0 /
+                                   (runner->currentRoom->speed * effectiveSpeed));
+

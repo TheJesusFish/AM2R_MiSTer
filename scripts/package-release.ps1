@@ -81,10 +81,13 @@ Windows copy of AM2R 1.1 extracted into a folder.
    /media/fat/savestates/AM2R. Normal game saves are stored in
    /media/fat/saves/AM2R.
 
-The first launch validates and extracts AM2R.zip into RAM and can take longer
-than a warm relaunch. Save states contain executable memory and only load with
-the exact runtime build which created them. Weapon Select+Start exits to the
-MiSTer menu.
+The first launch validates and extracts AM2R.zip into a generated
+/media/fat/games/am2r/.runtime-cache and can take longer than a warm relaunch.
+Later launches reuse that cache while the archive is unchanged. Save states
+contain executable memory and only load with the exact runtime build which
+created them. Keep at least 256 MiB free for a checkpoint; low-space requests
+are refused without replacing the previous slot. Weapon Select+Start exits to
+the MiSTer menu.
 
 AM2R.zip and all other proprietary game files are intentionally excluded.
 '@

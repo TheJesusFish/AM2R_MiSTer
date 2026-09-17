@@ -3,6 +3,10 @@
 module am2r_ddr_arbiter_tb;
 	reg clk = 0;
 	reg reset = 1;
+	reg frame_tick = 0;
+	reg display_tick = 0;
+	reg [31:0] native_frame = 32'h12345678;
+	reg [31:0] scanout_frame = 32'h89abcdef;
 	reg [7:0] gpu_burstcnt = 2;
 	reg [28:0] gpu_addr = 29'h100;
 	reg [63:0] gpu_din = 64'h1122334455667788;
@@ -30,9 +34,16 @@ module am2r_ddr_arbiter_tb;
 	reg [28:0] first_read_addr = 0, second_read_addr = 0;
 	reg write_seen = 0;
 	reg write_interleaved = 0;
+	integer frame_status_writes = 0;
+	integer frame_detail_writes = 0;
+	reg [63:0] last_frame_status = 0;
+	reg [63:0] last_frame_detail = 0;
 
 	am2r_ddr_arbiter dut(
 		.clk(clk), .reset(reset),
+		.frame_tick(frame_tick),
+		.display_tick(display_tick),
+		.native_frame(native_frame), .scanout_frame(scanout_frame),
 		.gpu_burstcnt(gpu_burstcnt), .gpu_addr(gpu_addr), .gpu_din(gpu_din),
 		.gpu_be(gpu_be), .gpu_rd(gpu_rd), .gpu_we(gpu_we),
 		.gpu_busy(gpu_busy), .gpu_dout(gpu_dout), .gpu_dout_ready(gpu_ready),
@@ -57,6 +68,14 @@ module am2r_ddr_arbiter_tb;
 		    ddram_din == gpu_din && ddram_be == gpu_be) begin
 			write_seen <= 1;
 			write_accepts <= write_accepts + 1;
+		end
+		if (ddram_we && !ddram_busy && ddram_addr == 29'h047fe008) begin
+			frame_status_writes <= frame_status_writes + 1;
+			last_frame_status <= ddram_din;
+		end
+		if (ddram_we && !ddram_busy && ddram_addr == 29'h047fe009) begin
+			frame_detail_writes <= frame_detail_writes + 1;
+			last_frame_detail <= ddram_din;
 		end
 		if (dut.owner == 3 && ddram_rd)
 			write_interleaved <= 1;
@@ -99,7 +118,29 @@ module am2r_ddr_arbiter_tb;
 		@(posedge clk); @(negedge clk); vid_rd = 0;
 		return_beat(64'h6); return_beat(64'h7); return_beat(64'h8);
 
-		if (errors == 0) $display("PASS: DDR arbiter priority, burst ownership, response routing, and writes");
+		// The early pacing pulse publishes the heartbeat without prematurely
+		// sampling presentation diagnostics.
+		@(negedge clk); frame_tick = 1;
+		repeat (4) @(negedge clk);
+		frame_tick = 0;
+		wait (frame_status_writes == 1);
+		repeat (2) @(posedge clk);
+		if (frame_detail_writes != 0)
+			errors = errors + 1;
+
+		// The real display boundary independently captures the native and scanout
+		// frame IDs, even though the ARM pacing edge led it in time.
+		@(negedge clk); display_tick = 1;
+		repeat (4) @(negedge clk);
+		display_tick = 0;
+		wait (frame_detail_writes == 1);
+		repeat (2) @(posedge clk);
+		if (last_frame_status != 64'h56424c4b00000001)
+			errors = errors + 1;
+		if (last_frame_detail != 64'h1234567889abcdef)
+			errors = errors + 1;
+
+		if (errors == 0) $display("PASS: DDR arbiter priority, burst ownership, response routing, writes, and vblank heartbeat");
 		else $fatal(1, "FAIL: %0d DDR arbiter errors", errors);
 		$finish;
 	end

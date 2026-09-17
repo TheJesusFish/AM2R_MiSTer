@@ -38,14 +38,20 @@ git apply ../../patches/butterscotch-water-native-deferred-export.patch
 git apply ../../patches/butterscotch-water-pipeline-performance.patch
 git apply ../../patches/butterscotch-large-file-metadata.patch
 git apply ../../patches/butterscotch-crt-ui-inset.patch
+git apply ../../patches/butterscotch-savestate-reliability.patch
+git apply ../../patches/butterscotch-runtime-performance.patch
+git apply ../../patches/butterscotch-heavy-room-pacing.patch
+git apply ../../patches/butterscotch-hardware-reattach-vblank.patch
+git apply ../../patches/butterscotch-opaque-suffix-cull.patch
+git apply ../../patches/butterscotch-room122-collision-hud.patch
+git apply ../../patches/butterscotch-subscreen-rendering.patch
 ```
 
-The twenty-seven files were generated from the hardware-validated working tree and
-each passes `git apply --reverse --check` against that tree. See the final
-hardware and save-state reports under `reports/` for build identities and test
-results.
-Applying all twenty-seven to a fresh detached clone at the base commit reconstructs
-the current runner source after normalizing checkout line endings. The first
+The thirty-four files were generated from the hardware-validated working tree.
+Each clean-applies in the order above, and applying all thirty-four to a fresh
+detached clone at the base commit reconstructs the current runner source after
+normalizing checkout line endings. See the final hardware and save-state
+reports under `reports/` for build identities and test results. The first
 seven patches were reconstructed and byte-compared with the
 80 MHz hardware-tested runner source on 2026-09-06. The eighth adds semantic
 controller bindings, recorded-script precedence for AM2R's compatibility
@@ -123,6 +129,62 @@ AM2R 1.1 title-screen version and URL overlays while leaving the title artwork,
 gameplay layers, camera coordinates, and collision coordinates at their native
 320x240 positions. The setting is transported through a versioned
 wrapper/runner shared-memory field and defaults to off.
+The twenty-eighth patch removes the remaining volatile Linux endpoints from
+checkpoints, bypasses DMTCP interposition during the save handshake with direct
+ARM system calls, preloads the unwind library before checkpoint threads exist,
+and tolerates an empty legacy resume marker until its writer has published the
+result. These changes make a state portable across core exits and different
+MiSTer input-device numbering without changing game state.
+The twenty-ninth patch removes a full-room spatial-grid scan from ordinary
+instance movement while retaining it for lifecycle cleanup and inconsistent
+cache repair. It also replaces byte-at-a-time software framebuffer clears with
+packed RGBA stores and adds an exact signed-32-bit fast path for GameMaker's
+round-to-even coordinate conversion. USB-1 testing in the supplied high-load
+room improved from roughly 46–52 FPS to 57–59 FPS without removing the stale
+collision-entry protection used by room transitions.
+The thirtieth patch retains exact spatial-grid bounds across AM2R's repeated
+deactivate/activate cycle, accelerates single-result line and rectangle queries
+without changing their original instance ordering, and removes temporary
+profiling instrumentation. It also paces nominal 60 Hz rooms to the core's
+exact 59.937 Hz native raster. In an exact USB-1 movement capture this reduced
+repeated frames from six, including a four-frame stutter cluster, to the one
+repeat expected when recording a 59.937 Hz source at 60.000 fps. A staged
+ten-missile Alpha Metroid regression reduced enemy health from 70 to 40,
+confirming reciprocal projectile collision behavior remains intact.
+The thirty-first patch removes framebuffer, FPGA DDR, and input endpoints from
+persistent checkpoints and reattaches them after save or restore. It also
+phase-locks ordinary 60 Hz game ticks to a core-local native-vblank heartbeat
+published by the FPGA, with the raster-matched absolute timer retained as a
+backward-compatible fallback for older RBFs. In the two user-supplied pacing
+rooms, controlled USB-1 captures contain one adjacent repeat in 720 and 600
+moving frames respectively—the expected 60.000 Hz capture sampling of the
+59.937 Hz source—with no multi-frame hitch cluster.
+The thirty-second patch shortens an already proven opaque scrolling-layer
+group to the latest suffix that still covers all 320x240 output pixels. In the
+user-reported room 122 jump, this removes an earlier fully overwritten wrapped
+background pair: the hardware command list fell from 56 commands and 247,488
+drawn pixels to 53 commands and 169,114 pixels, while FPGA work fell from about
+493,000 to 364,000 cycles. With the core's 48-line pacing lead, a synchronized
+USB-1 trace advanced exactly one scanout frame on 1,226 of 1,228 measured
+rasters and contained only one isolated repeat/skip pair instead of 106 pairs.
+The thirty-third patch preserves per-object GameMaker append order while line
+and rectangle collision builtins inspect only nearby spatial candidates. In
+the same room it reduces missed game ticks from 29 to 8 while retaining the
+exact append-order semantics required by the earlier door, grapple, and
+projectile-order fixes. It also presents
+the HUD as a 320-by-content-height surface view and updates only changed spans
+in the inactive FPGA texture buffer. The HUD transfer fell from a median
+1.094 ms to 0.277 ms; a final lossless UGREEN run without process-memory
+sampling contained 1,137 unique moving frames in 1,140 captures, with three
+isolated repeats and no stutter cluster.
+The thirty-fourth patch keeps every subscreen primitive in the atomic FPGA
+command stream. It lowers Equipment's untextured connector lines through a
+one-pixel affine texture, materializes the Logs page's uncommon four-corner
+label gradients as compact dynamic textures, and caches 90/270-degree chooser
+art as row-major textures for the paired axis blitter. USB-1's fallback count
+stayed flat through Map, Equipment, Logs, and Options, consecutive-frame sheets
+contained no partial menu frames, and steady chooser cost fell from about
+2.15 million to 0.76 million FPGA cycles.
 
 | Patch | SHA-256 |
 | --- | --- |
@@ -153,6 +215,13 @@ wrapper/runner shared-memory field and defaults to off.
 | `butterscotch-water-pipeline-performance.patch` | `95d1c60a743ef916f0c779b92eae033b40c2628730ab02b8fb47a9ee2e2dc1c2` |
 | `butterscotch-large-file-metadata.patch` | `498ac455036b22d9b3e2061c6c798a46d140830279494abcb517fe102cfff9e0` |
 | `butterscotch-crt-ui-inset.patch` | `9abbe0daa25b2b047ea4e14834a373445775aa0c316c24d40c46344f78d0711f` |
+| `butterscotch-savestate-reliability.patch` | `d7ee348ca1308212e0462a40657d119ff0cf11c8536c73e1acea9e18fa1554ad` |
+| `butterscotch-runtime-performance.patch` | `28bcbada72e65b1a7af2cd5e8d5fa63f7ef2db669394ad3770bf0b85dc3d293c` |
+| `butterscotch-heavy-room-pacing.patch` | `0c739b100eaa46d13cb260156f70fa89a469fdd6b520338f02c76dda1173a962` |
+| `butterscotch-hardware-reattach-vblank.patch` | `bd95428191263c6995cb5cef10e138ab2de97683c0bab3fb4e22b6ea76f81caa` |
+| `butterscotch-opaque-suffix-cull.patch` | `e644139a42d9a68db86b6c27a4d748e4c1a7a48a2b146d09ffcb8005eda4f034` |
+| `butterscotch-room122-collision-hud.patch` | `e749e752243988a3cf660a6ccca3504f658beb38a190c9810a65cfc25209451a` |
+| `butterscotch-subscreen-rendering.patch` | `26ea5183f48dbdc4c2b94bac8142f82bd39ee6bd36d34acb5f6189b92e5d9b7e` |
 
 Persistent checkpoints use DMTCP 3.2.0. Apply the MiSTer ARMv7 portability
 patch to a clean DMTCP checkout at commit

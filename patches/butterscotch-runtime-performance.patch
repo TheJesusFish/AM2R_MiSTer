@@ -1,0 +1,214 @@
+diff --git a/src/real_type.h b/src/real_type.h
+index df7d3a5..6a0ccb3 100644
+--- a/src/real_type.h
++++ b/src/real_type.h
+@@ -75,6 +75,23 @@ typedef double GMLReal;
+ // While the original runner uses "llrint(double)", we use our own banker's rounding implementation to avoid quirks in specific platforms (like the PlayStation 2) having different llrint rounding implementations.
+ static inline GMLReal GMLReal_bankersRound(GMLReal v) {
+     if (isnan(v) || isinf(v)) return v;
++
++    // Instance coordinates and collision bounds overwhelmingly fit in a
++    // signed 32-bit integer.  Converting those values toward zero is a single
++    // VFP operation on MiSTer, whereas floor() enters libm.  Handle positive
++    // and negative fractions explicitly so this remains exact round-to-even,
++    // including negative half-way values.  Keep the original implementation
++    // as the range-safe fallback for unusually large script values.
++    if (v >= (GMLReal)INT32_MIN && v <= (GMLReal)INT32_MAX) {
++        int32_t integer = (int32_t)v;
++        GMLReal fraction = v - (GMLReal)integer;
++        if (fraction > 0.5) return (GMLReal)(integer + 1);
++        if (fraction < -0.5) return (GMLReal)(integer - 1);
++        if (fraction == 0.5) return (GMLReal)((integer & 1) ? integer + 1 : integer);
++        if (fraction == -0.5) return (GMLReal)((integer & 1) ? integer - 1 : integer);
++        return (GMLReal)integer;
++    }
++
+     GMLReal f = GMLReal_floor(v);
+     GMLReal frac = v - f;
+     if (0.5 > frac) return f;
+diff --git a/src/spatial_grid.c b/src/spatial_grid.c
+index 3a19725..d40658e 100644
+--- a/src/spatial_grid.c
++++ b/src/spatial_grid.c
+@@ -33,17 +33,35 @@ void SpatialGrid_free(SpatialGrid* grid) {
+     free(grid);
+ }
+ 
+-void SpatialGrid_removeInstance(SpatialGrid* grid, Instance* instance) {
++// Remove an instance using the cells recorded on the instance itself.  This is
++// the normal movement path: collisionCells is maintained alongside every grid
++// insertion, so touching the whole room grid here is unnecessary.  Return
++// false when the cache is empty, invalid, or inconsistent so the caller can
++// repair the grid with the defensive full scan.
++static bool SpatialGrid_removeInstanceFromTrackedCells(SpatialGrid* grid, Instance* instance) {
+     int32_t totalCells = (int32_t)grid->gridWidth * (int32_t)grid->gridHeight;
+-    bool removedAny = false;
++    int32_t expectedRemovals = (int32_t)arrlen(instance->collisionCells);
++    int32_t actualRemovals = 0;
++    bool valid = expectedRemovals > 0;
++
++#ifdef SPATIAL_GRID_TEST_INSTRUMENTATION
++    grid->trackedRemovalPasses++;
++#endif
+ 
+-    // First remove from any cells named in this instance's cached tracking data.
+-    repeat(arrlen(instance->collisionCells), i) {
++    repeat(expectedRemovals, i) {
+         uint32_t gridCoordinates = instance->collisionCells[i];
+         int32_t gridX = SpatialGrid_unpackGridX(gridCoordinates);
+         int32_t gridY = SpatialGrid_unpackGridY(gridCoordinates);
++        if (gridX < 0 || gridX >= grid->gridWidth ||
++            gridY < 0 || gridY >= grid->gridHeight) {
++            valid = false;
++            continue;
++        }
+         int32_t cellIndex = SpatialGrid_cellIndex(grid, gridX, gridY);
+-        if (cellIndex < 0 || cellIndex >= totalCells) continue;
++        if (cellIndex < 0 || cellIndex >= totalCells) {
++            valid = false;
++            continue;
++        }
+ 
+         Instance** cell = grid->grid[cellIndex];
+         int32_t cellLen = (int32_t) arrlen(cell);
+@@ -51,7 +69,7 @@ void SpatialGrid_removeInstance(SpatialGrid* grid, Instance* instance) {
+             if (cell[j] == instance) {
+                 if (j < cellLen - 1) memmove(&cell[j], &cell[j + 1], (size_t) (cellLen - 1 - j) * sizeof(Instance*));
+                 arrsetlen(cell, cellLen - 1);
+-                removedAny = true;
++                actualRemovals++;
+                 cellLen--;
+             } else {
+                 j++;
+@@ -59,6 +77,16 @@ void SpatialGrid_removeInstance(SpatialGrid* grid, Instance* instance) {
+         }
+     }
+ 
++    return valid && actualRemovals == expectedRemovals;
++}
++
++static void SpatialGrid_removeInstanceFromAllCells(SpatialGrid* grid, Instance* instance) {
++    int32_t totalCells = (int32_t)grid->gridWidth * (int32_t)grid->gridHeight;
++
++#ifdef SPATIAL_GRID_TEST_INSTRUMENTATION
++    grid->fullRemovalPasses++;
++#endif
++
+     // Some room transitions and destructions can leave stale grid entries even when
+     // collisionCells was cleared or never populated for the current grid. Fall back to
+     // a full-grid scan so the instance pointer is not left dangling in the spatial hash.
+@@ -69,22 +97,39 @@ void SpatialGrid_removeInstance(SpatialGrid* grid, Instance* instance) {
+             if (cell[j] == instance) {
+                 if (j < cellLen - 1) memmove(&cell[j], &cell[j + 1], (size_t) (cellLen - 1 - j) * sizeof(Instance*));
+                 arrsetlen(cell, cellLen - 1);
+-                removedAny = true;
+                 cellLen--;
+             } else {
+                 j++;
+             }
+         }
+     }
++}
++
++static void SpatialGrid_finishInstanceRemoval(Instance* instance) {
++    arrsetlen(instance->collisionCells, 0);
++    instance->spatialGridDirty = false;
++}
++
++void SpatialGrid_removeInstance(SpatialGrid* grid, Instance* instance) {
++    // Lifecycle removal must be exhaustive.  In particular, room transitions
++    // may encounter an instance whose per-instance cache belongs to the old
++    // grid or was already cleared.  Keep the upstream stale-entry fix here.
++    SpatialGrid_removeInstanceFromAllCells(grid, instance);
++    SpatialGrid_finishInstanceRemoval(instance);
++}
++
++static void SpatialGrid_removeInstanceForSync(SpatialGrid* grid, Instance* instance) {
++    // A normally moving active instance has an exact cell cache.  Only scan the
++    // full room grid if that invariant is absent or has been broken.
++    if (!SpatialGrid_removeInstanceFromTrackedCells(grid, instance))
++        SpatialGrid_removeInstanceFromAllCells(grid, instance);
+ 
+     // Removal is also the state transition that makes a later activation
+     // eligible to enqueue the instance again.  An instance can be deactivated
+     // before its first pending grid insertion is synchronized, in which case
+     // no cell contains it and removedAny is false.  Leaving the dirty bit set
+     // in that case permanently suppresses the later activation enqueue.
+-    (void) removedAny;
+-    arrsetlen(instance->collisionCells, 0);
+-    instance->spatialGridDirty = false;
++    SpatialGrid_finishInstanceRemoval(instance);
+ }
+ 
+ void SpatialGrid_syncGrid(Runner* runner, SpatialGrid* grid) {
+@@ -116,7 +161,7 @@ void SpatialGrid_syncGrid(Runner* runner, SpatialGrid* grid) {
+         instance->spatialGridDirty = false;
+ 
+         // Remove from old cells
+-        SpatialGrid_removeInstance(grid, instance);
++        SpatialGrid_removeInstanceForSync(grid, instance);
+ 
+         InstanceBBox bbox = Collision_computeBBox(runner, instance);
+ 
+diff --git a/src/spatial_grid.h b/src/spatial_grid.h
+index bc07e07..78b38b9 100644
+--- a/src/spatial_grid.h
++++ b/src/spatial_grid.h
+@@ -22,6 +22,10 @@ typedef struct {
+     int32_t* dirtyInstances;
+     // Flat 2D grid of Instance* stb_ds arrays
+     Instance*** grid;
++#ifdef SPATIAL_GRID_TEST_INSTRUMENTATION
++    uint32_t trackedRemovalPasses;
++    uint32_t fullRemovalPasses;
++#endif
+ } SpatialGrid;
+ 
+ static inline int32_t SpatialGrid_cellIndex(SpatialGrid* grid, int32_t x, int32_t y) {
+diff --git a/src/sw_renderer.c b/src/sw_renderer.c
+index d861a60..228c267 100644
+--- a/src/sw_renderer.c
++++ b/src/sw_renderer.c
+@@ -1853,14 +1853,14 @@ static void swFlush(Renderer* renderer) {
+ void SWRenderer_clearFrameBuffer(Renderer* renderer, uint32_t color) {
+     SWRenderer* sw = (SWRenderer*)renderer;
+     if (sw->hostFramebuffer == nullptr) return;
+-    uint8_t* dst = sw->hostFramebuffer;
+     uint8_t r = BGR_R(color), g = BGR_G(color), b = BGR_B(color);
+-    for (int32_t i = 0; i < sw->hostWidth * sw->hostHeight; ++i) {
+-        dst[i * 4 + 0] = r;
+-        dst[i * 4 + 1] = g;
+-        dst[i * 4 + 2] = b;
+-        dst[i * 4 + 3] = 255;
+-    }
++    uint8_t rgba[4] = {r, g, b, 255};
++    uint32_t packed;
++    memcpy(&packed, rgba, sizeof(packed));
++    uint32_t* dst = (uint32_t*)sw->hostFramebuffer;
++    int32_t pixelCount = sw->hostWidth * sw->hostHeight;
++    for (int32_t i = 0; i < pixelCount; ++i)
++        dst[i] = packed;
+ }
+ 
+ static void swClearScreen(Renderer* renderer, uint32_t color, float alpha) {
+@@ -1886,10 +1886,16 @@ static void swClearScreen(Renderer* renderer, uint32_t color, float alpha) {
+         }
+     }
+ #endif
+-    for (int32_t i = 0; i < sw->fbWidth * sw->fbHeight; ++i) {
+-        uint8_t* dst = sw->framebuffer + (size_t)i * 4;
+-        dst[0] = r; dst[1] = g; dst[2] = b; dst[3] = a;
+-    }
++    // Every software target is malloc-aligned RGBA32 storage.  Fill one pixel
++    // per store instead of four byte stores; constructing the word through
++    // memcpy preserves the exact byte order on every host architecture.
++    uint8_t rgba[4] = {r, g, b, a};
++    uint32_t packed;
++    memcpy(&packed, rgba, sizeof(packed));
++    uint32_t* dst = (uint32_t*)sw->framebuffer;
++    int32_t pixelCount = sw->fbWidth * sw->fbHeight;
++    for (int32_t i = 0; i < pixelCount; ++i)
++        dst[i] = packed;
+ }
+ 
+ static void swDrawRectangleColor(Renderer* renderer, float x1, float y1, float x2, float y2, uint32_t c1, uint32_t c2, uint32_t c3, uint32_t c4, float alpha, bool outline) {

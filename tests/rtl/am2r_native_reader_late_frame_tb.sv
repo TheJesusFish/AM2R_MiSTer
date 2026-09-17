@@ -16,6 +16,7 @@ module am2r_native_reader_late_frame_tb;
 	wire ddr_rd;
 	wire ce_pix, hblank, hsync, vblank, vsync, new_frame, new_line;
 	wire frame_ready;
+	wire [31:0] scanout_frame;
 	wire buffer_in_use_valid;
 	wire [1:0] buffer_in_use;
 	wire underflow_toggle;
@@ -39,6 +40,7 @@ module am2r_native_reader_late_frame_tb;
 		.frame_ready(frame_ready), .frame_r(r), .frame_g(g), .frame_b(b),
 		.ce_pix(ce_pix), .hblank(hblank), .hsync(hsync), .vblank(vblank),
 		.vsync(vsync), .new_frame(new_frame), .new_line(new_line),
+		.pace_tick(),
 		.r(), .g(), .b()
 	);
 
@@ -49,7 +51,8 @@ module am2r_native_reader_late_frame_tb;
 		.clk_vid(clk_vid), .ce_pix(ce_pix), .de(~(hblank | vblank)),
 		.vblank(vblank), .new_frame(new_frame), .new_line(new_line),
 		.source_frame(source_frame), .source_buffer(source_buffer),
-		.frame_ready(frame_ready), .buffer_in_use_valid(buffer_in_use_valid),
+		.frame_ready(frame_ready), .scanout_frame(scanout_frame),
+		.buffer_in_use_valid(buffer_in_use_valid),
 		.buffer_in_use(buffer_in_use), .r_out(r), .g_out(g), .b_out(b),
 		.underflow_toggle(underflow_toggle)
 	);
@@ -146,32 +149,49 @@ module am2r_native_reader_late_frame_tb;
 		wait (samples == 320 * 240);
 		checking = 0;
 		if (!buffer_in_use_valid || buffer_in_use != 1) errors = errors + 1;
+		if (scanout_frame != 2) errors = errors + 1;
 
-		// A publication after the four-line cutoff must remain queued for the
-		// following raster, avoiding a risky late FIFO reset.
+		// Exercise the end of the widened acceptance window.  Publication on
+		// blank line 15 must still restart the preload in time for active video.
 		wait_for_new_frame();
-		wait_blank_lines(6);
+		wait_blank_lines(15);
 		source_buffer = 2'd2;
 		source_frame = 3;
-		expected_buffer = 2'd1;
-		samples = 0;
-		checking = 1;
-		wait (samples == 320 * 240);
-		checking = 0;
-		if (buffer_in_use != 2'd1) errors = errors + 1;
-
-		// The queued buffer becomes active normally at the next frame edge.
-		wait_for_new_frame();
 		expected_buffer = 2'd2;
 		samples = 0;
 		checking = 1;
 		wait (samples == 320 * 240);
 		checking = 0;
 		if (buffer_in_use != 2'd2) errors = errors + 1;
+		if (scanout_frame != 3) errors = errors + 1;
+
+		// A publication after the 16-line cutoff must remain queued for the
+		// following raster, avoiding a FIFO reset too close to active video.
+		wait_for_new_frame();
+		wait_blank_lines(18);
+		source_buffer = 2'd0;
+		source_frame = 4;
+		expected_buffer = 2'd2;
+		samples = 0;
+		checking = 1;
+		wait (samples == 320 * 240);
+		checking = 0;
+		if (buffer_in_use != 2'd2) errors = errors + 1;
+		if (scanout_frame != 3) errors = errors + 1;
+
+		// The queued buffer becomes active normally at the next frame edge.
+		wait_for_new_frame();
+		expected_buffer = 2'd0;
+		samples = 0;
+		checking = 1;
+		wait (samples == 320 * 240);
+		checking = 0;
+		if (buffer_in_use != 2'd0) errors = errors + 1;
+		if (scanout_frame != 4) errors = errors + 1;
 		if (underflow_toggle != 0) errors = errors + 1;
 
 		if (errors == 0)
-			$display("PASS: early-vblank publication is adopted atomically and late publication waits one raster");
+			$display("PASS: 16-line vblank publication is atomic and post-cutoff publication waits one raster");
 		else $fatal(1, "FAIL: %0d late-frame reader errors", errors);
 		$finish;
 	end

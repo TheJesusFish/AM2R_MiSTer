@@ -8,7 +8,7 @@ module am2r_native_video_tb;
 	reg [7:0] frame_g = 0;
 	reg [7:0] frame_b = 0;
 	wire ce_pix, hblank, hsync, vblank, vsync;
-	wire new_frame, new_line;
+	wire new_frame, new_line, pace_tick;
 	wire [7:0] r, g, b;
 	integer pixels = 0;
 	integer lines = 0;
@@ -18,13 +18,16 @@ module am2r_native_video_tb;
 	integer vsync_lines = 0;
 	integer clocks_since_ce = 0;
 	integer errors = 0;
+	integer pace_ticks = 0;
+	integer pace_line = -1;
 	reg seen_ce = 0;
 
 	am2r_native_video dut(
 		.clk(clk), .reset(reset),
 		.frame_ready(frame_ready), .frame_r(frame_r), .frame_g(frame_g), .frame_b(frame_b),
 		.ce_pix(ce_pix), .hblank(hblank), .hsync(hsync), .vblank(vblank),
-		.vsync(vsync), .new_frame(new_frame), .new_line(new_line), .r(r), .g(g), .b(b)
+		.vsync(vsync), .new_frame(new_frame), .new_line(new_line),
+		.pace_tick(pace_tick), .r(r), .g(g), .b(b)
 	);
 
 	always #5 clk = ~clk;
@@ -33,6 +36,15 @@ module am2r_native_video_tb;
 		if (reset) begin
 			clocks_since_ce <= 0;
 		end else begin
+			if (pace_tick) begin
+				pace_ticks = pace_ticks + 1;
+				pace_line = lines;
+			end
+			if (new_frame && lines - pace_line != 48) begin
+				$display("Pacing edge was %0d lines before vblank, expected 48",
+				         lines - pace_line);
+				errors = errors + 1;
+			end
 			clocks_since_ce <= clocks_since_ce + 1;
 			if (ce_pix) begin
 				if (seen_ce && clocks_since_ce != 3) begin
@@ -68,6 +80,10 @@ module am2r_native_video_tb;
 		if (active_lines != 240 || hsync_pixels != 30 * 262 || vsync_lines != 3) begin
 			$display("Timing mismatch active_lines=%0d hsync_pixels=%0d vsync_lines=%0d",
 				active_lines, hsync_pixels, vsync_lines);
+			errors = errors + 1;
+		end
+		if (pace_ticks != 1) begin
+			$display("Pacing pulse count was %0d, expected 1", pace_ticks);
 			errors = errors + 1;
 		end
 		if (errors == 0)

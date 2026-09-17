@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
     [string]$SourceDirectory = (Join-Path $PSScriptRoot '..\third_party\Butterscotch'),
-    [string]$BuildDirectory = (Join-Path $PSScriptRoot '..\data\build\butterscotch-mister-pipeline-final')
+    [string]$BuildDirectory = (Join-Path $PSScriptRoot '..\data\build\butterscotch-mister-pipeline-final'),
+    [switch]$KeepSymbols
 )
 
 $ErrorActionPreference = 'Stop'
@@ -12,6 +13,7 @@ $ninja = (Resolve-Path -LiteralPath (Join-Path $projectRoot 'third_party\ninja\n
 $compiler = (Resolve-Path -LiteralPath (Join-Path $projectRoot 'scripts\zig-cc-arm-linux.cmd')).Path
 $archiver = (Resolve-Path -LiteralPath (Join-Path $projectRoot 'scripts\zig-ar.cmd')).Path
 $ranlib = (Resolve-Path -LiteralPath (Join-Path $projectRoot 'scripts\zig-ranlib.cmd')).Path
+$linkerFlags = if ($KeepSymbols) { '' } else { '-s' }
 
 if (-not (Test-Path -LiteralPath (Join-Path $source 'src\backends\mister.c'))) {
     throw 'Butterscotch MiSTer patches are not applied. See patches\README.md.'
@@ -25,6 +27,7 @@ $env:ZIG_LOCAL_CACHE_DIR = Join-Path $projectRoot 'data\build\zig-local-cache'
     '-DCMAKE_SYSTEM_NAME=Linux' `
     '-DCMAKE_SYSTEM_PROCESSOR=armv7' `
     '-DCMAKE_BUILD_TYPE=Release' `
+    "-DCMAKE_EXE_LINKER_FLAGS=$linkerFlags" `
     "-DCMAKE_C_COMPILER=$compiler" `
     "-DCMAKE_AR=$archiver" `
     "-DCMAKE_RANLIB=$ranlib" `

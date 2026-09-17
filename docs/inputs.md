@@ -18,8 +18,10 @@ readme, configuration files, and saves are not part of the core payload.
 The exact 45-member path list and supported `data.win` identity are in
 [GAME_DATA.md](../GAME_DATA.md). Put those paths at the root of the ZIP and keep
 their capitalization unchanged. The frontend checks that every required member
-exists and verifies its ZIP CRC while extracting to `/tmp/am2r-runtime`. Do not
-substitute files from another AM2R release without re-validating the runtime.
+exists and verifies its ZIP CRC while extracting to the generated
+`/media/fat/games/am2r/.runtime-cache`. It reuses that cache only while the ZIP's
+size and modification time still match. Do not substitute files from another
+AM2R release without re-validating the runtime.
 
 ## Additional useful inputs
 

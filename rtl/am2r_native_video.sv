@@ -25,6 +25,7 @@ module am2r_native_video
 	output reg         vsync = 0,
 	output reg         new_frame = 0,
 	output reg         new_line = 0,
+	output reg         pace_tick = 0,
 	output reg  [7:0]  r = 0,
 	output reg  [7:0]  g = 0,
 	output reg  [7:0]  b = 0
@@ -49,6 +50,7 @@ module am2r_native_video
 		ce_pix <= 0;
 		new_frame <= 0;
 		new_line <= 0;
+		pace_tick <= 0;
 		if (reset) begin
 			ce_count <= 0;
 			h_count <= 0;
@@ -59,6 +61,7 @@ module am2r_native_video
 			vsync <= 0;
 			new_frame <= 0;
 			new_line <= 0;
+			pace_tick <= 0;
 			r <= 0;
 			g <= 0;
 			b <= 0;
@@ -85,6 +88,12 @@ module am2r_native_video
 			end
 
 			if (h_count == H_TOTAL - 1) begin
+				// Start the next game tick 48 scanlines (3.06 ms) before
+				// vertical blank. CPU drawing and FPGA presentation then finish
+				// ahead of the publication edge instead of straddling it. The
+				// cadence remains exactly one pulse per native raster.
+				if (v_count == V_ACTIVE - 49)
+					pace_tick <= 1;
 				h_count <= 0;
 				if (v_count == V_TOTAL - 1) begin
 					v_count <= 0;

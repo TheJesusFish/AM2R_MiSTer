@@ -29,7 +29,20 @@ def object_name(data_win, object_index):
 def locate_runner():
     inferior = gdb.selected_inferior()
     runner_type = gdb.lookup_type("Runner").pointer()
-    for address in range(0x001CF000, 0x001D8000, 4):
+    # With the exact unstripped companion ELF, DMTCP restores the production
+    # image at its original non-PIE addresses and the symbol is authoritative.
+    # Retain the scan below for older checkpoints whose original ELF is gone.
+    try:
+        direct = gdb.parse_and_eval("g_runner")
+        if int(direct):
+            return int(gdb.parse_and_eval("&g_runner")), int(direct), direct.dereference()
+    except (gdb.error, gdb.MemoryError):
+        pass
+    # Production runners are stripped after link, and the final v30 link grew
+    # beyond the historical 0x1d8000 BSS ceiling as later renderer fixes were
+    # folded in without changing the state format.  Scan the complete small
+    # executable data/BSS window rather than baking in an obsolete end address.
+    for address in range(0x001CF000, 0x00220000, 4):
         try:
             raw = bytes(inferior.read_memory(address, 4))
         except gdb.MemoryError:

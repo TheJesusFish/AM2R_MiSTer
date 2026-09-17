@@ -14,7 +14,7 @@ $env:TEMP = Join-Path $build 'zig-tmp'
 $env:TMP = $env:TEMP
 New-Item -ItemType Directory -Force -Path $env:TEMP | Out-Null
 
-& $zig cc -std=c23 -DENABLE_WAD14 `
+& $zig cc -std=c23 -DENABLE_WAD14 -DSPATIAL_GRID_TEST_INSTRUMENTATION `
     "-I$(Join-Path $butterscotch 'src')" `
     "-I$(Join-Path $butterscotch 'vendor\stb\ds')" `
     (Join-Path $PSScriptRoot 'spatial_grid_activation_regression.c') `

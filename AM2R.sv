@@ -152,6 +152,7 @@ wire       vsync;
 wire       ce_pix;
 wire       new_frame;
 wire       new_line;
+wire       pace_tick;
 
 wire [7:0] gpu_ddr_burstcnt;
 wire [28:0] gpu_ddr_addr;
@@ -195,6 +196,7 @@ wire vid_ddr_dout_ready;
 wire vid_ddr_busy;
 wire vid_ddr_rd;
 wire native_frame_ready;
+wire [31:0] scanout_frame_number;
 wire [7:0] native_r;
 wire [7:0] native_g;
 wire [7:0] native_b;
@@ -218,6 +220,7 @@ am2r_native_reader native_reader
 	.source_frame(native_frame_number),
 	.source_buffer(native_frame_buffer),
 	.frame_ready(native_frame_ready),
+	.scanout_frame(scanout_frame_number),
 	.buffer_in_use_valid(scan_buffer_valid),
 	.buffer_in_use(scan_buffer_in_use),
 	.r_out(native_r),
@@ -231,6 +234,10 @@ am2r_ddr_arbiter ddr_arbiter
 (
 	.clk(clk_gpu),
 	.reset(gpu_reset),
+	.frame_tick(pace_tick),
+	.display_tick(new_frame),
+	.native_frame(native_frame_number),
+	.scanout_frame(scanout_frame_number),
 	.gpu_burstcnt(gpu_ddr_burstcnt), .gpu_addr(gpu_ddr_addr),
 	.gpu_din(gpu_ddr_din), .gpu_be(gpu_ddr_be),
 	.gpu_rd(gpu_ddr_rd), .gpu_we(gpu_ddr_we), .gpu_busy(gpu_ddr_busy),
@@ -263,6 +270,7 @@ am2r_native_video native_video
 	.vsync(vsync),
 	.new_frame(new_frame),
 	.new_line(new_line),
+	.pace_tick(pace_tick),
 	.r(video_r),
 	.g(video_g),
 	.b(video_b)

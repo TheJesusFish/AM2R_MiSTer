@@ -1,5 +1,5 @@
 param(
-    [string]$OutputPath = (Join-Path $PSScriptRoot '..\releases\AM2R_MiSTer_GitHub_Source_v24.zip')
+    [string]$OutputPath = (Join-Path $PSScriptRoot '..\releases\AM2R_MiSTer_GitHub_Source_v27.zip')
 )
 
 $ErrorActionPreference = 'Stop'

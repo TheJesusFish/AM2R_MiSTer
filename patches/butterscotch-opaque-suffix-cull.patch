@@ -1,0 +1,26 @@
+diff --git a/src/backends/mister.c b/src/backends/mister.c
+index f0455f9..4ee0d06 100644
+--- a/src/backends/mister.c
++++ b/src/backends/mister.c
+@@ -838,7 +838,20 @@ static uint32_t cullFullyCoveredPrefix(void) {
+             for (uint32_t i = groupStart; i < groupEnd && opaque; ++i)
+                 opaque = axisCommandSourceIsOpaque(&g_gpu_commands[i]);
+             if (opaque) {
+-                bestPrefix = groupStart;
++                // A single texture is often split at a scrolling wrap point.
++                // GameMaker can draw two complete wrapped layers from that
++                // texture consecutively, so the last two strips already hide
++                // the first two. Find the shortest opaque suffix which still
++                // covers the target instead of retaining the whole group.
++                memset(g_gpu_opaque_coverage, 0,
++                       sizeof(g_gpu_opaque_coverage));
++                for (uint32_t i = groupEnd; i > groupStart; --i) {
++                    markAxisCommandCoverage(&g_gpu_commands[i - 1u]);
++                    if (coverageIsFull()) {
++                        bestPrefix = i - 1u;
++                        break;
++                    }
++                }
+                 break;
+             }
+         }

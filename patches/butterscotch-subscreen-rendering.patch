@@ -1,0 +1,300 @@
+diff --git a/src/sw_renderer.c b/src/sw_renderer.c
+index 9b9d094..6f70e0e 100644
+--- a/src/sw_renderer.c
++++ b/src/sw_renderer.c
+@@ -404,15 +404,120 @@ static uint32_t swGpuPrepareAxisTexture(SWRenderer* sw, const uint8_t* pixels,
+     return address;
+ }
+ 
++static uint32_t swGpuQuarterTurnTexture(SWRenderer* sw,
++                                       const uint8_t* source,
++                                       int32_t sourceWidth,
++                                       int32_t sourceHeight,
++                                       int32_t width,
++                                       int32_t height,
++                                       int32_t uStart,
++                                       int32_t vStart,
++                                       int32_t uDx,
++                                       int32_t vDx,
++                                       int32_t uDy,
++                                       int32_t vDy,
++                                       int32_t uMin,
++                                       int32_t uMax,
++                                       int32_t vMin,
++                                       int32_t vMax) {
++    // Only immutable texture pages are safe to retain in this cache. Dynamic
++    // GameMaker surfaces can change without changing their allocation.
++    bool staticPage = false;
++    for (uint32_t page = 0; page < sw->textureCount; ++page) {
++        if (sw->texturePixels[page] == source) {
++            staticPage = true;
++            break;
++        }
++    }
++    if (!staticPage || width <= 0 || height <= 0 || width > 320 || height > 240)
++        return 0;
++
++    for (uint32_t i = 0; i < sw->gpuQuarterTurnCacheCount; ++i) {
++        SWGpuQuarterTurnCache* entry = &sw->gpuQuarterTurnCache[i];
++        if (entry->source == source &&
++            entry->sourceWidth == sourceWidth && entry->sourceHeight == sourceHeight &&
++            entry->width == width && entry->height == height &&
++            entry->uStart == uStart && entry->vStart == vStart &&
++            entry->uDx == uDx && entry->vDx == vDx &&
++            entry->uDy == uDy && entry->vDy == vDy &&
++            entry->uMin == uMin && entry->uMax == uMax &&
++            entry->vMin == vMin && entry->vMax == vMax)
++            return entry->address;
++    }
++    if (sw->gpuQuarterTurnCacheCount >= 8) return 0;
++
++    SWGpuQuarterTurnCache* entry =
++        &sw->gpuQuarterTurnCache[sw->gpuQuarterTurnCacheCount];
++    entry->pixels = (uint8_t*)safeCalloc((size_t)width * height, 4u);
++    uint32_t* output = (uint32_t*)entry->pixels;
++    const uint32_t* input = (const uint32_t*)source;
++    for (int32_t y = 0; y < height; ++y) {
++        for (int32_t x = 0; x < width; ++x) {
++            int64_t u = (int64_t)uStart + (int64_t)x * uDx + (int64_t)y * uDy;
++            int64_t v = (int64_t)vStart + (int64_t)x * vDx + (int64_t)y * vDy;
++            if (u < uMin || u >= uMax || v < vMin || v >= vMax) continue;
++            int32_t sourceX = (int32_t)(u >> 16);
++            int32_t sourceY = (int32_t)(v >> 16);
++            if (sourceX < 0 || sourceX >= sourceWidth ||
++                sourceY < 0 || sourceY >= sourceHeight) continue;
++            output[(size_t)y * width + x] =
++                input[(size_t)sourceY * sourceWidth + sourceX];
++        }
++    }
++    entry->address = MisterGpu_uploadTexture(
++        entry->pixels, (size_t)width * height * 4u);
++    if (entry->address == 0) {
++        free(entry->pixels);
++        memset(entry, 0, sizeof(*entry));
++        return 0;
++    }
++    entry->source = source;
++    entry->sourceWidth = sourceWidth;
++    entry->sourceHeight = sourceHeight;
++    entry->width = width;
++    entry->height = height;
++    entry->uStart = uStart;
++    entry->vStart = vStart;
++    entry->uDx = uDx;
++    entry->vDx = vDx;
++    entry->uDy = uDy;
++    entry->vDy = vDy;
++    entry->uMin = uMin;
++    entry->uMax = uMax;
++    entry->vMin = vMin;
++    entry->vMax = vMax;
++    sw->gpuQuarterTurnCacheCount++;
++    return entry->address;
++}
++
+ static bool swGpuTryAffineQuad(SWRenderer* sw, SWVertex v[4],
+                                const uint8_t* texPixels, int32_t texW, int32_t texH) {
+-    if (texPixels == nullptr || texW <= 0 || texH <= 0 ||
+-        !sw->gpuFrameEligible || !sw->gpuSawClear || !swGpuIsOutputTarget(sw) ||
++    if (!sw->gpuFrameEligible || !sw->gpuSawClear || !swGpuIsOutputTarget(sw) ||
+         !sw->blendEnable || sw->base.currentShader >= 0 ||
+         (sw->blendMode != bm_normal && sw->blendMode != bm_add) || sw->alphaTestEnable ||
+         sw->fogEnable || !sw->colorWriteR || !sw->colorWriteG ||
+         !sw->colorWriteB || !sw->colorWriteA) return false;
+ 
++    // GameMaker implements draw_line as a narrow, untextured rotated quad.
++    // AM2R's Equipment page draws its item connectors that way every frame.
++    // Treat a solid quad as a white one-pixel texture modulated by the vertex
++    // colour so it can use the same affine FPGA command as a rotated sprite.
++    // Without this path the renderer has to read the partially drawn FPGA
++    // frame back to the ARM, and that intermediate presentation is visible as
++    // a severe menu flicker in addition to making the page needlessly slow.
++    static const uint32_t solidWhitePixel = 0xffffffffu;
++    if (texPixels == nullptr) {
++        texPixels = (const uint8_t*)&solidWhitePixel;
++        texW = 1;
++        texH = 1;
++        v[0].u = 0.0f; v[0].v = 0.0f;
++        v[1].u = 1.0f; v[1].v = 0.0f;
++        v[2].u = 1.0f; v[2].v = 1.0f;
++        v[3].u = 0.0f; v[3].v = 1.0f;
++    } else if (texW <= 0 || texH <= 0) {
++        return false;
++    }
++
+     for (int i = 1; i < 4; ++i) {
+         if (v[i].r != v[0].r || v[i].g != v[0].g ||
+             v[i].b != v[0].b || v[i].a != v[0].a)
+@@ -426,8 +531,10 @@ static bool swGpuTryAffineQuad(SWRenderer* sw, SWVertex v[4],
+         if (v[i].y < fminY) fminY=v[i].y;
+         if (v[i].y > fmaxY) fmaxY=v[i].y;
+     }
+-    int32_t minX=(int32_t)floorf(fminX),maxX=(int32_t)ceilf(fmaxX);
+-    int32_t minY=(int32_t)floorf(fminY),maxY=(int32_t)ceilf(fmaxY);
++    const int32_t fullMinX=(int32_t)floorf(fminX),fullMaxX=(int32_t)ceilf(fmaxX);
++    const int32_t fullMinY=(int32_t)floorf(fminY),fullMaxY=(int32_t)ceilf(fmaxY);
++    int32_t minX=fullMinX,maxX=fullMaxX;
++    int32_t minY=fullMinY,maxY=fullMaxY;
+     if(minX<sw->scissorX)minX=sw->scissorX;if(minY<sw->scissorY)minY=sw->scissorY;
+     if(maxX>sw->scissorX+sw->scissorW)maxX=sw->scissorX+sw->scissorW;
+     if(maxY>sw->scissorY+sw->scissorH)maxY=sw->scissorY+sw->scissorH;
+@@ -458,11 +565,49 @@ static bool swGpuTryAffineQuad(SWRenderer* sw, SWVertex v[4],
+     const int64_t fuStart=llround(uStart*65536.0),fvStart=llround(vStart*65536.0);
+     const int64_t fuDx=llround(uDx*65536.0),fvDx=llround(vDx*65536.0);
+     const int64_t fuDy=llround(uDy*65536.0),fvDy=llround(vDy*65536.0);
++    const double fullPx=(double)fullMinX+0.5-v[0].x;
++    const double fullPy=(double)fullMinY+0.5-v[0].y;
++    const int64_t fuFullStart=llround(((double)v[0].u*texW+
++        uDx*fullPx+uDy*fullPy)*65536.0);
++    const int64_t fvFullStart=llround(((double)v[0].v*texH+
++        vDx*fullPx+vDy*fullPy)*65536.0);
+     if(fuMin<INT32_MIN||fuMin>INT32_MAX||fuMax<INT32_MIN||fuMax>INT32_MAX||
+        fvMin<INT32_MIN||fvMin>INT32_MAX||fvMax<INT32_MIN||fvMax>INT32_MAX||
+        fuStart<INT32_MIN||fuStart>INT32_MAX||fvStart<INT32_MIN||fvStart>INT32_MAX||
+        fuDx<INT32_MIN||fuDx>INT32_MAX||fvDx<INT32_MIN||fvDx>INT32_MAX||
+-       fuDy<INT32_MIN||fuDy>INT32_MAX||fvDy<INT32_MIN||fvDy>INT32_MAX) return false;
++       fuDy<INT32_MIN||fuDy>INT32_MAX||fvDy<INT32_MIN||fvDy>INT32_MAX||
++       fuFullStart<INT32_MIN||fuFullStart>INT32_MAX||
++       fvFullStart<INT32_MIN||fvFullStart>INT32_MAX) return false;
++
++    // A quarter-turn makes consecutive destination pixels jump between
++    // distant source rows. The affine engine must then perform an uncached
++    // DDR lookup for almost every pixel. Transpose immutable atlas sprites
++    // once and feed the compact result to the paired axis blitter instead.
++    if (texPixels != (const uint8_t*)&solidWhitePixel &&
++        llabs(fuDx) <= 1 && llabs(fvDy) <= 1 &&
++        llabs(fuDy) >= 32768 && llabs(fvDx) >= 32768) {
++        uint32_t quarterTurn = swGpuQuarterTurnTexture(sw,
++            texPixels, texW, texH, fullMaxX-fullMinX, fullMaxY-fullMinY,
++            (int32_t)fuFullStart, (int32_t)fvFullStart,
++            (int32_t)fuDx, (int32_t)fvDx, (int32_t)fuDy, (int32_t)fvDy,
++            (int32_t)fuMin, (int32_t)fuMax, (int32_t)fvMin, (int32_t)fvMax);
++        if (quarterTurn && MisterGpu_addBlit(quarterTurn,
++            (uint32_t)(fullMaxX-fullMinX)*4u,
++            (int16_t)minX,(int16_t)minY,(uint16_t)(maxX-minX),(uint16_t)(maxY-minY),
++            ((minX-fullMinX)<<16)+(1<<15),
++            ((minY-fullMinY)<<16)+(1<<15),
++            1<<16,1<<16,
++            (uint32_t)floatColorByte(v[0].r) |
++            ((uint32_t)floatColorByte(v[0].g) << 8) |
++            ((uint32_t)floatColorByte(v[0].b) << 16) |
++            ((uint32_t)floatColorByte(v[0].a) << 24),
++            sw->blendMode == bm_add)) {
++            sw->frameTriangleQuads++;
++            sw->frameTrianglePixels+=(uint64_t)(maxX-minX)*(uint64_t)(maxY-minY);
++            sw->gpuHasSkippedDraws=true;
++            return true;
++        }
++    }
+ 
+     uint32_t textureAddress=swGpuTextureAddress(sw,texPixels,texW,texH);
+     if(textureAddress==0 || !MisterGpu_addAffineBlit(textureAddress,(uint32_t)texW*4u,
+@@ -749,6 +894,48 @@ static bool rasterizeAxisAlignedQuad(SWRenderer* sw, SWVertex v[4], const uint8_
+         }
+ #endif
+     }
++#ifdef USE_MISTER
++    if(!texPixels&&!uniform&&normalState&&sw->gpuFrameEligible&&
++       sw->gpuSawClear&&swGpuIsOutputTarget(sw)&&sw->blendEnable&&
++       sw->gpuGradientScratchIndex<4){
++        const int32_t width=maxX-minX,height=maxY-minY;
++        if(width<=320&&height<=240){
++            const uint32_t slot=sw->gpuGradientScratchIndex++;
++            if(sw->gpuGradientScratch[slot]==nullptr)
++                sw->gpuGradientScratch[slot]=(uint8_t*)safeCalloc(320u*240u,4u);
++            uint32_t* output=(uint32_t*)sw->gpuGradientScratch[slot];
++            for(int32_t gy=0;gy<height;++gy){
++                const float ty=((float)(minY+gy)+0.5f-v[0].y)*invDy;
++                for(int32_t gx=0;gx<width;++gx){
++                    const float tx=((float)(minX+gx)+0.5f-v[0].x)*invDx;
++                    const float topR=v[0].r+tx*(v[1].r-v[0].r);
++                    const float topG=v[0].g+tx*(v[1].g-v[0].g);
++                    const float topB=v[0].b+tx*(v[1].b-v[0].b);
++                    const float topA=v[0].a+tx*(v[1].a-v[0].a);
++                    const float bottomR=v[3].r+tx*(v[2].r-v[3].r);
++                    const float bottomG=v[3].g+tx*(v[2].g-v[3].g);
++                    const float bottomB=v[3].b+tx*(v[2].b-v[3].b);
++                    const float bottomA=v[3].a+tx*(v[2].a-v[3].a);
++                    output[(size_t)gy*width+gx]=
++                        (uint32_t)floatColorByte(topR+ty*(bottomR-topR))|
++                        ((uint32_t)floatColorByte(topG+ty*(bottomG-topG))<<8)|
++                        ((uint32_t)floatColorByte(topB+ty*(bottomB-topB))<<16)|
++                        ((uint32_t)floatColorByte(topA+ty*(bottomA-topA))<<24);
++                }
++            }
++            const uint32_t address=MisterGpu_uploadDynamicTexture(
++                output,(size_t)width*height*4u);
++            if(address&&MisterGpu_addBlit(address,(uint32_t)width*4u,
++               (int16_t)minX,(int16_t)minY,(uint16_t)width,(uint16_t)height,
++               1<<15,1<<15,1<<16,1<<16,0xffffffffu,additive)){
++                sw->framePlainQuads++;
++                sw->framePlainPixels+=(uint64_t)width*(uint64_t)height;
++                sw->gpuHasSkippedDraws=true;
++                return true;
++            }
++        }
++    }
++#endif
+     if(compatibleTexture){
+ #ifdef USE_MISTER
+         int32_t sparseSurface = -1;
+@@ -1069,6 +1256,9 @@ static void swDestroy(Renderer* renderer) {
+ #ifdef USE_MISTER
+     free(sw->gpuTextureAddresses);
+     for (uint32_t i = 0; i < 8; ++i) free(sw->gpuDynamicScratch[i]);
++    for (uint32_t i = 0; i < 4; ++i) free(sw->gpuGradientScratch[i]);
++    for (uint32_t i = 0; i < sw->gpuQuarterTurnCacheCount; ++i)
++        free(sw->gpuQuarterTurnCache[i].pixels);
+     free(sw->surfaceContentMinX);
+     free(sw->surfaceContentMinY);
+     free(sw->surfaceContentMaxX);
+@@ -1105,6 +1295,7 @@ static void swBeginFrame(Renderer* renderer, int32_t gameW, int32_t gameH, int32
+ #ifdef USE_MISTER
+     MisterGpu_beginFrame();
+     sw->gpuDynamicScratchIndex = 0;
++    sw->gpuGradientScratchIndex = 0;
+     sw->gpuFrameEligible = MisterGpu_isAvailable() && sw->fbWidth == 320 && sw->fbHeight == 240 &&
+                            sw->currentSurface == renderer->runner->applicationSurfaceId;
+     sw->gpuSawClear = false;
+diff --git a/src/sw_renderer.h b/src/sw_renderer.h
+index 9885070..35a75b3 100644
+--- a/src/sw_renderer.h
++++ b/src/sw_renderer.h
+@@ -10,6 +10,17 @@ typedef enum {
+     SW_AM2R_MAP_CACHE_HIT = 1,
+     SW_AM2R_MAP_CACHE_INCREMENTAL = 2,
+ } SWAm2rMapCacheMode;
++
++typedef struct {
++    const uint8_t* source;
++    uint8_t* pixels;
++    int32_t sourceWidth, sourceHeight;
++    int32_t width, height;
++    int32_t uStart, vStart;
++    int32_t uDx, vDx, uDy, vDy;
++    int32_t uMin, uMax, vMin, vMax;
++    uint32_t address;
++} SWGpuQuarterTurnCache;
+ #endif
+ 
+ // ===[ SWRenderer Struct ]===
+@@ -94,6 +105,19 @@ typedef struct {
+     uint32_t gpuDynamicScratchIndex;
+     uint32_t gpuDynamicResampleLogs;
+ 
++    // Per-command staging for the uncommon four-corner untextured gradients
++    // emitted by AM2R's subscreen. The FPGA consumes these buffers after the
++    // draw call returns, so separate slots prevent a later gradient in the
++    // same frame from changing an earlier command's pixels.
++    uint8_t* gpuGradientScratch[4];
++    uint32_t gpuGradientScratchIndex;
++
++    // Static atlas sprites rotated by 90 or 270 degrees are transposed once
++    // into row-major textures. This lets the ordinary paired blitter handle
++    // AM2R's four-way subscreen chooser instead of the slower affine engine.
++    SWGpuQuarterTurnCache gpuQuarterTurnCache[8];
++    uint32_t gpuQuarterTurnCacheCount;
++
+     uint32_t gpuHudCropLogs;
+ 
+     // Conservative bounds for pixels which may be non-transparent in each

@@ -14,7 +14,7 @@ import gdb
 inferior = gdb.selected_inferior()
 runner_type = gdb.lookup_type("Runner").pointer()
 
-for address in range(0x001CF000, 0x001D8000, 4):
+for address in range(0x001CF000, 0x00220000, 4):
     try:
         raw = bytes(inferior.read_memory(address, 4))
     except gdb.MemoryError:

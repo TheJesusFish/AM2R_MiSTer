@@ -73,7 +73,13 @@ def main() -> None:
         "record->shadow == NULL || !record->shadow_valid",
         "if (coverageIsFull())",
         "opaque = axisCommandSourceIsOpaque(&g_gpu_commands[i]);",
+        "for (uint32_t i = groupEnd; i > groupStart; --i)",
+        "bestPrefix = i - 1u;",
         "tryFuseMapBackground();\n        cullFullyCoveredPrefix();",
+        "uint32_t waitBaseline = current;",
+        "if (current != waitBaseline)",
+        "if (++g_vblank_timeout_count >= 3)",
+        "MiSTer pacing: transient FPGA heartbeat timeout",
     ):
         require(mister_source, contract)
 

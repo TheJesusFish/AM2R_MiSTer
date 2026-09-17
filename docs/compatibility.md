@@ -1,6 +1,10 @@
 # AM2R 1.1 compatibility matrix
 
 This matrix describes the exact ARM/FPGA engineering build identified in the
+[subscreen rendering report](../reports/subscreen-rendering-validation-2026-09-16.md),
+[room-122 collision/HUD report](../reports/room122-collision-hud-validation-2026-09-16.md),
+[FPGA-vblank pacing report](../reports/vblank-pacing-validation-2026-09-16.md),
+[heavy-room pacing report](../reports/heavy-room-pacing-validation-2026-09-16.md),
 [v24 water/pickup/latency report](../reports/v24-water-pickup-latency-savestate-validation-2026-09-11.md),
 [portable-save/map hardware report](../reports/portable-save-map-performance-validation-2026-09-08.md),
 [Linux 6.18 compatibility report](../reports/linux-6.18-framebuffer-validation-2026-09-08.md),
@@ -19,9 +23,11 @@ observed on the USB-1 MiSTer, not merely supported by source inspection.
 | WAD/data load | Pass | Exact AM2R 1.1 VM/WAD 14 input boots repeatedly |
 | Linux framebuffer compatibility | Pass on 6.18; older path preserved in code | USB-1 6.18.38 uses the `ENODEV`-only `/dev/mem` fallback; the original `/dev/fb0` mmap remains first choice |
 | Title and menu | Pass | Deterministic create/reload routes and HDMI capture |
+| In-game subscreen | Pass | USB-1 lossless capture through Map, Equipment, Logs, and Options. Connector lines and four-corner gradients stay in the atomic FPGA command stream; 24-frame consecutive sheets contain no partial frames, all unsupported fallback counters remain zero, and the cached chooser runs in about 0.76 million cycles. |
 | Story/cutscenes | Pass in opening route | Normal/additive tint, gradients, affine ship/Samus effects captured |
 | Room transitions | Pass in opening route | Controller, loading, transition, title, landing and `rm_a0h01` rooms |
 | First playable area | Pass | Deterministic movement/actions and active scrolling traversal |
+| Supplied high-load rooms | Pass at native cadence | The FPGA vblank heartbeat fixes ARM/raster phase drift. A stricter room-122 diagonal-jump route then exposed collision and HUD upload spikes: ordered nearby collision candidates and sparse double-buffered HUD updates reduced missed game ticks from 29 to 1 in the comparable trace window. A final 19-second lossless UGREEN gameplay window had 1,137 unique frames in 1,140 captures, with three isolated repeats and no hitch cluster. |
 | Aimed firing | Pass in opening gameplay | Straight, up, down, diagonal-up, and diagonal-down six-second phases hold 59.9–60.0 FPS with zero FPGA fallbacks |
 | Map open/close and discovery | Pass in opening gameplay | Cold map builds once; repeated opens hit the retained surface and newly revealed cells update incrementally at sustained 60 FPS |
 | Textures/sprites | Pass in route | Lazy texture pages, clipping, axis and affine nearest-neighbour draws |
@@ -30,7 +36,7 @@ observed on the USB-1 MiSTer, not merely supported by source inspection.
 | Underwater distortion/foreground | Pass in supplied room | Deferred application-surface export, native water alias, and repeated additive-tile fusion; 1,681-frame USB-1 jump capture had zero horizontal/vertical artifact flags and mostly 59.9–60.0 FPS telemetry |
 | Audio decode/mix/output | Pass in route and transport fixtures | Fixed 48 kHz producer; exact 1 kHz transport, native Start-sound comparison, nonzero gameplay peaks, and no observed xrun |
 | Save/create/reload | Pass | Stable 236,913-byte `sav1` hash across relaunch |
-| Persistent save states | Pass only on the exact runner build | Four disk-backed DMTCP slots; empty load, overwrite, atomic commit, GPU/derived-surface rebuild, audio resume, and exit/relaunch passed. Format-3 metadata checks build ID plus runner CRC32 before replacing the live process. USB-1 v24 measured 60.43 s save / 2.60 s load; old process images are preserved but rejected because they embed old executable code. |
+| Persistent save states | Pass only on the exact runner build | Four DMTCP slots; empty load, overwrite, atomic commit, GPU/derived-surface rebuild, audio resume, and exit/relaunch passed. Format-3 metadata checks build ID plus runner CRC32 before replacing the live process. Checkpoints stage on the persistent filesystem rather than `/dev/shm`; a 256 MiB preflight prevents OOM and preserves the old slot on `ENOSPC`. The final USB-1 regression wrote 219,190,628 bytes in 59.954 s, loaded it, then refused a second low-space save in 0.2 ms without killing the runner. Save latency varies with storage; loads complete in a few seconds. Old process images are preserved but rejected because they embed old executable code. |
 | Keyboard-style MiSTer input | Pass | Live event0 handle plus deterministic D-pad/action route |
 | Normal core launch/exit/recovery | Pass | **Other → AM2R** selects the core-specific HPS frontend; repeated launches and Weapon Select+Start/signal exits restored clean `MENU` state |
 | OSD save-state control | Pass; user hands-on remains | Exact current build committed through OSD Save and replaced/restored the live runner through OSD Load; immediate status feedback is shown |
