@@ -1,34 +1,6 @@
 # AM2R MiSTer
 
-AM2R MiSTer is an experimental hybrid core for the DE10-Nano. The ARM HPS
-runs AM2R 1.1 through a patched Butterscotch GameMaker runtime, while a custom
-FPGA GPU handles the dominant clear, fill, blit, affine, alpha, additive, and
-presentation operations. Native 320×240, 59.94 Hz scanout feeds MiSTer's
-standard HDMI and analog-video paths.
-
-The current engineering build launches as a normal MiSTer core, reaches
-gameplay, supports standard in-game saves and four persistent process-level
-save-state slots, and has been exercised on real MiSTer hardware. It remains a
-tester build rather than a claim of complete-game compatibility.
-
-The current runtime removes full-room collision-grid work from ordinary
-movement and local collision queries, retains exact indexed bounds across
-AM2R's repeated object activation cycle, and phase-locks ordinary 60 Hz game
-steps to a native-vblank heartbeat published by the FPGA. A corrected
-Morph Ball reproduction in the supplied room dropped from five repeated frames
-in 720 moving frames to one; the second affected room likewise had one repeat
-in 600 moving frames. That remaining repeat is expected when a 59.937 Hz source
-is recorded at 60.000 fps; live telemetry stayed near 59.8–60.1 fps. Older RBFs
-retain the compatible raster-period timer fallback.
-
-The in-game subscreen has also been exercised page-by-page on real hardware.
-Map, Equipment, Logs, and Options now stay in one atomic FPGA command stream;
-the Equipment connector-line and Logs gradient fallbacks that produced partial
-flashing frames are removed. The four-way chooser caches its quarter-turned
-art for the paired blitter, keeping repeated page changes at native cadence.
-
-This repository contains no AM2R game data. Testers must provide their own
-lawfully obtained AM2R 1.1 files and place the required files into a ZIP.
+This is an AI generated readme. I will do a better one once the core is closer to ready.
 
 ## Install a tester build
 
