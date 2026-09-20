@@ -38,6 +38,7 @@ def describe(label: str, values: list[float]) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("trace", type=Path)
+    parser.add_argument("--bin-ms", type=float, default=0.0)
     args = parser.parse_args()
 
     events: list[tuple[float, str]] = []
@@ -75,6 +76,8 @@ def main() -> int:
         if label == "step":
             if frame is not None:
                 frame["cycle"] = timestamp - frame["start"]
+                if "wait_start" in frame and "wait" not in frame:
+                    frame["wait"] = timestamp - frame["wait_start"]
                 frames.append(frame)
             frame = {"start": timestamp}
             stage_starts = {"step": timestamp}
@@ -88,11 +91,26 @@ def main() -> int:
                 frame[stage] = timestamp - started
         else:
             stage_starts[label] = timestamp
+            # Entry-only uprobes avoid uretprobe nesting failures on old
+            # MiSTer kernels.  Consecutive main-loop stage entries still give
+            # useful inclusive timings, and paired traces overwrite these
+            # estimates with their exact return-probe durations below.
+            if label == "draw" and "step" not in frame:
+                frame["step"] = timestamp - frame["start"]
+            elif label == "present":
+                draw_started = stage_starts.get("draw")
+                if draw_started is not None and "draw" not in frame:
+                    frame["draw"] = timestamp - draw_started
             if label == "wait":
                 frame["work"] = timestamp - frame["start"]
+                frame["wait_start"] = timestamp
+                present_started = stage_starts.get("present")
+                if present_started is not None and "present" not in frame:
+                    frame["present"] = timestamp - present_started
 
     describe("work before wait", [item["work"] for item in frames if "work" in item])
     cycle_values = [item["cycle"] for item in frames if "cycle" in item]
+    trace_start = frames[0]["start"] if frames else 0.0
     print(
         "slow cycles: "
         f">20ms={sum(value > 20.0 for value in cycle_values)} "
@@ -102,6 +120,7 @@ def main() -> int:
     for item in sorted(frames, key=lambda value: value.get("cycle", 0), reverse=True)[:20]:
         print(
             "slow cycle "
+            f"t={item.get('start', trace_start) - trace_start:.3f} "
             f"cycle={item.get('cycle', 0):.3f} "
             f"work={item.get('work', 0):.3f} "
             f"step={item.get('step', 0):.3f} "
@@ -109,6 +128,24 @@ def main() -> int:
             f"present={item.get('present', 0):.3f} "
             f"wait={item.get('wait', 0):.3f}"
         )
+    if args.bin_ms > 0 and frames:
+        bins: dict[int, list[dict[str, float]]] = defaultdict(list)
+        for item in frames:
+            bins[int((item["start"] - trace_start) // args.bin_ms)].append(item)
+        print("time bins:")
+        for index in sorted(bins):
+            items = bins[index]
+            cycles = [item["cycle"] for item in items if "cycle" in item]
+            work = [item["work"] for item in items if "work" in item]
+            steps = [item["step"] for item in items if "step" in item]
+            draws = [item["draw"] for item in items if "draw" in item]
+            print(
+                f"t={index * args.bin_ms:.0f}-{(index + 1) * args.bin_ms:.0f}ms "
+                f"frames={len(items)} slow={sum(value > 25.0 for value in cycles)} "
+                f"work_med={statistics.median(work):.3f} "
+                f"step_med={statistics.median(steps):.3f} "
+                f"draw_med={statistics.median(draws):.3f}"
+            )
     return 0
 
 

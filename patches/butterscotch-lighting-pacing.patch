@@ -1,0 +1,887 @@
+diff --git a/src/audio/miniaudio/ma_audio_system.c b/src/audio/miniaudio/ma_audio_system.c
+index 90c0379..109c469 100644
+--- a/src/audio/miniaudio/ma_audio_system.c
++++ b/src/audio/miniaudio/ma_audio_system.c
+@@ -26,6 +26,11 @@
+ #include <stdlib.h>
+ #include "string_compat.h"
+ #include "stb_ds.h"
++#ifdef USE_MISTER
++#include <errno.h>
++#include <pthread.h>
++#include <sched.h>
++#endif
+ 
+ // ===[ Helpers ]===
+ 
+@@ -103,8 +108,26 @@ static char* resolveExternalPath(MaAudioSystem* ma, Sound* sound) {
+ static void measuredAudioCallback(ma_device* device, void* output,
+                                   const void* input, ma_uint32 frameCount) {
+     (void)input;
++#ifdef USE_MISTER
++    // The game thread runs SCHED_FIFO 49 to prevent Linux housekeeping from
++    // consuming a raster interval. Keep the ALSA callback one level higher so
++    // audio can never be starved by a busy game frame. A recreated miniaudio
++    // thread after save-state restore configures itself again automatically.
++    static _Thread_local bool schedulingConfigured = false;
++    if (!schedulingConfigured) {
++        struct sched_param audioSchedule = { 0 };
++        audioSchedule.sched_priority = 50;
++        int result = pthread_setschedparam(
++            pthread_self(), SCHED_FIFO, &audioSchedule);
++        if (result != 0)
++            logWarn("Audio: could not enable real-time callback scheduling: %s\n",
++                    strerror(result));
++        schedulingConfigured = true;
++    }
++#endif
+     MaAudioSystem* ma = (MaAudioSystem*)device->pUserData;
+     ma_engine_read_pcm_frames(&ma->engine, output, frameCount, NULL);
++#if defined(MISTER_AUDIO_DIAGNOSTICS)
+     const float* samples = (const float*)output;
+     float peak = 0.0f;
+     for (ma_uint32 i = 0; i < frameCount * 2; ++i) {
+@@ -117,6 +140,7 @@ static void measuredAudioCallback(ma_device* device, void* output,
+     uint32_t previous = __atomic_load_n(&ma->peakMicrounits, __ATOMIC_RELAXED);
+     while (scaled > previous && !__atomic_compare_exchange_n(&ma->peakMicrounits,
+            &previous, scaled, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
++#endif
+ }
+ 
+ static bool maInitRuntime(MaAudioSystem* ma) {
+@@ -216,6 +240,7 @@ static void maDestroy(AudioSystem* audio) {
+ 
+ static void maUpdate(AudioSystem* audio, float deltaTime) {
+     MaAudioSystem* ma = (MaAudioSystem*) audio;
++#if defined(MISTER_AUDIO_DIAGNOSTICS)
+     ma->outputLogElapsed += deltaTime;
+     if (ma->outputLogElapsed >= 5.0f) {
+         uint64_t frames = __atomic_load_n(&ma->outputFrames, __ATOMIC_RELAXED);
+@@ -225,6 +250,9 @@ static void maUpdate(AudioSystem* audio, float deltaTime) {
+                 (unsigned long long)frames, active, peak / 1000000.0f);
+         ma->outputLogElapsed = 0.0f;
+     }
++#else
++    (void)deltaTime;
++#endif
+ 
+     repeat(MAX_SOUND_INSTANCES, i) {
+         SoundInstance* inst = &ma->instances[i];
+diff --git a/src/backends/mister.c b/src/backends/mister.c
+index df37cc4..4581ed9 100644
+--- a/src/backends/mister.c
++++ b/src/backends/mister.c
+@@ -11,6 +11,7 @@
+ #include <linux/fb.h>
+ #include <linux/input.h>
+ #include <pthread.h>
++#include <sched.h>
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -488,7 +489,11 @@ static uint32_t nextTextureGeneration(void) {
+ 
+ static void warnTextureTableExhausted(void) {
+     static uint32_t warningCount = 0;
+-    if (warningCount < 8 || (g_gpu_frame_serial % 300u) == 0)
++    if (warningCount < 8
++#if defined(MISTER_GPU_DIAGNOSTICS)
++        || (g_gpu_frame_serial % 300u) == 0
++#endif
++    )
+         logWarn("MiSTer GPU: texture record table exhausted\n");
+     warningCount++;
+ }
+@@ -584,8 +589,10 @@ uint32_t MisterGpu_uploadTexture(const void* rgbaPixels, size_t bytes) {
+     record->opaque_pixels = NULL;
+     record->opaque_word_count = 0;
+     record->opaque_generation = 0;
++#if defined(MISTER_GPU_DIAGNOSTICS)
+     logInfo("MiSTer GPU: uploaded texture %u (%zu bytes at 0x%08x)\n",
+             g_gpu_texture_record_count - 1, bytes, physical);
++#endif
+     return physical;
+ }
+ 
+@@ -795,8 +802,10 @@ static uint32_t uploadDynamicTexture(const void* rgbaPixels, size_t bytes,
+     record->opaque_pixels = NULL;
+     record->opaque_word_count = 0;
+     record->opaque_generation = 0;
++#if defined(MISTER_GPU_DIAGNOSTICS)
+     logInfo("MiSTer GPU: uploaded dynamic texture %u (%zu bytes at 0x%08x/0x%08x)\n",
+             g_gpu_texture_record_count - 1, bytes, physical0, physical1);
++#endif
+     return physical0;
+ }
+ 
+@@ -2416,12 +2425,18 @@ bool MisterGpu_addClear(uint32_t rgba) {
+     return true;
+ }
+ 
++static uint64_t gpuBlendFlags(uint8_t blendMode) {
++    if (blendMode == MISTER_GPU_BLEND_ADDITIVE) return 1ull << 8;
++    if (blendMode == MISTER_GPU_BLEND_SUBTRACT) return 1ull << 9;
++    return 0;
++}
++
+ bool MisterGpu_addFill(int16_t x, int16_t y, uint16_t width, uint16_t height,
+-                       uint32_t rgba, bool additive) {
++                       uint32_t rgba, uint8_t blendMode) {
+     if (!g_gpu_available || g_gpu_command_count >= GPU_COMMAND_CAPACITY - 1) return false;
+     MisterGpuCommand* command = &g_gpu_commands[g_gpu_command_count++];
+     memset(command, 0, sizeof(*command));
+-    command->word[0] = 3u | ((uint64_t)additive << 8) |
++    command->word[0] = 3u | gpuBlendFlags(blendMode) |
+                        ((uint64_t)width << 16) | ((uint64_t)height << 32);
+     command->word[1] = rgba;
+     command->word[2] = (uint16_t)x | ((uint64_t)(uint16_t)y << 16);
+@@ -2430,8 +2445,8 @@ bool MisterGpu_addFill(int16_t x, int16_t y, uint16_t width, uint16_t height,
+ 
+ bool MisterGpu_addFillVGradient(int16_t x, int16_t y, uint16_t width, uint16_t height,
+                        uint32_t tintStart, int16_t dr, int16_t dg,
+-                       int16_t db, int16_t da, bool additive) {
+-    if (!MisterGpu_addFill(x, y, width, height, tintStart, additive)) return false;
++                       int16_t db, int16_t da, uint8_t blendMode) {
++    if (!MisterGpu_addFill(x, y, width, height, tintStart, blendMode)) return false;
+     g_gpu_commands[g_gpu_command_count - 1].word[7] =
+         (uint16_t)dr | ((uint64_t)(uint16_t)dg << 16) |
+         ((uint64_t)(uint16_t)db << 32) | ((uint64_t)(uint16_t)da << 48);
+@@ -2441,11 +2456,11 @@ bool MisterGpu_addFillVGradient(int16_t x, int16_t y, uint16_t width, uint16_t h
+ bool MisterGpu_addBlit(uint32_t source, uint32_t stride,
+                        int16_t x, int16_t y, uint16_t width, uint16_t height,
+                        int32_t u, int32_t v, int32_t du, int32_t dv,
+-                       uint32_t tint, bool additive) {
++                       uint32_t tint, uint8_t blendMode) {
+     if (!g_gpu_available || source == 0 || g_gpu_command_count >= GPU_COMMAND_CAPACITY - 1) return false;
+     MisterGpuCommand* command = &g_gpu_commands[g_gpu_command_count++];
+     memset(command, 0, sizeof(*command));
+-    command->word[0] = 2u | ((uint64_t)additive << 8) |
++    command->word[0] = 2u | gpuBlendFlags(blendMode) |
+                        ((uint64_t)width << 16) | ((uint64_t)height << 32);
+     command->word[1] = source | ((uint64_t)stride << 32);
+     command->word[2] = (uint16_t)x | ((uint64_t)(uint16_t)y << 16);
+@@ -2460,9 +2475,9 @@ bool MisterGpu_addBlitVGradient(uint32_t source, uint32_t stride,
+                        int16_t x, int16_t y, uint16_t width, uint16_t height,
+                        int32_t u, int32_t v, int32_t du, int32_t dv,
+                        uint32_t tintStart, int16_t dr, int16_t dg,
+-                       int16_t db, int16_t da, bool additive) {
++                       int16_t db, int16_t da, uint8_t blendMode) {
+     if (!MisterGpu_addBlit(source, stride, x, y, width, height,
+-                          u, v, du, dv, tintStart, additive)) return false;
++                          u, v, du, dv, tintStart, blendMode)) return false;
+     g_gpu_commands[g_gpu_command_count - 1].word[7] =
+         (uint16_t)dr | ((uint64_t)(uint16_t)dg << 16) |
+         ((uint64_t)(uint16_t)db << 32) | ((uint64_t)(uint16_t)da << 48);
+@@ -2474,8 +2489,8 @@ bool MisterGpu_addAffineBlit(uint32_t source, uint32_t stride,
+                        int32_t uMin, int32_t uMax, int32_t vMin, int32_t vMax,
+                        int32_t uStart, int32_t vStart,
+                        int32_t uDx, int32_t vDx, int32_t uDy, int32_t vDy,
+-                       uint32_t tint, bool additive) {
+-    uint32_t needed = (tint != 0xffffffffu || additive) ? 2u : 1u;
++                       uint32_t tint, uint8_t blendMode) {
++    uint32_t needed = (tint != 0xffffffffu || blendMode != MISTER_GPU_BLEND_NORMAL) ? 2u : 1u;
+     if (!g_gpu_available || source == 0 ||
+         g_gpu_command_count >= GPU_COMMAND_CAPACITY - needed) return false;
+     if (needed == 2u) {
+@@ -2484,7 +2499,7 @@ bool MisterGpu_addAffineBlit(uint32_t source, uint32_t stride,
+         // blit; the FPGA resets it after one use.
+         MisterGpuCommand* setup = &g_gpu_commands[g_gpu_command_count++];
+         memset(setup, 0, sizeof(*setup));
+-        setup->word[0] = 5u | ((uint64_t)additive << 8);
++        setup->word[0] = 5u | gpuBlendFlags(blendMode);
+         setup->word[1] = tint;
+     }
+     MisterGpuCommand* command = &g_gpu_commands[g_gpu_command_count++];
+@@ -2726,8 +2741,10 @@ bool MisterGpu_afterSaveStateRestore(void) {
+         record->last_upload_frame = g_gpu_frame_serial;
+     }
+     __sync_synchronize();
++#if defined(MISTER_GPU_DIAGNOSTICS)
+     logInfo("MiSTer GPU: restored %u texture records after save-state load\n",
+             g_gpu_texture_record_count);
++#endif
+     return restored;
+ }
+ 
+@@ -2863,6 +2880,34 @@ bool platformInit(int32_t reqW, int32_t reqH, const char *title, bool headless)
+     return true;
+ }
+ 
++void platformConfigureGameThread(void) {
++    // MiSTer Linux runs a filesystem sync service every five seconds. Under
++    // SCHED_OTHER that service can preempt the ARM renderer across an entire
++    // 60 Hz raster interval even when the game itself is comfortably within
++    // budget. Match the established hybrid-core policy: keep the vblank-paced
++    // game thread real-time, below the audio callback, while its regular wait
++    // still yields the CPU every frame. This is called only after audio and
++    // worker threads exist so they retain SCHED_OTHER unless they explicitly
++    // opt in. Failure is non-fatal for non-root development environments.
++    struct sched_param gameSchedule = { 0 };
++    gameSchedule.sched_priority = 49;
++    if (sched_setscheduler(0, SCHED_FIFO, &gameSchedule) != 0)
++        logWarn("MiSTer pacing: could not enable real-time game scheduling: %s\n",
++                strerror(errno));
++}
++
++void platformPrepareGameThreadRestore(void) {
++    // The original checkpoint timeline retains SCHED_FIFO while DMTCP's
++    // restarted timeline resumes as SCHED_OTHER. Normalize both before
++    // miniaudio recreates its ordinary worker so that helper can never inherit
++    // the game loop's real-time policy. platformConfigureGameThread() raises
++    // only this caller again after worker creation has completed.
++    struct sched_param normalSchedule = { 0 };
++    if (sched_setscheduler(0, SCHED_OTHER, &normalSchedule) != 0)
++        logWarn("MiSTer pacing: could not normalize game scheduling for restore: %s\n",
++                strerror(errno));
++}
++
+ void platformExit(void) {
+     if (g_gpu_available) waitGpuCompletion(NULL);
+     for (uint32_t i = 0; i < g_gpu_texture_record_count; ++i) {
+@@ -2959,6 +3004,7 @@ void Runner_setNextFrame(uint32_t *framebuffer, int width, int height) {
+ }
+ 
+ static void reportPresentRate(void) {
++#if defined(MISTER_GPU_DIAGNOSTICS)
+     static uint64_t reportStart = 0;
+     static uint32_t reportFrames = 0;
+     uint64_t now = nowNanos();
+@@ -2970,6 +3016,7 @@ static void reportPresentRate(void) {
+         reportStart = now;
+         reportFrames = 0;
+     }
++#endif
+ }
+ 
+ void platformSwapBuffers(void) {
+@@ -3014,11 +3061,16 @@ void platformSwapBuffers(void) {
+         tryFuseMapBackground();
+         cullFullyCoveredPrefix();
+         uint32_t cycles = 0;
++#if defined(MISTER_GPU_DIAGNOSTICS)
+         uint32_t commandCount = g_gpu_command_count;
+         uint64_t waitStart = nowNanos();
++#endif
+         if (MisterGpu_finishFrame(&cycles)) {
++#if defined(MISTER_GPU_DIAGNOSTICS)
+             double waitMs = (int64_t)(nowNanos() - waitStart) / 1000000.0;
++#endif
+             g_gpu_submitted_frames++;
++#if defined(MISTER_GPU_DIAGNOSTICS)
+             if (g_runner != NULL && (g_runner->frameCount % 300) == 0) {
+                 logInfo("MiSTer GPU submit frame %d: %u commands, water=%u rows, native=%u, repeat=%u, previous=%u cycles, submitted=%u\n",
+                         g_runner->frameCount, commandCount, waterRows,
+@@ -3034,6 +3086,11 @@ void platformSwapBuffers(void) {
+                     slowGpuLogs++;
+                 }
+             }
++#else
++            (void)waterRows;
++            (void)nativeWaterRows;
++            (void)repeatedTileCommands;
++#endif
+         }
+     }
+     if (g_gpu_presented) {
+diff --git a/src/backends/mister_gpu.h b/src/backends/mister_gpu.h
+index 333ee73..dcd5812 100644
+--- a/src/backends/mister_gpu.h
++++ b/src/backends/mister_gpu.h
+@@ -5,6 +5,10 @@
+ #include <stddef.h>
+ #include <stdint.h>
+ 
++#define MISTER_GPU_BLEND_NORMAL 0u
++#define MISTER_GPU_BLEND_ADDITIVE 1u
++#define MISTER_GPU_BLEND_SUBTRACT 2u
++
+ bool MisterGpu_isAvailable(void);
+ uint32_t MisterGpu_getCrtUiInset(void);
+ void MisterGpu_beginFrame(void);
+@@ -21,25 +25,25 @@ uint32_t MisterGpu_prepareDynamicTextureGpuWrite(const void* rgbaPixels, size_t
+ void MisterGpu_releaseTexture(const void* rgbaPixels);
+ bool MisterGpu_addClear(uint32_t rgba);
+ bool MisterGpu_addFill(int16_t x, int16_t y, uint16_t width, uint16_t height,
+-                       uint32_t rgba, bool additive);
++                       uint32_t rgba, uint8_t blendMode);
+ bool MisterGpu_addFillVGradient(int16_t x, int16_t y, uint16_t width, uint16_t height,
+                        uint32_t tintStart, int16_t dr, int16_t dg,
+-                       int16_t db, int16_t da, bool additive);
++                       int16_t db, int16_t da, uint8_t blendMode);
+ bool MisterGpu_addBlit(uint32_t source, uint32_t stride,
+                        int16_t x, int16_t y, uint16_t width, uint16_t height,
+                        int32_t u, int32_t v, int32_t du, int32_t dv,
+-                       uint32_t tint, bool additive);
++                       uint32_t tint, uint8_t blendMode);
+ bool MisterGpu_addBlitVGradient(uint32_t source, uint32_t stride,
+                        int16_t x, int16_t y, uint16_t width, uint16_t height,
+                        int32_t u, int32_t v, int32_t du, int32_t dv,
+                        uint32_t tintStart, int16_t dr, int16_t dg,
+-                       int16_t db, int16_t da, bool additive);
++                       int16_t db, int16_t da, uint8_t blendMode);
+ bool MisterGpu_addAffineBlit(uint32_t source, uint32_t stride,
+                        int16_t x, int16_t y, uint16_t width, uint16_t height,
+                        int32_t uMin, int32_t uMax, int32_t vMin, int32_t vMax,
+                        int32_t uStart, int32_t vStart,
+                        int32_t uDx, int32_t vDx, int32_t uDy, int32_t vDy,
+-                       uint32_t tint, bool additive);
++                       uint32_t tint, uint8_t blendMode);
+ bool MisterGpu_addFramebufferExport(uint32_t destination);
+ bool MisterGpu_addWaterRows(uint32_t source, uint32_t stride,
+                             int16_t firstDestinationY,
+diff --git a/src/loop.c b/src/loop.c
+index 273b6cb..bc7d498 100644
+--- a/src/loop.c
++++ b/src/loop.c
+@@ -678,6 +678,7 @@ static bool am2rStateSave(Runner* runner, int slot) {
+     // timelines reconnect to whichever native wrapper is currently running.
+     am2rStateClose();
+     int checkpointError = am2rStateWaitForResume();
++    platformPrepareGameThreadRestore();
+     bool hardwareRestored = MisterGpu_afterSaveStateRestore();
+ #ifdef USE_MINIAUDIO
+     bool audioRestored = MaAudioSystem_restoreSaveState(runner->audioSystem);
+@@ -686,6 +687,13 @@ static bool am2rStateSave(Runner* runner, int slot) {
+     bool audioRestored = true;
+ #endif
+     bool endpointRestored = am2rStateOpen();
++    // DMTCP deliberately resumes the checkpoint's main thread under
++    // SCHED_OTHER even when it was SCHED_FIFO before capture.  Reapply the
++    // MiSTer game-loop policy only after audio recreation so miniaudio's
++    // ordinary worker does not inherit the game thread's real-time priority.
++    // This is idempotent for the original timeline and prevents a loaded state
++    // from bringing back the five-second filesystem-sync pacing hitch.
++    platformConfigureGameThread();
+     if (checkpointError != 0 || !hardwareRestored || !audioRestored ||
+         !endpointRestored) {
+         int savedError = checkpointError != 0 ? checkpointError : EIO;
+@@ -1202,6 +1210,9 @@ int loop(CommandLineArgs args, const char *argv0) {
+ 
+         // Initialize the runner
+         Runner* runner = Runner_create(dataWin, vm, renderer, (FileSystem*) overlayFs, audioSystem, args.seed);
++#ifdef USE_MISTER
++        platformConfigureGameThread();
++#endif
+ 
+         if (!args.lazyTextures) {
+             repeat(runner->dataWin->txtr.count, i) {
+diff --git a/src/platformdefs.h b/src/platformdefs.h
+index 239888f..9ae4bd6 100644
+--- a/src/platformdefs.h
++++ b/src/platformdefs.h
+@@ -140,6 +140,10 @@ void platformSleepUntil(uint64_t time);
+ // supports it. Returns false for older cores or a stalled heartbeat so callers
+ // can retain their timer-based pacing fallback.
+ bool platformWaitForVblank(uint32_t timeoutUsec);
++// Raise only the game-loop thread after worker/audio threads have been
++// created, so they do not accidentally inherit the game thread's policy.
++void platformPrepareGameThreadRestore(void);
++void platformConfigureGameThread(void);
+ #endif
+ 
+ extern InputRecording *globalInputRecording;
+diff --git a/src/runner.c b/src/runner.c
+index e48a9ae..88721b8 100644
+--- a/src/runner.c
++++ b/src/runner.c
+@@ -543,6 +543,71 @@ static bool Runner_tryExecuteAm2rWaterDraw(Runner* runner, Instance* instance,
+     Instance_setSelfVar(instance, variableIds[7], RValue_makeInt32(240));
+     return true;
+ }
++
++// AM2R's sand rooms can have hundreds of visible oBlockSand instances. Their
++// custom Draw event is intentionally simple, but interpreting the same four
++// flag checks and draw_sprite calls for every 16x16 cell consumes several
++// milliseconds per frame on the Cortex-A9. Execute that exact event natively
++// while retaining the ordinary interpreter for every other code entry and for
++// any AM2R data revision whose object/code/variables do not match.
++static bool Runner_tryExecuteAm2rSandDraw(Runner* runner, Instance* instance,
++                                          int32_t eventType, int32_t eventSubtype,
++                                          int32_t codeId, int32_t ownerObjectIndex) {
++    static const char objectName[] = "oBlockSand";
++    static const char codeName[] = "gml_Object_oBlockSand_Draw_0";
++    static const char cornerSpriteName[] = "sSandCorner";
++    static const char* const cornerVariableNames[] = {
++        "sandcrn0", "sandcrn1", "sandcrn2", "sandcrn3"
++    };
++    int32_t cornerVariableIds[sizeof(cornerVariableNames) /
++                              sizeof(cornerVariableNames[0])];
++
++    if (eventType != EVENT_DRAW || eventSubtype != DRAW_NORMAL ||
++        instance == nullptr || runner->renderer == nullptr ||
++        codeId < 0 || (uint32_t)codeId >= runner->dataWin->code.count ||
++        ownerObjectIndex < 0 ||
++        (uint32_t)ownerObjectIndex >= runner->dataWin->objt.count)
++        return false;
++
++    const CodeEntry* code = &runner->dataWin->code.entries[codeId];
++    const GameObject* owner = &runner->dataWin->objt.objects[ownerObjectIndex];
++    if (code->name == nullptr || owner->name == nullptr ||
++        strcmp(code->name, codeName) != 0 ||
++        strcmp(owner->name, objectName) != 0)
++        return false;
++
++    VMContext* vm = runner->vmContext;
++    for (size_t i = 0;
++         i < sizeof(cornerVariableNames) / sizeof(cornerVariableNames[0]); ++i) {
++        ptrdiff_t slot = shgeti(vm->varNameMap, (char*)cornerVariableNames[i]);
++        if (slot < 0) return false;
++        cornerVariableIds[i] = vm->varNameMap[slot].value;
++        if (!IntRValueHashMap_contains(&instance->selfVars,
++                                       cornerVariableIds[i]))
++            return false;
++    }
++
++    int32_t cornerSprite = shget(runner->assetsByName,
++                                 (char*)cornerSpriteName);
++    if (cornerSprite < 0 ||
++        (uint32_t)cornerSprite >= runner->dataWin->sprt.count ||
++        runner->dataWin->sprt.sprites[cornerSprite].name == nullptr ||
++        strcmp(runner->dataWin->sprt.sprites[cornerSprite].name,
++               cornerSpriteName) != 0)
++        return false;
++
++    Renderer_drawSprite(runner->renderer, instance->spriteIndex,
++                        (int32_t)instance->imageIndex,
++                        instance->x, instance->y);
++    for (int32_t corner = 0; corner < 4; ++corner) {
++        if (RValue_toBool(Instance_getSelfVar(
++                instance, cornerVariableIds[corner]))) {
++            Renderer_drawSprite(runner->renderer, cornerSprite, corner,
++                                instance->x, instance->y);
++        }
++    }
++    return true;
++}
+ #endif
+ 
+ // Executes an already-resolved event handler (see findEventCodeIdAndOwner) and verified codeId >= 0.
+@@ -579,8 +644,13 @@ static void Runner_executeResolvedEvent(Runner* runner, Instance* instance, int3
+ #endif
+ 
+ #ifdef USE_MISTER
+-    if (!Runner_tryExecuteAm2rWaterDraw(runner, instance, eventType,
+-                                        eventSubtype, codeId, ownerObjectIndex))
++    bool handledNatively = Runner_tryExecuteAm2rWaterDraw(
++        runner, instance, eventType, eventSubtype, codeId, ownerObjectIndex);
++    if (!handledNatively)
++        handledNatively = Runner_tryExecuteAm2rSandDraw(
++            runner, instance, eventType, eventSubtype, codeId,
++            ownerObjectIndex);
++    if (!handledNatively)
+ #endif
+         executeCode(runner, instance, codeId);
+ 
+diff --git a/src/sw_renderer.c b/src/sw_renderer.c
+index c734831..eb7bc93 100644
+--- a/src/sw_renderer.c
++++ b/src/sw_renderer.c
+@@ -184,12 +184,14 @@ static void swGpuFallback(SWRenderer* sw, const char* reason) {
+     else if (!strcmp(reason, "application surface copy")) reasonIndex = 4;
+     else if (!strcmp(reason, "application surface readback")) reasonIndex = 5;
+     sw->gpuFallbackReasons[reasonIndex]++;
++#if defined(MISTER_GPU_DIAGNOSTICS)
+     if (sw->gpuFallbackFrames < 20 ||
+         (sw->base.runner->frameCount % 300) == 0) {
+         logInfo("MiSTer GPU fallback frame %d: %s (clear=%d skipped=%d host=%d)\n",
+                 sw->base.runner->frameCount, reason, sw->gpuSawClear,
+                 sw->gpuHasSkippedDraws, sw->gpuHostContinuation);
+     }
++#endif
+     if (sw->gpuHasSkippedDraws) {
+         uint32_t cycles = 0;
+         if (MisterGpu_finishFrame(&cycles)) {
+@@ -212,6 +214,7 @@ static void swGpuFallback(SWRenderer* sw, const char* reason) {
+ static void swGpuFallbackForApplicationSurfaceSnapshot(SWRenderer* sw) {
+     if (!sw->gpuFrameEligible) return;
+     sw->gpuFallbackReasons[5]++;
++#if defined(MISTER_GPU_DIAGNOSTICS)
+     if (sw->gpuFallbackFrames < 20 ||
+         (sw->base.runner->frameCount % 300) == 0) {
+         logInfo("MiSTer GPU fallback frame %d: application surface snapshot "
+@@ -219,6 +222,7 @@ static void swGpuFallbackForApplicationSurfaceSnapshot(SWRenderer* sw) {
+                 sw->base.runner->frameCount, sw->gpuSawClear,
+                 sw->gpuHasSkippedDraws, sw->gpuHostContinuation);
+     }
++#endif
+     if (sw->gpuHasSkippedDraws) {
+         int32_t app = sw->base.runner->applicationSurfaceId;
+         uint8_t* destination = nullptr;
+@@ -267,12 +271,14 @@ static bool swGpuReadbackCheckpoint(SWRenderer* sw) {
+         // The completed framebuffer is now the base for the continuation, so
+         // a second clear is neither required nor desirable.
+         sw->gpuSawClear = true;
++#if defined(MISTER_GPU_DIAGNOSTICS)
+         static uint32_t checkpointLogs = 0;
+         if (checkpointLogs < 20) {
+             logInfo("MiSTer GPU readback checkpoint frame %d: %u cycles\n",
+                     sw->base.runner->frameCount, cycles);
+             checkpointLogs++;
+         }
++#endif
+     }
+     return true;
+ }
+@@ -371,6 +377,7 @@ static uint32_t swGpuPrepareAxisTexture(SWRenderer* sw, const uint8_t* pixels,
+                 source[(size_t)sy * (uint32_t)texW + (uint32_t)sx];
+         }
+     }
++#if defined(MISTER_GPU_DIAGNOSTICS)
+     if (newSlot && sw->gpuDynamicResampleLogs < 8) {
+         logInfo("MiSTer GPU dynamic surface slot %u: sampled %dx%d to %dx%d "
+                 "uv=%d,%d step=%d,%d (%u-byte buffer)\n",
+@@ -378,6 +385,7 @@ static uint32_t swGpuPrepareAxisTexture(SWRenderer* sw, const uint8_t* pixels,
+                 320u * 240u * 4u);
+         sw->gpuDynamicResampleLogs++;
+     }
++#endif
+     uint32_t address = MisterGpu_uploadDynamicTexture(
+         sw->gpuDynamicScratch[slot], 320u * 240u * 4u);
+     if (address != 0 && sourceRevisionKnown) {
+@@ -494,7 +502,8 @@ static bool swGpuTryAffineQuad(SWRenderer* sw, SWVertex v[4],
+                                const uint8_t* texPixels, int32_t texW, int32_t texH) {
+     if (!sw->gpuFrameEligible || !sw->gpuSawClear || !swGpuIsOutputTarget(sw) ||
+         !sw->blendEnable || sw->base.currentShader >= 0 ||
+-        (sw->blendMode != bm_normal && sw->blendMode != bm_add) || sw->alphaTestEnable ||
++        (sw->blendMode != bm_normal && sw->blendMode != bm_add &&
++         sw->blendMode != bm_subtract) || sw->alphaTestEnable ||
+         sw->fogEnable || !sw->colorWriteR || !sw->colorWriteG ||
+         !sw->colorWriteB || !sw->colorWriteA) return false;
+ 
+@@ -601,7 +610,9 @@ static bool swGpuTryAffineQuad(SWRenderer* sw, SWVertex v[4],
+             ((uint32_t)floatColorByte(v[0].g) << 8) |
+             ((uint32_t)floatColorByte(v[0].b) << 16) |
+             ((uint32_t)floatColorByte(v[0].a) << 24),
+-            sw->blendMode == bm_add)) {
++            sw->blendMode == bm_add ? MISTER_GPU_BLEND_ADDITIVE :
++            (sw->blendMode == bm_subtract ? MISTER_GPU_BLEND_SUBTRACT :
++                                            MISTER_GPU_BLEND_NORMAL))) {
+             sw->frameTriangleQuads++;
+             sw->frameTrianglePixels+=(uint64_t)(maxX-minX)*(uint64_t)(maxY-minY);
+             sw->gpuHasSkippedDraws=true;
+@@ -619,7 +630,9 @@ static bool swGpuTryAffineQuad(SWRenderer* sw, SWVertex v[4],
+        ((uint32_t)floatColorByte(v[0].g) << 8) |
+        ((uint32_t)floatColorByte(v[0].b) << 16) |
+        ((uint32_t)floatColorByte(v[0].a) << 24),
+-       sw->blendMode == bm_add)) return false;
++       sw->blendMode == bm_add ? MISTER_GPU_BLEND_ADDITIVE :
++       (sw->blendMode == bm_subtract ? MISTER_GPU_BLEND_SUBTRACT :
++                                       MISTER_GPU_BLEND_NORMAL))) return false;
+     sw->frameTriangleQuads++;
+     sw->frameTrianglePixels+=(uint64_t)(maxX-minX)*(uint64_t)(maxY-minY);
+     sw->gpuHasSkippedDraws=true;
+@@ -759,6 +772,7 @@ static bool rasterizeAxisAlignedQuad(SWRenderer* sw, SWVertex v[4], const uint8_
+     if (fabsf(v[0].y-v[1].y)>epsilon || fabsf(v[2].y-v[3].y)>epsilon ||
+         fabsf(v[0].x-v[3].x)>epsilon || fabsf(v[1].x-v[2].x)>epsilon) {
+ #ifdef USE_MISTER
++#if defined(MISTER_GPU_DIAGNOSTICS)
+         static uint32_t nonAxisLogs = 0;
+         if (swGpuIsOutputTarget(sw) && nonAxisLogs < 8) {
+             logInfo("MiSTer GPU affine candidate: tex=%d blend=%d enable=%d "
+@@ -781,6 +795,7 @@ static bool rasterizeAxisAlignedQuad(SWRenderer* sw, SWVertex v[4], const uint8_
+                     ((uint32_t)floatColorByte(v[3].b)<<16) | ((uint32_t)floatColorByte(v[3].a)<<24));
+             nonAxisLogs++;
+         }
++#endif
+         if (swGpuTryAffineQuad(sw, v, texPixels, texW, texH)) return true;
+         swGpuFallbackIfOutput(sw, "non-axis quad");
+ #endif
+@@ -804,7 +819,8 @@ static bool rasterizeAxisAlignedQuad(SWRenderer* sw, SWVertex v[4], const uint8_
+                        v[0].b==v[1].b&&v[0].b==v[2].b&&v[0].b==v[3].b&&
+                        v[0].a==v[1].a&&v[0].a==v[2].a&&v[0].a==v[3].a;
+     const float invDx=1.0f/dx,invDy=1.0f/dy;
+-    const bool supportedBlend=sw->blendMode==bm_normal||sw->blendMode==bm_add;
++    const bool supportedBlend=sw->blendMode==bm_normal||sw->blendMode==bm_add||
++                              sw->blendMode==bm_subtract;
+     // The software backend exposes shaders as unsupported.  Keep an active
+     // shader out of the FPGA fast paths as a defensive contract: if a game
+     // nevertheless binds one, the draw must fall back instead of silently
+@@ -812,7 +828,8 @@ static bool rasterizeAxisAlignedQuad(SWRenderer* sw, SWVertex v[4], const uint8_
+     const bool normalState=supportedBlend&&sw->base.currentShader<0&&
+                            !sw->alphaTestEnable&&!sw->fogEnable&&
+                            sw->colorWriteR&&sw->colorWriteG&&sw->colorWriteB&&sw->colorWriteA;
+-    const bool additive=sw->blendMode==bm_add;
++    const uint8_t gpuBlendMode=sw->blendMode==bm_add ? MISTER_GPU_BLEND_ADDITIVE :
++        (sw->blendMode==bm_subtract ? MISTER_GPU_BLEND_SUBTRACT : MISTER_GPU_BLEND_NORMAL);
+     const bool compatibleState=uniform&&normalState;
+     const bool compatibleTexture=texPixels&&compatibleState;
+     const bool verticalTint=!uniform&&normalState&&
+@@ -824,11 +841,54 @@ static bool rasterizeAxisAlignedQuad(SWRenderer* sw, SWVertex v[4], const uint8_
+ #ifdef USE_MISTER
+     if(!texPixels&&compatibleState&&sw->gpuFrameEligible&&sw->gpuSawClear&&
+        swGpuIsOutputTarget(sw)&&sw->blendEnable&&
+-       MisterGpu_addFill((int16_t)minX,(int16_t)minY,(uint16_t)(maxX-minX),(uint16_t)(maxY-minY),tint,additive)){
++       MisterGpu_addFill((int16_t)minX,(int16_t)minY,(uint16_t)(maxX-minX),(uint16_t)(maxY-minY),tint,gpuBlendMode)){
+         sw->gpuHasSkippedDraws=true;
+         return true;
+     }
+ #endif
++    // Uniform opaque rectangles are common render-target operations in
++    // GameMaker effects.  In particular, AM2R's lighting engine subtracts a
++    // one-level grey rectangle over 331x251 pixels every step.  Sending that
++    // through the generic float/interpolation loop below performs four state
++    // branches and three integer divisions for every pixel.  At full alpha the
++    // supported blend equations reduce exactly to packed fill or saturated
++    // byte add/subtract, so use that integer form for software surfaces.
++    if(!texPixels&&compatibleState&&tintA==255u){
++        const int32_t width=maxX-minX;
++        if(!sw->blendEnable||sw->blendMode==bm_normal){
++            uint32_t packed=tint;
++            for(int32_t y=minY;y<maxY;++y){
++                uint32_t* row=(uint32_t*)(sw->framebuffer+((size_t)y*sw->fbWidth+minX)*4u);
++                for(int32_t x=0;x<width;++x)row[x]=packed;
++            }
++#ifdef USE_MISTER
++            swExtendSurfaceContentBounds(sw,minX,minY,maxX,maxY);
++#endif
++            return true;
++        }
++        if(sw->blendMode==bm_subtract||sw->blendMode==bm_add){
++            const bool subtract=sw->blendMode==bm_subtract;
++            for(int32_t y=minY;y<maxY;++y){
++                uint8_t* pixel=sw->framebuffer+((size_t)y*sw->fbWidth+minX)*4u;
++                for(int32_t x=0;x<width;++x,pixel+=4){
++                    if(subtract){
++                        pixel[0]=pixel[0]>tintR?(uint8_t)(pixel[0]-tintR):0;
++                        pixel[1]=pixel[1]>tintG?(uint8_t)(pixel[1]-tintG):0;
++                        pixel[2]=pixel[2]>tintB?(uint8_t)(pixel[2]-tintB):0;
++                    }else{
++                        pixel[0]=clampByte((int32_t)pixel[0]+tintR);
++                        pixel[1]=clampByte((int32_t)pixel[1]+tintG);
++                        pixel[2]=clampByte((int32_t)pixel[2]+tintB);
++                        pixel[3]=255;
++                    }
++                }
++            }
++#ifdef USE_MISTER
++            swExtendSurfaceContentBounds(sw,minX,minY,maxX,maxY);
++#endif
++            return true;
++        }
++    }
+     if(!texPixels&&verticalTint){
+ #ifdef USE_MISTER
+         if(sw->gpuFrameEligible&&sw->gpuSawClear&&swGpuIsOutputTarget(sw)&&sw->blendEnable){
+@@ -845,7 +905,7 @@ static bool rasterizeAxisAlignedQuad(SWRenderer* sw, SWVertex v[4], const uint8_
+                 db>=INT16_MIN&&db<=INT16_MAX&&da>=INT16_MIN&&da<=INT16_MAX;
+             if(fits&&MisterGpu_addFillVGradient((int16_t)minX,(int16_t)minY,
+                (uint16_t)(maxX-minX),(uint16_t)(maxY-minY),tintStart,
+-               (int16_t)dr,(int16_t)dg,(int16_t)db,(int16_t)da,additive)){
++               (int16_t)dr,(int16_t)dg,(int16_t)db,(int16_t)da,gpuBlendMode)){
+                 sw->framePlainQuads++;
+                 sw->framePlainPixels+=(uint64_t)(maxX-minX)*(uint64_t)(maxY-minY);
+                 sw->gpuHasSkippedDraws=true;
+@@ -885,7 +945,7 @@ static bool rasterizeAxisAlignedQuad(SWRenderer* sw, SWVertex v[4], const uint8_
+             if(textureAddress&&fits&&MisterGpu_addBlitVGradient(textureAddress,gpuStride,
+                (int16_t)minX,(int16_t)minY,(uint16_t)(maxX-minX),(uint16_t)(maxY-minY),
+                gpuU,gpuV,gpuDu,gpuDv,
+-               tintStart,(int16_t)dr,(int16_t)dg,(int16_t)db,(int16_t)da,additive)){
++               tintStart,(int16_t)dr,(int16_t)dg,(int16_t)db,(int16_t)da,gpuBlendMode)){
+                 sw->framePlainQuads++;
+                 sw->framePlainPixels+=(uint64_t)(maxX-minX)*(uint64_t)(maxY-minY);
+                 sw->gpuHasSkippedDraws=true;
+@@ -927,7 +987,7 @@ static bool rasterizeAxisAlignedQuad(SWRenderer* sw, SWVertex v[4], const uint8_
+                 output,(size_t)width*height*4u);
+             if(address&&MisterGpu_addBlit(address,(uint32_t)width*4u,
+                (int16_t)minX,(int16_t)minY,(uint16_t)width,(uint16_t)height,
+-               1<<15,1<<15,1<<16,1<<16,0xffffffffu,additive)){
++               1<<15,1<<15,1<<16,1<<16,0xffffffffu,gpuBlendMode)){
+                 sw->framePlainQuads++;
+                 sw->framePlainPixels+=(uint64_t)width*(uint64_t)height;
+                 sw->gpuHasSkippedDraws=true;
+@@ -938,6 +998,16 @@ static bool rasterizeAxisAlignedQuad(SWRenderer* sw, SWVertex v[4], const uint8_
+ #endif
+     if(compatibleTexture){
+ #ifdef USE_MISTER
++        int32_t sourceSurface = -1;
++        if (sw->gpuFrameEligible && swGpuIsOutputTarget(sw)) {
++            for (uint32_t surface = 0; surface < sw->surfaceCount; ++surface) {
++                if (sw->surfaceExistsFlags[surface] &&
++                    sw->surfacePixels[surface] == texPixels) {
++                    sourceSurface = (int32_t)surface;
++                    break;
++                }
++            }
++        }
+         int32_t sparseSurface = -1;
+         // AM2R's Draw-GUI surface reaches this common textured-quad path as a
+         // full 320x240 draw, but its alpha data normally occupies only the
+@@ -956,14 +1026,6 @@ static bool rasterizeAxisAlignedQuad(SWRenderer* sw, SWVertex v[4], const uint8_
+             fabsf(v[2].u - 1.0f) < 0.0001f && fabsf(v[2].v - 1.0f) < 0.0001f &&
+             fabsf(v[3].u) < 0.0001f && fabsf(v[3].v - 1.0f) < 0.0001f &&
+             tint == 0xffffffffu) {
+-            int32_t sourceSurface = -1;
+-            for (uint32_t surface = 0; surface < sw->surfaceCount; ++surface) {
+-                if (sw->surfaceExistsFlags[surface] &&
+-                    sw->surfacePixels[surface] == texPixels) {
+-                    sourceSurface = (int32_t)surface;
+-                    break;
+-                }
+-            }
+             if (sourceSurface >= 0) {
+                 int32_t minSourceX = sw->surfaceContentMinX[sourceSurface];
+                 int32_t minSourceY = sw->surfaceContentMinY[sourceSurface];
+@@ -986,12 +1048,14 @@ static bool rasterizeAxisAlignedQuad(SWRenderer* sw, SWVertex v[4], const uint8_
+                     maxX -= 320 - maxSourceX;
+                     minY += minSourceY;
+                     maxY -= 240 - maxSourceY;
++#if defined(MISTER_GPU_DIAGNOSTICS)
+                     if (sw->gpuHudCropLogs < 8) {
+                         logInfo("MiSTer AM2R HUD crop: bounds=%d,%d..%d,%d view=320x%d\n",
+                                 minSourceX, minSourceY, maxSourceX, maxSourceY,
+                                 cropHeight);
+                         sw->gpuHudCropLogs++;
+                     }
++#endif
+                 }
+             }
+         }
+@@ -1020,6 +1084,23 @@ static bool rasterizeAxisAlignedQuad(SWRenderer* sw, SWVertex v[4], const uint8_
+                 textureAddress = MisterGpu_uploadSparseDynamicTextureRevision(
+                     texPixels, (size_t)texW * texH * 4u, gpuStride,
+                     sw->surfaceRevisions[sparseSurface]);
++            } else if (coordinatesFit && sourceSurface >= 0 &&
++                       texW == 512 && texH == 256 &&
++                       sw->surfaceWidths[sourceSurface] == texW &&
++                       sw->surfaceHeights[sourceSurface] == texH) {
++                // AM2R's lighting engine rebuilds a 512x256 subtractive mask
++                // every tick, even when only the character-following light
++                // moved by a few pixels.  A conventional dynamic upload
++                // writes both complete 512 KiB buffers on alternating frames.
++                // Keep the exact RGBA surface and 2048-byte source stride, but
++                // update only rows/spans which differ from the corresponding
++                // double-buffer shadow.  Stationary masks become comparison-
++                // only frames and moving lights transfer their small union of
++                // old/new bounds instead of the entire power-of-two surface.
++                gpuStride = (uint32_t)texW * 4u;
++                textureAddress = MisterGpu_uploadSparseDynamicTextureRevision(
++                    texPixels, (size_t)texW * texH * 4u, gpuStride,
++                    sw->surfaceRevisions[sourceSurface]);
+             } else if (coordinatesFit) {
+                 textureAddress = swGpuPrepareAxisTexture(sw,texPixels,texW,texH,
+                     maxX-minX,maxY-minY,&gpuU,&gpuV,&gpuDu,&gpuDv,&gpuStride);
+@@ -1027,14 +1108,16 @@ static bool rasterizeAxisAlignedQuad(SWRenderer* sw, SWVertex v[4], const uint8_
+             if (textureAddress != 0 && coordinatesFit &&
+                 MisterGpu_addBlit(textureAddress, gpuStride,
+                     (int16_t)minX, (int16_t)minY, (uint16_t)(maxX-minX), (uint16_t)(maxY-minY),
+-                    gpuU, gpuV, gpuDu, gpuDv, tint, additive)) {
++                    gpuU, gpuV, gpuDu, gpuDv, tint, gpuBlendMode)) {
+                 sw->gpuHasSkippedDraws = true;
+                 return true;
+             }
++#if defined(MISTER_GPU_DIAGNOSTICS)
+             if (sw->gpuFallbackFrames < 20)
+                 logInfo("MiSTer GPU blit reject: address=%08x fit=%d uv=%lld,%lld step=%lld,%.0f tex=%dx%d dst=%dx%d\n",
+                         textureAddress, coordinatesFit, (long long)startX, (long long)startY,
+                         (long long)stepX, stepYDouble, texW, texH, maxX-minX, maxY-minY);
++#endif
+         }
+         swGpuFallbackIfOutput(sw, "textured blit not recordable");
+ #endif
+@@ -1057,20 +1140,15 @@ static bool rasterizeAxisAlignedQuad(SWRenderer* sw, SWVertex v[4], const uint8_
+                     uint32_t pa=((pixel>>24)&255u)*tintA/255u;
+                     pixel=pr|(pg<<8)|(pb<<16)|(pa<<24);
+                 }
+-                uint32_t sa=pixel>>24;
+-                if(sa==0)continue;
+-                if(!sw->blendEnable||sa==255){*dst=pixel;continue;}
+-                uint32_t d=*dst,inv=255-sa;
+-                uint32_t r=(((pixel&255)*sa+(d&255)*inv)/255)&255;
+-                uint32_t g=(((((pixel>>8)&255)*sa+((d>>8)&255)*inv)/255)&255)<<8;
+-                uint32_t b=(((((pixel>>16)&255)*sa+((d>>16)&255)*inv)/255)&255)<<16;
+-                uint32_t a=(sa+((d>>24)*inv)/255)<<24;
+-                *dst=r|g|b|a;
++                blendPixel(sw, (uint8_t*)dst, pixel & 255u,
++                           (pixel >> 8) & 255u, (pixel >> 16) & 255u,
++                           pixel >> 24);
+             }
+         }
+         return true;
+     }
+ #ifdef USE_MISTER
++#if defined(MISTER_GPU_DIAGNOSTICS)
+     static uint32_t gpuRejectLogs = 0;
+     if (swGpuIsOutputTarget(sw) &&
+         (gpuRejectLogs < 24 || (sw->base.runner->frameCount % 300) == 0)) {
+@@ -1087,6 +1165,7 @@ static bool rasterizeAxisAlignedQuad(SWRenderer* sw, SWVertex v[4], const uint8_
+                 maxX-minX, maxY-minY, colors[0], colors[1], colors[2], colors[3]);
+         gpuRejectLogs++;
+     }
++#endif
+     swGpuFallbackIfOutput(sw, "unsupported axis quad state");
+     swExtendSurfaceContentBounds(sw, minX, minY, maxX, maxY);
+ #endif
+@@ -1321,6 +1400,7 @@ static void swEndFrameInit(Renderer* renderer) {
+ 
+ static void swEndFrameEnd(Renderer* renderer) {
+     SWRenderer* sw = (SWRenderer*)renderer;
++#if defined(MISTER_GPU_DIAGNOSTICS)
+     if ((renderer->runner->frameCount % 300) == 0) {
+         logInfo("SW frame %d: axis=%u/%llu plain=%u/%llu rotated=%u/%llu\n",
+                 renderer->runner->frameCount, sw->frameAxisQuads, (unsigned long long)sw->frameAxisPixels,
+@@ -1333,6 +1413,7 @@ static void swEndFrameEnd(Renderer* renderer) {
+                 sw->gpuFallbackReasons[5], sw->gpuFallbackReasons[6]);
+ #endif
+     }
++#endif
+     if (!renderer->runner->usingAppSurface || !renderer->runner->appSurfaceAutoDraw) return;
+     int32_t id = renderer->runner->applicationSurfaceId;
+     if (id < 0 || (uint32_t)id >= sw->surfaceCount || !sw->surfaceExistsFlags[id]) return;
+@@ -1425,10 +1506,12 @@ static void swEndGUI(Renderer* renderer) {
+     // platformSwapBuffers; disabling eligibility here leaves those final CPU
+     // shadow writes invisible while the FPGA owns presentation.
+     if (sw->gpuHostContinuation) {
++#if defined(MISTER_GPU_DIAGNOSTICS)
+         if ((renderer->runner->frameCount % 300) == 0)
+             logInfo("MiSTer GPU frame %d: queued=%d fallback=%u (eligible=%d clear=%d)\n",
+                     renderer->runner->frameCount, sw->gpuHasSkippedDraws,
+                     sw->gpuFallbackFrames, sw->gpuFrameEligible, sw->gpuSawClear);
++#endif
+     }
+ #endif
+     if (sw->currentSurface == RENDER_TARGET_HOST_FRAMEBUFFER && sw->hostFramebuffer != nullptr)
+@@ -2404,6 +2487,7 @@ SWAm2rMapCacheMode SWRenderer_misterPrepareAm2rMapSurface(
+         else if (incrementalEligible)
+             mode = SW_AM2R_MAP_CACHE_INCREMENTAL;
+     }
++#if defined(MISTER_GPU_DIAGNOSTICS)
+     if (sw->am2rMapSurfaceLogCount < 16) {
+         const char* modeName = mode == SW_AM2R_MAP_CACHE_HIT ? "hit" :
+                                (mode == SW_AM2R_MAP_CACHE_INCREMENTAL ?
+@@ -2414,6 +2498,7 @@ SWAm2rMapCacheMode SWRenderer_misterPrepareAm2rMapSurface(
+                 (uint32_t)(discoveryHash >> 32), (uint32_t)discoveryHash);
+         sw->am2rMapSurfaceLogCount++;
+     }
++#endif
+     return mode;
+ }
+ 
+@@ -2648,17 +2733,20 @@ static void swSurfaceCopy(Renderer* renderer, int32_t dstId, int32_t dx, int32_t
+             sw->surfaceContentMinY[dstId] = sw->surfaceContentMinY[srcId];
+             sw->surfaceContentMaxX[dstId] = sw->surfaceContentMaxX[srcId];
+             sw->surfaceContentMaxY[dstId] = sw->surfaceContentMaxY[srcId];
++#if defined(MISTER_GPU_DIAGNOSTICS)
+             static uint32_t exportLogs = 0;
+             if (exportLogs < 16) {
+                 logInfo("MiSTer application surface export frame=%d dst=%d address=%08x\n",
+                         renderer->runner->frameCount, dstId, destination);
+                 exportLogs++;
+             }
++#endif
+             return;
+         }
+     }
+     if (dstId == renderer->runner->applicationSurfaceId ||
+         srcId == renderer->runner->applicationSurfaceId) {
++#if defined(MISTER_GPU_DIAGNOSTICS)
+         static uint32_t applicationCopyLogs = 0;
+         if (applicationCopyLogs < 24) {
+             logInfo("MiSTer application surface copy frame=%d app=%d current=%d "
+@@ -2671,6 +2759,7 @@ static void swSurfaceCopy(Renderer* renderer, int32_t dstId, int32_t dx, int32_t
+                     sw->gpuHostContinuation);
+             applicationCopyLogs++;
+         }
++#endif
+         swGpuFallback(sw, "application surface copy");
+     }
+ #endif

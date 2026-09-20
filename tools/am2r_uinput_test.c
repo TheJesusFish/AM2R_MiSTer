@@ -117,6 +117,7 @@ int main(int argc, char **argv)
 	bool start_only = false;
 	bool jump_loop = false;
 	bool left_fall = false;
+	bool lava_lateral = false;
 	bool right_walk = false;
 	bool left_walk = false;
 	bool left_traverse = false;
@@ -128,10 +129,14 @@ int main(int argc, char **argv)
 	bool pacing_jump = false;
 	bool metroid_test = false;
 	bool robot_test = false;
+	bool sand_down_test = false;
+	bool sand_left_test = false;
+	bool sand_right_test = false;
 	bool continue_save = false;
 	bool select_save = false;
 	bool subscreen_cycle = false;
 	bool subscreen_logs = false;
+	int exit_direction = 0;
 	bool have_delay = false;
 	for (int i = 1; i < argc; ++i) {
 		if (!strcmp(argv[i], "--gameplay")) {
@@ -161,6 +166,9 @@ int main(int argc, char **argv)
 		} else if (!strcmp(argv[i], "--left-fall")) {
 			if (left_fall) goto usage;
 			left_fall = true;
+		} else if (!strcmp(argv[i], "--lava-lateral")) {
+			if (lava_lateral) goto usage;
+			lava_lateral = true;
 		} else if (!strcmp(argv[i], "--right-walk")) {
 			if (right_walk) goto usage;
 			right_walk = true;
@@ -194,6 +202,15 @@ int main(int argc, char **argv)
 		} else if (!strcmp(argv[i], "--robot-test")) {
 			if (robot_test) goto usage;
 			robot_test = true;
+		} else if (!strcmp(argv[i], "--sand-down-test")) {
+			if (sand_down_test) goto usage;
+			sand_down_test = true;
+		} else if (!strcmp(argv[i], "--sand-left-test")) {
+			if (sand_left_test) goto usage;
+			sand_left_test = true;
+		} else if (!strcmp(argv[i], "--sand-right-test")) {
+			if (sand_right_test) goto usage;
+			sand_right_test = true;
 		} else if (!strcmp(argv[i], "--continue-save")) {
 			if (continue_save) goto usage;
 			continue_save = true;
@@ -206,20 +223,32 @@ int main(int argc, char **argv)
 		} else if (!strcmp(argv[i], "--subscreen-logs")) {
 			if (subscreen_logs) goto usage;
 			subscreen_logs = true;
+		} else if (!strcmp(argv[i], "--exit-left")) {
+			if (exit_direction) goto usage;
+			exit_direction = 1;
+		} else if (!strcmp(argv[i], "--exit-right")) {
+			if (exit_direction) goto usage;
+			exit_direction = 2;
+		} else if (!strcmp(argv[i], "--exit-up")) {
+			if (exit_direction) goto usage;
+			exit_direction = 3;
+		} else if (!strcmp(argv[i], "--exit-down")) {
+			if (exit_direction) goto usage;
+			exit_direction = 4;
 		} else {
 			if (have_delay || parse_delay(argv[i], &initial_delay_ms)) goto usage;
 			have_delay = true;
 		}
 	}
 	if ((traverse && !gameplay) ||
-	    ((bindings || bindable_save || mapped_save || install_bindable_map || start_only || jump_loop || left_fall || right_walk || left_walk || left_traverse || right_traverse || door_right || pacing_loop || pacing_long || pacing_morph || pacing_jump || metroid_test || robot_test || continue_save || select_save || subscreen_cycle || subscreen_logs) &&
+	    ((bindings || bindable_save || mapped_save || install_bindable_map || start_only || jump_loop || left_fall || lava_lateral || right_walk || left_walk || left_traverse || right_traverse || door_right || pacing_loop || pacing_long || pacing_morph || pacing_jump || metroid_test || robot_test || sand_down_test || sand_left_test || sand_right_test || continue_save || select_save || subscreen_cycle || subscreen_logs || exit_direction) &&
 	     (gameplay || traverse)) ||
 	    ((int)bindings + (int)bindable_save + (int)mapped_save +
 	     (int)install_bindable_map + (int)start_only +
-	     (int)jump_loop + (int)left_fall + (int)right_walk + (int)left_walk +
-	     (int)left_traverse + (int)right_traverse + (int)door_right + (int)pacing_loop + (int)pacing_long + (int)pacing_morph + (int)pacing_jump + (int)metroid_test + (int)robot_test +
+	     (int)jump_loop + (int)left_fall + (int)lava_lateral + (int)right_walk + (int)left_walk +
+	     (int)left_traverse + (int)right_traverse + (int)door_right + (int)pacing_loop + (int)pacing_long + (int)pacing_morph + (int)pacing_jump + (int)metroid_test + (int)robot_test + (int)sand_down_test + (int)sand_left_test + (int)sand_right_test +
 	     (int)continue_save + (int)select_save + (int)subscreen_cycle +
-	     (int)subscreen_logs > 1)) goto usage;
+	     (int)subscreen_logs + (exit_direction != 0) > 1)) goto usage;
 
 	if (install_bindable_map) {
 		// Install before launching the core so Main reads this controller's
@@ -299,6 +328,7 @@ int main(int argc, char **argv)
 	       bindable_save ? "bindable save-state" :
 	       start_only ? "start-only" :
 	       left_fall ? "left-fall" :
+	       lava_lateral ? "lava-lateral" :
 	       right_walk ? "right-walk" :
 	       left_walk ? "left-walk" :
 	       left_traverse ? "left-traverse" :
@@ -310,15 +340,44 @@ int main(int argc, char **argv)
 	       pacing_jump ? "pacing-jump" :
 	       metroid_test ? "metroid-test" :
 	       robot_test ? "robot-test" :
+	       sand_down_test ? "sand-down-test" :
+	       sand_left_test ? "sand-left-test" :
+	       sand_right_test ? "sand-right-test" :
 	       continue_save ? "continue-save" :
 	       select_save ? "select-save" :
 	       subscreen_cycle ? "subscreen-cycle" :
 	       subscreen_logs ? "subscreen-logs" :
+	       exit_direction == 1 ? "exit-left" :
+	       exit_direction == 2 ? "exit-right" :
+	       exit_direction == 3 ? "exit-up" :
+	       exit_direction == 4 ? "exit-down" :
 	       (bindings ? "bindings" : (gameplay ? "gameplay" : "boot")),
 	       initial_delay_ms);
 	fflush(stdout);
 	if (sleep_ms(initial_delay_ms)) goto io_error;
-	if (continue_save) {
+	if (exit_direction) {
+		// Assign the temporary pad, then cross one staged room boundary with a
+		// short, unambiguous directional hold.  This keeps hardware QA routes on
+		// the game's normal oGotoRoom transition path instead of writing room
+		// state directly.
+		if (pulse_button(fd, BTN_SOUTH, 120) || sleep_ms(1000)) goto io_error;
+		if (exit_direction <= 2) {
+			if (emit(fd, EV_ABS, ABS_HAT0X, exit_direction == 1 ? -1 : 1) ||
+			    sync_event(fd) || sleep_ms(700) ||
+			    emit(fd, EV_ABS, ABS_HAT0X, 0) || sync_event(fd)) goto io_error;
+		} else {
+			if (emit(fd, EV_ABS, ABS_HAT0Y, exit_direction == 3 ? -1 : 1) ||
+			    sync_event(fd) ||
+			    // A top boundary generally has to be crossed with an actual jump;
+			    // Up alone does not give Samus vertical velocity.  The staged QA
+			    // position is immediately below the trigger, so one normal Jump
+			    // preserves the game's collision/transition code path.
+			    (exit_direction == 3 && pulse_button(fd, BTN_EAST, 180)) ||
+			    sleep_ms(700) ||
+			    emit(fd, EV_ABS, ABS_HAT0Y, 0) || sync_event(fd)) goto io_error;
+		}
+		if (sleep_ms(1500)) goto io_error;
+	} else if (continue_save) {
 		// Assign the hot-plugged controller without forwarding that edge, enter
 		// the save selector, choose slot A, and confirm Continue. Do not append
 		// gameplay movement: callers can inspect the exact loaded save point.
@@ -414,6 +473,51 @@ int main(int argc, char **argv)
 			    sleep_ms(rise_ms[shot]) || pulse_button(fd, BTN_WEST, 140) ||
 			    sleep_ms(90) || emit(fd, EV_KEY, BTN_EAST, 0) ||
 			    sync_event(fd) || sleep_ms(1100)) goto io_error;
+		}
+		if (sleep_ms(2500)) goto io_error;
+	} else if (sand_down_test) {
+		// The supplied slot-1 scene places Samus above destructible sand. Repeat
+		// the user's jump/aim-down/fire route with isolated shot edges so stage
+		// timing can be correlated with each sand-clear event.
+		if (pulse_button(fd, BTN_SOUTH, 120) || sleep_ms(2000)) goto io_error;
+		for (int shot = 0; shot < 16; ++shot) {
+			printf("sand down shot %d/16\n", shot + 1);
+			fflush(stdout);
+			if (emit(fd, EV_KEY, BTN_EAST, 1) || sync_event(fd) ||
+			    sleep_ms(240) || emit(fd, EV_KEY, BTN_TL, 1) ||
+			    sync_event(fd) || sleep_ms(80) ||
+			    pulse_button(fd, BTN_WEST, 100) || sleep_ms(100) ||
+			    emit(fd, EV_KEY, BTN_TL, 0) ||
+			    emit(fd, EV_KEY, BTN_EAST, 0) || sync_event(fd) ||
+			    sleep_ms(760)) goto io_error;
+		}
+		if (sleep_ms(2500)) goto io_error;
+	} else if (sand_left_test) {
+		// This checkpoint places Samus at the right edge already facing the
+		// destructible sand mass. Do not tap a direction: even a brief right tap
+		// crosses the adjacent room boundary and measures a transition instead of
+		// the reported sand-room workload.
+		if (pulse_button(fd, BTN_SOUTH, 120) || sleep_ms(2000)) goto io_error;
+		for (int shot = 0; shot < 24; ++shot) {
+			printf("sand left shot %d/24\n", shot + 1);
+			fflush(stdout);
+			if (pulse_button(fd, BTN_WEST, 100) || sleep_ms(400))
+				goto io_error;
+		}
+		if (sleep_ms(2500)) goto io_error;
+	} else if (sand_right_test) {
+		// The supplied slot-2 scene needs only a right-facing beam. Face right
+		// once, then fire separate edges at a cadence that exposes any clear-time
+		// hitch without turning the sequence into continuous autofire.
+		if (pulse_button(fd, BTN_SOUTH, 120) || sleep_ms(2000) ||
+		    emit(fd, EV_ABS, ABS_HAT0X, 1) || sync_event(fd) ||
+		    sleep_ms(180) || emit(fd, EV_ABS, ABS_HAT0X, 0) ||
+		    sync_event(fd) || sleep_ms(300)) goto io_error;
+		for (int shot = 0; shot < 24; ++shot) {
+			printf("sand right shot %d/24\n", shot + 1);
+			fflush(stdout);
+			if (pulse_button(fd, BTN_WEST, 100) || sleep_ms(400))
+				goto io_error;
 		}
 		if (sleep_ms(2500)) goto io_error;
 	} else if (jump_loop) {
@@ -528,6 +632,24 @@ int main(int argc, char **argv)
 		    emit(fd, EV_ABS, ABS_HAT0X, right_walk ? 1 : -1) || sync_event(fd) ||
 		    sleep_ms(10000) || emit(fd, EV_ABS, ABS_HAT0X, 0) ||
 		    sync_event(fd) || sleep_ms(5000)) goto io_error;
+	} else if (lava_lateral) {
+		// The currently attached slot-1 state starts on the ledge immediately
+		// above the lava.  Walk off the left edge, allow the character to become
+		// fully submerged, then alternate lateral movement while the capture is
+		// active.  The short dwell preserves the checkpoint's finite health.
+		if (pulse_button(fd, BTN_SOUTH, 120) || sleep_ms(7000) ||
+		    emit(fd, EV_ABS, ABS_HAT0X, -1) || sync_event(fd) ||
+		    sleep_ms(900) || emit(fd, EV_ABS, ABS_HAT0X, 0) ||
+		    sync_event(fd) || sleep_ms(800)) goto io_error;
+		for (int pass = 0; pass < 12; ++pass) {
+			int direction = (pass & 1) ? 1 : -1;
+			printf("lava lateral leg %d/12 direction=%d\n", pass + 1, direction);
+			fflush(stdout);
+			if (emit(fd, EV_ABS, ABS_HAT0X, direction) || sync_event(fd) ||
+			    sleep_ms(350)) goto io_error;
+		}
+		if (emit(fd, EV_ABS, ABS_HAT0X, 0) || sync_event(fd) ||
+		    sleep_ms(2500)) goto io_error;
 	} else if (left_fall) {
 		// Assign the hot-plugged controller, then walk away from the room's
 		// right wall and cross the central pit without jumping.
@@ -622,7 +744,7 @@ int main(int argc, char **argv)
 	// south face button to core B. Use east here so the sequence confirms menu
 	// choices as well as proving that the game-facing A mapping survives the
 	// Main_MiSTer bridge.
-	if (bindings || bindable_save || mapped_save || start_only || jump_loop || left_fall || right_walk || left_walk || left_traverse || right_traverse || door_right || pacing_loop || pacing_long || pacing_morph || pacing_jump || metroid_test || continue_save || select_save || subscreen_cycle || subscreen_logs) {
+	if (bindings || bindable_save || mapped_save || start_only || jump_loop || left_fall || lava_lateral || right_walk || left_walk || left_traverse || right_traverse || door_right || pacing_loop || pacing_long || pacing_morph || pacing_jump || metroid_test || robot_test || sand_down_test || sand_left_test || sand_right_test || continue_save || select_save || subscreen_cycle || subscreen_logs || exit_direction) {
 		// The semantic binding sequence above is complete.
 	} else if (traverse) {
 		if (emit(fd, EV_ABS, ABS_HAT0X, 1) || sync_event(fd)) goto io_error;
@@ -640,14 +762,14 @@ int main(int argc, char **argv)
 		    emit(fd, EV_ABS, ABS_HAT0X, 0) || sync_event(fd) || sleep_ms(1500)) goto io_error;
 	}
 
-	if (!bindings && !bindable_save && !mapped_save && !start_only && !jump_loop && !left_fall && !right_walk && !left_walk && !left_traverse && !right_traverse && !door_right && !pacing_loop && !pacing_long && !pacing_morph && !pacing_jump && !metroid_test && !continue_save && !select_save && !subscreen_cycle && !subscreen_logs)
+	if (!bindings && !bindable_save && !mapped_save && !start_only && !jump_loop && !left_fall && !lava_lateral && !right_walk && !left_walk && !left_traverse && !right_traverse && !door_right && !pacing_loop && !pacing_long && !pacing_morph && !pacing_jump && !metroid_test && !robot_test && !sand_down_test && !sand_left_test && !sand_right_test && !continue_save && !select_save && !subscreen_cycle && !subscreen_logs && !exit_direction)
 		printf("A/d-pad sequence sent\n");
 	ioctl(fd, UI_DEV_DESTROY);
 	close(fd);
 	return 0;
 
 usage:
-	fprintf(stderr, "usage: %s [initial-delay-ms] [--gameplay] [--traverse] [--bindings|--bindable-save|--mapped-save|--install-bindable-map|--start-only|--jump-loop|--left-fall|--right-walk|--left-walk|--left-traverse|--right-traverse|--door-right|--pacing-loop|--pacing-long|--pacing-morph|--pacing-jump|--metroid-test|--robot-test|--continue-save|--select-save|--subscreen-cycle|--subscreen-logs]\n", argv[0]);
+	fprintf(stderr, "usage: %s [initial-delay-ms] [--gameplay] [--traverse] [--bindings|--bindable-save|--mapped-save|--install-bindable-map|--start-only|--jump-loop|--left-fall|--lava-lateral|--right-walk|--left-walk|--left-traverse|--right-traverse|--door-right|--pacing-loop|--pacing-long|--pacing-morph|--pacing-jump|--metroid-test|--robot-test|--sand-down-test|--sand-left-test|--sand-right-test|--continue-save|--select-save|--subscreen-cycle|--subscreen-logs|--exit-left|--exit-right|--exit-up|--exit-down]\n", argv[0]);
 	return 2;
 
 io_error:

@@ -1,5 +1,7 @@
 """Print live character/camera field addresses for a read-only QA sampler."""
 
+import struct
+
 import gdb
 
 
@@ -10,8 +12,44 @@ def array_length(pointer):
     return int((pointer.cast(header_type) - 1).dereference()["length"])
 
 
-runner_pointer = gdb.parse_and_eval("g_runner")
-runner = runner_pointer.dereference()
+def locate_runner():
+    """Use the symbol when valid, otherwise scan the small executable BSS."""
+    inferior = gdb.selected_inferior()
+    runner_type = gdb.lookup_type("Runner").pointer()
+    try:
+        direct = gdb.parse_and_eval("g_runner")
+        if 0x001D0000 <= int(direct) < 0xB0000000:
+            runner = direct.dereference()
+            if (0 <= int(runner["currentRoomIndex"]) < 1000 and
+                    0 < int(runner["frameCount"]) < 100000000):
+                return direct, runner
+    except (gdb.error, gdb.MemoryError):
+        pass
+
+    for address in range(0x001CF000, 0x00220000, 4):
+        try:
+            pointer_value = struct.unpack(
+                "<I", bytes(inferior.read_memory(address, 4))
+            )[0]
+            if (pointer_value < 0x001D0000 or pointer_value >= 0xB0000000 or
+                    pointer_value & 3):
+                continue
+            pointer = gdb.Value(pointer_value).cast(runner_type)
+            runner = pointer.dereference()
+            data_win = runner["dataWin"].dereference()
+            if not (0 <= int(runner["currentRoomIndex"]) < 1000):
+                continue
+            if not (0 < int(runner["frameCount"]) < 100000000):
+                continue
+            if not (100 <= int(data_win["objt"]["count"]) < 10000):
+                continue
+            return pointer, runner
+        except (gdb.error, gdb.MemoryError):
+            continue
+    raise gdb.GdbError("could not locate the live AM2R Runner")
+
+
+runner_pointer, runner = locate_runner()
 data_win = runner["dataWin"].dereference()
 print("MOTION_FRAME address=0x%x value=%d" %
       (int(runner["frameCount"].address), int(runner["frameCount"])))

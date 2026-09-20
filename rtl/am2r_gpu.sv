@@ -111,9 +111,11 @@ module am2r_gpu
 	reg [15:0] tint_product [0:7];
 	reg solid_mode;
 	reg additive_mode;
+	reg subtract_mode;
 	reg affine_mode;
 	reg [31:0] affine_tint_config;
 	reg affine_additive_config;
+	reg affine_subtract_config;
 	reg [16:0] destination_linear;
 	reg [15:0] destination_word;
 	reg destination_odd;
@@ -342,6 +344,25 @@ module am2r_gpu
 		end
 	endfunction
 
+	function automatic [7:0] saturating_subtract;
+		input [7:0] a, b;
+		begin
+			saturating_subtract = a < b ? 8'h00 : a - b;
+		end
+	endfunction
+
+	function automatic [31:0] subtract_blend;
+		input [31:0] src, dst;
+		reg [7:0] sa;
+		begin
+			sa = src[31:24];
+			subtract_blend[7:0] = saturating_subtract(dst[7:0], div255_floor(src[7:0] * sa));
+			subtract_blend[15:8] = saturating_subtract(dst[15:8], div255_floor(src[15:8] * sa));
+			subtract_blend[23:16] = saturating_subtract(dst[23:16], div255_floor(src[23:16] * sa));
+			subtract_blend[31:24] = dst[31:24];
+		end
+	endfunction
+
 	function automatic [31:0] rgba_to_xrgb;
 		input [31:0] rgba;
 		begin
@@ -371,6 +392,7 @@ module am2r_gpu
 		input [31:0] src, dst;
 		begin
 			if (src[31:24] == 0) blended_pixel = dst;
+			else if (subtract_mode) blended_pixel = subtract_blend(src, dst);
 			else if (additive_mode) blended_pixel = additive_blend(src, dst);
 			else if (src[31:24] == 8'hff) blended_pixel = src;
 			else blended_pixel = alpha_blend(src, dst);
@@ -459,6 +481,9 @@ module am2r_gpu
 			scan_underflow_seen <= 0;
 			affine_tint_config <= 32'hffff_ffff;
 			affine_additive_config <= 0;
+			affine_subtract_config <= 0;
+			additive_mode <= 0;
+			subtract_mode <= 0;
 			native_frame <= 0;
 			native_buffer <= 0;
 		end else begin
@@ -540,6 +565,7 @@ module am2r_gpu
 						8'd2: begin
 							solid_mode <= 0;
 							additive_mode <= descriptor[0][8];
+							subtract_mode <= descriptor[0][9];
 							affine_mode <= 0;
 							src_base <= descriptor[1][31:0];
 							src_stride <= descriptor[1][63:32];
@@ -569,7 +595,7 @@ module am2r_gpu
 							state <= ST_BLIT_ROW;
 						end
 						8'd3: begin
-							if (descriptor[0][8] &&
+							if (descriptor[0][8] && !descriptor[0][9] &&
 							    descriptor[1][31:24] == 8'hff &&
 							    descriptor[2][31:0] == 0 &&
 							    descriptor[0][31:16] == FB_WIDTH &&
@@ -603,6 +629,7 @@ module am2r_gpu
 							end else begin
 								solid_mode <= 1;
 								additive_mode <= descriptor[0][8];
+								subtract_mode <= descriptor[0][9];
 								affine_mode <= 0;
 								tint_color <= descriptor[1][31:0];
 								tint_r_current <= {1'b0, descriptor[1][7:0], 16'b0};
@@ -634,6 +661,7 @@ module am2r_gpu
 							// bounding box, source bounds, and 16.16 UV derivatives.
 							solid_mode <= 0;
 							additive_mode <= affine_additive_config;
+							subtract_mode <= affine_subtract_config;
 							affine_mode <= 1;
 							src_base <= descriptor[1][31:0];
 							src_stride <= descriptor[1][63:32];
@@ -665,6 +693,7 @@ module am2r_gpu
 							texture_cache_valid <= 0;
 							affine_tint_config <= 32'hffff_ffff;
 							affine_additive_config <= 0;
+							affine_subtract_config <= 0;
 							state <= ST_BLIT_ROW;
 						end
 						8'd5: begin
@@ -672,6 +701,7 @@ module am2r_gpu
 							// separate leaves all 256 coordinate bits available.
 							affine_tint_config <= descriptor[1][31:0];
 							affine_additive_config <= descriptor[0][8];
+							affine_subtract_config <= descriptor[0][9];
 							command_index <= command_index + 1'b1;
 							command_word <= 0;
 							start_read(command_addr + ((command_index + 1'b1) << 6), 8);
@@ -840,7 +870,7 @@ module am2r_gpu
 						end else if (solid_mode &&
 						             blit_x + 1'b1 < blit_width &&
 						             ($signed(dst_x) + $signed({1'b0, blit_x}) + 1) < FB_WIDTH &&
-						             (additive_mode ||
+						             (additive_mode || subtract_mode ||
 						              (tint_color[31:24] != 0 && tint_color[31:24] != 8'hff))) begin
 							// The read above supplies ST_PAIR_BLEND_WRITE after the
 							// existing one-cycle M10K latency.
@@ -892,7 +922,7 @@ module am2r_gpu
 					ST_SOLID_READY: begin
 						destination_word <= destination_linear[16:1];
 						destination_odd <= destination_linear[0];
-						if (pair_mode && !additive_mode &&
+						if (pair_mode && !additive_mode && !subtract_mode &&
 						    (tint_color[31:24] == 0 || tint_color[31:24] == 8'hff)) begin
 							// Opaque/transparent solid pairs need neither the tint staging
 							// register nor an M10K destination read. Commit both lanes here.
@@ -935,7 +965,7 @@ module am2r_gpu
 					if (pair_mode) begin
 						destination_word <= destination_linear[16:1];
 						destination_odd <= destination_linear[0];
-						if (tint_color == 32'hffff_ffff && !additive_mode &&
+						if (tint_color == 32'hffff_ffff && !additive_mode && !subtract_mode &&
 						    (texture_cache_data[source_byte_addr[6:3]][31:24] == 0 ||
 						     texture_cache_data[source_byte_addr[6:3]][31:24] == 8'hff) &&
 						    (texture_cache_data[source_byte_addr[6:3]][63:56] == 0 ||
@@ -976,7 +1006,7 @@ module am2r_gpu
 							end else begin
 								advance_blit_pair();
 							end
-						end else if (!additive_mode && tint_color[23:0] == 24'hffffff &&
+						end else if (!additive_mode && !subtract_mode && tint_color[23:0] == 24'hffffff &&
 						             (texture_cache_data[source_byte_addr[6:3]][31:24] == 0 ||
 						              texture_cache_data[source_byte_addr[6:3]][31:24] == 8'hff) &&
 						             (texture_cache_data[source_byte_addr[6:3]][63:56] == 0 ||
@@ -1069,7 +1099,7 @@ module am2r_gpu
 				end
 				ST_BLEND_READ: begin
 					if (tinted_pixel[31:24] == 0) advance_blit_pixel();
-					else if (!additive_mode && tinted_pixel[31:24] == 8'hff) begin
+					else if (!additive_mode && !subtract_mode && tinted_pixel[31:24] == 8'hff) begin
 						fb_even_write_address <= destination_word;
 						fb_odd_write_address <= destination_word;
 						if (destination_odd) begin
@@ -1110,7 +1140,7 @@ module am2r_gpu
 					// write opaque lanes directly, skip transparent lanes, and save
 					// one GPU clock per pair. Partial-alpha and additive pairs retain
 					// the existing read/modify/write path below.
-					if (!additive_mode &&
+					if (!additive_mode && !subtract_mode &&
 					    (tinted_pixel[31:24] == 0 || tinted_pixel[31:24] == 8'hff) &&
 					    (tinted_pixel_1[31:24] == 0 || tinted_pixel_1[31:24] == 8'hff)) begin
 						if (destination_odd) begin

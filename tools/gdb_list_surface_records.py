@@ -1,10 +1,51 @@
 """List software surfaces and their MiSTer GPU texture-cache records."""
 
 import binascii
+import struct
 import gdb
 
 
-runner = gdb.parse_and_eval("g_runner").dereference()
+def locate_runner():
+    inferior = gdb.selected_inferior()
+    runner_type = gdb.lookup_type("Runner").pointer()
+    try:
+        direct = gdb.parse_and_eval("g_runner")
+        if 0x001D0000 <= int(direct) < 0xB0000000:
+            return direct.dereference()
+    except (gdb.error, gdb.MemoryError):
+        pass
+    scan_start = 0x001CF000
+    scan_end = 0x00220000
+    try:
+        data_words = bytes(inferior.read_memory(scan_start, scan_end - scan_start))
+    except gdb.MemoryError:
+        data_words = b""
+    for address in range(scan_start, scan_end, 4):
+        try:
+            if data_words:
+                offset = address - scan_start
+                pointer_value = struct.unpack_from("<I", data_words, offset)[0]
+            else:
+                pointer_value = struct.unpack(
+                    "<I", bytes(inferior.read_memory(address, 4))
+                )[0]
+            if pointer_value < 0x001D0000 or pointer_value >= 0xB0000000 or pointer_value & 3:
+                continue
+            candidate = gdb.Value(pointer_value).cast(runner_type).dereference()
+            data_win = candidate["dataWin"].dereference()
+            if not (100 <= int(data_win["objt"]["count"]) < 10000):
+                continue
+            if not (0 <= int(candidate["currentRoomIndex"]) < 1000):
+                continue
+            if not (0 < int(candidate["frameCount"]) < 100000000):
+                continue
+            return candidate
+        except (gdb.error, gdb.MemoryError):
+            continue
+    raise gdb.GdbError("could not locate a plausible restored AM2R Runner")
+
+
+runner = locate_runner()
 renderer = runner["renderer"].cast(gdb.lookup_type("SWRenderer").pointer()).dereference()
 inferior = gdb.selected_inferior()
 

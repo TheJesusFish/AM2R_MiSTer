@@ -2,7 +2,12 @@
 
 Run under GDB while the MiSTer runner is stopped.  Names are resolved from the
 loaded data.win so the audit does not depend on AM2R object/variable indices.
+The production MiSTer executable is stripped after linking, so locate its
+``Runner`` through validated heap/layout invariants instead of trusting the
+companion ELF's file-local ``g_runner`` address.
 """
+
+import struct
 
 import gdb
 
@@ -16,10 +21,12 @@ EXIT_NAMES = {
     "transitionx", "transitiony", "camstartx", "camstarty",
 }
 CHARACTER_NAMES = {
-    "state", "facing", "xVel", "yVel", "ballstate", "spiderball",
+    "state", "statetime", "facing", "xVel", "yVel", "ballstate", "spiderball",
     "onSpider", "inSpider", "stickyball", "control", "cancontrol",
-    "sbstate", "sbmove", "edgedl", "edgedr", "edgeul", "edgeur",
+    "canrun", "savedisplay", "SAVING", "sbstate", "sbmove", "edgedl",
+    "edgedr", "edgeul", "edgeur",
 }
+STATION_NAMES = {"enabled", "cansave", "saveenabled", "image_index"}
 
 
 def arrlen(pointer):
@@ -27,6 +34,35 @@ def arrlen(pointer):
         return 0
     header_type = gdb.lookup_type("stbds_array_header").pointer()
     return int((pointer.cast(header_type) - 1).dereference()["length"])
+
+
+def hashmap_length(pointer):
+    if not int(pointer):
+        return 0
+    header_type = gdb.lookup_type("stbds_array_header").pointer()
+    return int(((pointer - 1).cast(header_type) - 1).dereference()["length"]) - 1
+
+
+def locate_runner():
+    inferior = gdb.selected_inferior()
+    runner_type = gdb.lookup_type("Runner").pointer()
+    for address in range(0x001CF000, 0x00220000, 4):
+        try:
+            pointer_value = struct.unpack(
+                "<I", bytes(inferior.read_memory(address, 4))
+            )[0]
+            if pointer_value < 0x001D0000 or pointer_value >= 0xB0000000 or pointer_value & 3:
+                continue
+            candidate = gdb.Value(pointer_value).cast(runner_type).dereference()
+            data_win = candidate["dataWin"].dereference()
+            if not (0 <= int(candidate["currentRoomIndex"]) < 1000):
+                continue
+            if not (100 <= int(data_win["objt"]["count"]) < 10000):
+                continue
+            return pointer_value, candidate
+        except (gdb.error, gdb.MemoryError):
+            continue
+    raise gdb.GdbError("could not locate the live AM2R Runner")
 
 
 def object_name(data_win, object_index):
@@ -41,9 +77,7 @@ def make_var_names(vm):
     name_map = vm["varNameMap"]
     # stb_ds hash maps expose their default entry at [-1]; the array header is
     # therefore one element farther back than for a plain stb_ds array.
-    name_count = int(gdb.parse_and_eval(
-        "((stbds_array_header*)(g_runner->vmContext->varNameMap - 1) - 1)->length - 1"
-    ))
+    name_count = hashmap_length(name_map)
     for index in range(name_count):
         entry = name_map[index]
         if not int(entry["key"]):
@@ -83,7 +117,7 @@ def selected_vars(instance, var_names, wanted):
     return sorted(result)
 
 
-runner = gdb.parse_and_eval("g_runner").dereference()
+runner_pointer, runner = locate_runner()
 vm = runner["vmContext"].dereference()
 data_win = runner["dataWin"].dereference()
 var_names = make_var_names(vm)
@@ -107,9 +141,7 @@ for index in range(arrlen(runner["instances"])):
 id_map_entries = {}
 id_map = runner["instancesById"]
 if int(id_map):
-    id_map_count = int(gdb.parse_and_eval(
-        "((stbds_array_header*)(g_runner->instancesById - 1) - 1)->length - 1"
-    ))
+    id_map_count = hashmap_length(id_map)
     for index in range(id_map_count):
         entry = id_map[index]
         id_map_entries[int(entry["key"])] = int(entry["value"])
@@ -142,22 +174,24 @@ for index in range(arrlen(runner["instances"])):
         continue
     instance = pointer.dereference()
     name = object_name(data_win, int(instance["objectIndex"]))
-    if name not in ("oCharacter", "oGotoRoom"):
+    if name not in ("oCharacter", "oGotoRoom", "oSaveStation"):
         continue
     print(
         " ROOM_INSTANCE object=%s id=%d x=%.6f y=%.6f prev=(%.6f,%.6f) "
-        "speed=(%.6f,%.6f) sprite=%d mask=%d active=%d destroyed=%d "
+        "speed=(%.6f,%.6f) direction=%.6f sprite=%d mask=%d active=%d destroyed=%d "
         "visible=%d persistent=%d" % (
             name, int(instance["instanceId"]), float(instance["x"]),
             float(instance["y"]), float(instance["xprevious"]),
             float(instance["yprevious"]), float(instance["hspeed"]),
-            float(instance["vspeed"]), int(instance["spriteIndex"]),
+            float(instance["vspeed"]), float(instance["direction"]),
+            int(instance["spriteIndex"]),
             int(instance["maskIndex"]), 1 if bool(instance["active"]) else 0,
             1 if bool(instance["destroyed"]) else 0,
             1 if bool(instance["visible"]) else 0,
             1 if bool(instance["persistent"]) else 0,
         )
     )
-    wanted = CHARACTER_NAMES if name == "oCharacter" else EXIT_NAMES
+    wanted = (CHARACTER_NAMES if name == "oCharacter" else
+              STATION_NAMES if name == "oSaveStation" else EXIT_NAMES)
     for var_name, value in selected_vars(instance, var_names, wanted):
         print("  ROOM_VAR object=%s name=%s value=%s" % (name, var_name, value))

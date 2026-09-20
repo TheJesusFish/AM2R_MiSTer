@@ -1,0 +1,731 @@
+diff --git a/src/instance.c b/src/instance.c
+index b81b700..828a1ac 100644
+--- a/src/instance.c
++++ b/src/instance.c
+@@ -150,11 +150,10 @@ void Instance_copyFields(Instance* source, Instance* destination) {
+ 
+     // Deep-copy self variables (Instance_setSelfVar handles string duplication + array incRef)
+     {
+-    repeat(source->selfVars.capacity, i) {
+-        IntRValueEntry* entry = &source->selfVars.entries[i];
+-        if (entry->key != INT_RVALUE_HASHMAP_EMPTY_KEY) {
+-            Instance_setSelfVar(destination, entry->key, entry->value);
+-        }
++    repeat(source->selfVars.count, i) {
++        uint32_t entryIndex = source->selfVars.occupiedIndices[i];
++        IntRValueEntry* entry = &source->selfVars.entries[entryIndex];
++        Instance_setSelfVar(destination, entry->key, entry->value);
+     }
+     }
+ }
+diff --git a/src/instance.h b/src/instance.h
+index c4645f2..4de50d2 100644
+--- a/src/instance.h
++++ b/src/instance.h
+@@ -124,6 +124,25 @@ static inline void Instance_setSelfVar(Instance* inst, int32_t varID, RValue val
+     RValue independentVal = RValue_makeIndependent(val);
+     RValue_free(pointerToSlot);
+     *pointerToSlot = independentVal;
++
++    // GameMaker instance references are numeric ids starting at 100000. Keep
++    // a dense history of slots that can contain one so destroyed-instance
++    // cleanup does not scan every ordinary coordinate, timer, and flag.
++    bool possibleInstanceReference = false;
++    if (independentVal.type == RVALUE_INT32) {
++        possibleInstanceReference = independentVal.int32 >= 100000;
++#ifndef NO_RVALUE_INT64
++    } else if (independentVal.type == RVALUE_INT64) {
++        possibleInstanceReference = independentVal.int64 >= 100000 && independentVal.int64 <= INT32_MAX;
++#endif
++    } else if (independentVal.type == RVALUE_REAL &&
++               independentVal.real >= (GMLReal) 100000 &&
++               independentVal.real <= (GMLReal) INT32_MAX) {
++        int32_t integerValue = (int32_t) independentVal.real;
++        possibleInstanceReference = independentVal.real == (GMLReal) integerValue;
++    }
++    if (possibleInstanceReference)
++        IntRValueHashMap_trackInstanceReferenceSlot(&inst->selfVars, pointerToSlot);
+ }
+ 
+ // Recompute speed/direction from hspeed/vspeed (called when hspeed or vspeed is set)
+diff --git a/src/int_rvalue_hashmap.c b/src/int_rvalue_hashmap.c
+index edd4297..655568d 100644
+--- a/src/int_rvalue_hashmap.c
++++ b/src/int_rvalue_hashmap.c
+@@ -1,5 +1,6 @@
+ #include "int_rvalue_hashmap.h"
+ 
++#include <stddef.h>
+ #include <stdlib.h>
+ #include "string_compat.h"
+ 
+@@ -9,51 +10,72 @@ static void allocEmpty(IntRValueHashMap* map, uint32_t capacity) {
+     // memset 0xFF makes every key int32_t = -1 (the empty sentinel). The value bytes also become 0xFF but are unread for empty slots, so no harm.
+     map->entries = (IntRValueEntry *)safeMalloc(capacity * sizeof(IntRValueEntry));
+     memset(map->entries, 0xFF, capacity * sizeof(IntRValueEntry));
++    map->occupiedIndices = (uint32_t *)safeMalloc(capacity * sizeof(uint32_t));
++    map->instanceReferenceIndices = (uint32_t *)safeMalloc(capacity * sizeof(uint32_t));
++    map->instanceReferenceFlags = (uint8_t *)safeCalloc(capacity, sizeof(uint8_t));
+     map->capacity = capacity;
+     map->mask = capacity - 1;
+     map->count = 0;
++    map->instanceReferenceCount = 0;
+ }
+ 
+-// Reinserts an existing entry into a freshly-grown table. Skips the resize check and the count update because the caller already accounts for both.
+-static void rawInsert(IntRValueHashMap* map, int32_t key, RValue value) {
++// Reinserts an existing entry into a freshly-grown table. Skips the resize
++// check, but rebuilds the dense occupied-index list alongside the hash table.
++static void rawInsert(IntRValueHashMap* map, int32_t key, RValue value, bool tracksInstanceReference) {
+     uint32_t idx = ((uint32_t) key * 0x9E3779B9u) & map->mask;
+     while (map->entries[idx].key != INT_RVALUE_HASHMAP_EMPTY_KEY) {
+         idx = (idx + 1) & map->mask;
+     }
+     map->entries[idx].key = key;
+     map->entries[idx].value = value;
++    map->occupiedIndices[map->count++] = idx;
++    if (tracksInstanceReference) {
++        map->instanceReferenceFlags[idx] = 1;
++        map->instanceReferenceIndices[map->instanceReferenceCount++] = idx;
++    }
+ }
+ 
+ static void grow(IntRValueHashMap* map) {
+     uint32_t oldCapacity = map->capacity;
++    uint32_t oldCount = map->count;
+     IntRValueEntry* oldEntries = map->entries;
++    uint32_t* oldOccupiedIndices = map->occupiedIndices;
++    uint32_t* oldInstanceReferenceIndices = map->instanceReferenceIndices;
++    uint8_t* oldInstanceReferenceFlags = map->instanceReferenceFlags;
+     uint32_t newCapacity = oldCapacity == 0 ? INITIAL_CAPACITY : oldCapacity * 2;
+     allocEmpty(map, newCapacity);
+     if (oldEntries != nullptr) {
+-        repeat(oldCapacity, i) {
+-            int32_t k = oldEntries[i].key;
+-            if (k != INT_RVALUE_HASHMAP_EMPTY_KEY) {
+-                rawInsert(map, k, oldEntries[i].value);
+-                map->count++;
+-            }
++        repeat(oldCount, i) {
++            uint32_t oldIndex = oldOccupiedIndices[i];
++            rawInsert(map, oldEntries[oldIndex].key, oldEntries[oldIndex].value,
++                      oldInstanceReferenceFlags[oldIndex] != 0);
+         }
+         free(oldEntries);
++        free(oldOccupiedIndices);
++        free(oldInstanceReferenceIndices);
++        free(oldInstanceReferenceFlags);
+     }
+ }
+ 
+ void IntRValueHashMap_freeAllValues(IntRValueHashMap* map) {
+     if (map->entries != nullptr) {
+-        repeat(map->capacity, i) {
+-            if (map->entries[i].key != INT_RVALUE_HASHMAP_EMPTY_KEY) {
+-                RValue_free(&map->entries[i].value);
+-            }
++        repeat(map->count, i) {
++            uint32_t entryIndex = map->occupiedIndices[i];
++            RValue_free(&map->entries[entryIndex].value);
+         }
+         free(map->entries);
+         map->entries = nullptr;
++        free(map->occupiedIndices);
++        map->occupiedIndices = nullptr;
++        free(map->instanceReferenceIndices);
++        map->instanceReferenceIndices = nullptr;
++        free(map->instanceReferenceFlags);
++        map->instanceReferenceFlags = nullptr;
+     }
+     map->capacity = 0;
+     map->mask = 0;
+     map->count = 0;
++    map->instanceReferenceCount = 0;
+ }
+ 
+ RValue* IntRValueHashMap_findSlot(IntRValueHashMap* map, int32_t key) {
+@@ -67,6 +89,22 @@ RValue* IntRValueHashMap_findSlot(IntRValueHashMap* map, int32_t key) {
+     }
+ }
+ 
++void IntRValueHashMap_trackInstanceReferenceSlot(IntRValueHashMap* map, RValue* valueSlot) {
++    requireNotNull(map);
++    requireNotNull(valueSlot);
++    require(map->entries != nullptr);
++
++    IntRValueEntry* entry = (IntRValueEntry*) ((uint8_t*) valueSlot - offsetof(IntRValueEntry, value));
++    ptrdiff_t entryIndex = entry - map->entries;
++    require(entryIndex >= 0 && (uint32_t) entryIndex < map->capacity);
++    require(entry->key != INT_RVALUE_HASHMAP_EMPTY_KEY);
++
++    uint32_t index = (uint32_t) entryIndex;
++    if (map->instanceReferenceFlags[index] != 0) return;
++    map->instanceReferenceFlags[index] = 1;
++    map->instanceReferenceIndices[map->instanceReferenceCount++] = index;
++}
++
+ RValue* IntRValueHashMap_getOrInsertUndefined(IntRValueHashMap* map, int32_t key) {
+     requireMessage(key != INT_RVALUE_HASHMAP_EMPTY_KEY, "IntRValueHashMap_getOrInsertUndefined: key -1 collides with the empty-slot sentinel");
+ 
+@@ -82,7 +120,7 @@ RValue* IntRValueHashMap_getOrInsertUndefined(IntRValueHashMap* map, int32_t key
+         if (slotKey == INT_RVALUE_HASHMAP_EMPTY_KEY) {
+             map->entries[idx].key = key;
+             map->entries[idx].value = RValue_makeUndefined();
+-            map->count++;
++            map->occupiedIndices[map->count++] = idx;
+             return &map->entries[idx].value;
+         }
+         idx = (idx + 1) & map->mask;
+diff --git a/src/int_rvalue_hashmap.h b/src/int_rvalue_hashmap.h
+index 2ab8722..a1b3703 100644
+--- a/src/int_rvalue_hashmap.h
++++ b/src/int_rvalue_hashmap.h
+@@ -23,9 +23,19 @@ typedef struct {
+ // All fields are public so iterators (debug overlay, JSON dump, Instance_copyFields, Instance_free) can scan the entries array directly. capacity is always 0 or a power of two; mask is capacity - 1.
+ typedef struct {
+     IntRValueEntry* entries;
++    // Dense list of occupied entry indexes.  Most GameMaker instances have
++    // sparse, low-load self-variable tables; iterators that need every value
++    // should not have to walk all of the empty hash capacity.
++    uint32_t* occupiedIndices;
++    // Dense subset of occupied slots that have held a possible runtime
++    // instance id.  Destroy cleanup only needs to inspect these slots instead
++    // of walking every self variable on every live instance.
++    uint32_t* instanceReferenceIndices;
++    uint8_t* instanceReferenceFlags;
+     uint32_t capacity;
+     uint32_t mask;
+     uint32_t count;
++    uint32_t instanceReferenceCount;
+ } IntRValueHashMap;
+ 
+ // RValue_free's every occupied entry, then releases the entries buffer.
+@@ -39,6 +49,11 @@ RValue* IntRValueHashMap_findSlot(IntRValueHashMap* map, int32_t key);
+ // The pointer is valid until the next mutation of the map.
+ RValue* IntRValueHashMap_getOrInsertUndefined(IntRValueHashMap* map, int32_t key);
+ 
++// Records that valueSlot has held a possible runtime instance id. The slot
++// must belong to map and remain valid until the next map mutation. Recording
++// is idempotent and survives table growth.
++void IntRValueHashMap_trackInstanceReferenceSlot(IntRValueHashMap* map, RValue* valueSlot);
++
+ // Returns the number of occupied slots.
+ static inline uint32_t IntRValueHashMap_count(const IntRValueHashMap* map) {
+     return map->count;
+diff --git a/src/runner.c b/src/runner.c
+index 27ad406..e48a9ae 100644
+--- a/src/runner.c
++++ b/src/runner.c
+@@ -807,6 +807,131 @@ static int compareDrawables(const void* a, const void* b) {
+     return compareDrawKeys(&drawKeyA, &drawKeyB);
+ }
+ 
++static void rebuildDrawableCacheIfDirty(Runner* runner);
++
++// Keep the valid drawable cache synchronized with ordinary instance churn.
++// Projectiles and destructible room objects are created and destroyed during
++// Step events; rebuilding and qsorting the whole room on every such change
++// costs several milliseconds on the MiSTer HPS.  Inserting into the already
++// sorted cache preserves the exact DrawKey order. cursorDirty is raised so a
++// creation that occurs from inside a Draw event still makes Runner_draw
++// re-evaluate its cursor exactly as the former structure-dirty rebuild did,
++// without turning the insertion into another full depth refresh and qsort.
++static void cacheNewInstanceDrawable(Runner* runner, Instance* inst) {
++    if (runner->drawableListStructureDirty) return;
++
++    Drawable added;
++    ZERO_STRUCT(added);
++    added.type = DRAWABLE_INSTANCE;
++    added.depth = inst->depth;
++    added.instance = inst;
++
++    // A genuine depth change has already made the ordering uncertain. Append
++    // now and let the next draw-boundary refresh sort the entire batch once.
++    // In particular, do not rebuild here: one shot can create many temporary
++    // objects while collision events are still being dispatched.
++    if (runner->drawableListSortDirty) {
++        arrput(runner->cachedDrawables, added);
++        return;
++    }
++
++    DrawKey addedKey = drawableKey(&added);
++
++    int32_t count = (int32_t) arrlen(runner->cachedDrawables);
++    int32_t low = 0;
++    int32_t high = count;
++    while (low < high) {
++        int32_t middle = low + (high - low) / 2;
++        DrawKey middleKey = drawableKey(&runner->cachedDrawables[middle]);
++        if (compareDrawKeys(&middleKey, &addedKey) <= 0)
++            low = middle + 1;
++        else
++            high = middle;
++    }
++
++    arrput(runner->cachedDrawables, added);
++    if (low < count) {
++        memmove(&runner->cachedDrawables[low + 1],
++                &runner->cachedDrawables[low],
++                (size_t)(count - low) * sizeof(Drawable));
++        runner->cachedDrawables[low] = added;
++    }
++    runner->drawableListCursorDirty = true;
++}
++
++void Runner_instanceDrawableDepthChanged(Runner* runner, Instance* inst) {
++    if (runner == nullptr || inst == nullptr ||
++        runner->drawableListStructureDirty || runner->drawableListSortDirty)
++        return;
++
++    int32_t count = (int32_t) arrlen(runner->cachedDrawables);
++    int32_t oldIndex = -1;
++    repeat(count, i) {
++        Drawable* drawable = &runner->cachedDrawables[i];
++        if (drawable->type == DRAWABLE_INSTANCE && drawable->instance == inst) {
++            oldIndex = (int32_t) i;
++            break;
++        }
++    }
++
++    // Struct instances are represented by Instance too, but never participate
++    // in room drawing and therefore have no cache entry.
++    if (oldIndex < 0 || runner->cachedDrawables[oldIndex].depth == inst->depth)
++        return;
++
++    Drawable moved = runner->cachedDrawables[oldIndex];
++    moved.depth = inst->depth;
++    if (oldIndex + 1 < count) {
++        memmove(&runner->cachedDrawables[oldIndex],
++                &runner->cachedDrawables[oldIndex + 1],
++                (size_t)(count - oldIndex - 1) * sizeof(Drawable));
++    }
++    arrsetlen(runner->cachedDrawables, count - 1);
++
++    DrawKey movedKey = drawableKey(&moved);
++    int32_t low = 0;
++    int32_t high = count - 1;
++    while (low < high) {
++        int32_t middle = low + (high - low) / 2;
++        DrawKey middleKey = drawableKey(&runner->cachedDrawables[middle]);
++        if (compareDrawKeys(&middleKey, &movedKey) <= 0)
++            low = middle + 1;
++        else
++            high = middle;
++    }
++
++    arrput(runner->cachedDrawables, moved);
++    if (low < count - 1) {
++        memmove(&runner->cachedDrawables[low + 1],
++                &runner->cachedDrawables[low],
++                (size_t)(count - 1 - low) * sizeof(Drawable));
++        runner->cachedDrawables[low] = moved;
++    }
++    runner->drawableListCursorDirty = true;
++}
++
++// Remove all destroyed instance pointers in one stable pass before their
++// Instance storage is freed. The surviving cache remains in exact DrawKey
++// order, so no rebuild or qsort is necessary.
++static void cacheRemoveDestroyedInstanceDrawables(Runner* runner) {
++    if (runner->drawableListStructureDirty) return;
++    int32_t count = (int32_t) arrlen(runner->cachedDrawables);
++    int32_t write = 0;
++    for (int32_t read = 0; read < count; ++read) {
++        Drawable* drawable = &runner->cachedDrawables[read];
++        if (drawable->type == DRAWABLE_INSTANCE &&
++            drawable->instance != nullptr &&
++            drawable->instance->destroyed)
++            continue;
++        if (write != read)
++            runner->cachedDrawables[write] = *drawable;
++        ++write;
++    }
++    arrsetlen(runner->cachedDrawables, write);
++    if (write != count)
++        runner->drawableListCursorDirty = true;
++}
++
+ static void fireDrawSubtype(Runner* runner, Drawable* drawables, int32_t drawableCount, int32_t subtype) {
+     int32_t slot = EventSlotMap_lookup(&runner->eventSlotMap, EVENT_DRAW, subtype);
+     if (slot == -1) return;
+@@ -921,6 +1046,7 @@ static void rebuildDrawableCacheIfDirty(Runner* runner) {
+         if (room == nullptr) {
+             runner->drawableListStructureDirty = false;
+             runner->drawableListSortDirty = false;
++            runner->drawableListCursorDirty = false;
+             return;
+         }
+ 
+@@ -979,6 +1105,7 @@ static void rebuildDrawableCacheIfDirty(Runner* runner) {
+         }
+         runner->drawableListStructureDirty = false;
+         runner->drawableListSortDirty = false;
++        runner->drawableListCursorDirty = false;
+         return;
+     }
+ 
+@@ -989,6 +1116,7 @@ static void rebuildDrawableCacheIfDirty(Runner* runner) {
+             qsort(runner->cachedDrawables, count, sizeof(Drawable), compareDrawables);
+         }
+         runner->drawableListSortDirty = false;
++        runner->drawableListCursorDirty = false;
+     }
+ }
+ 
+@@ -1009,8 +1137,9 @@ void Runner_draw(Runner* runner) {
+     DrawKey lastProcessedDrawKey;
+ 
+     while (true) {
+-        if (runner->drawableListSortDirty || runner->drawableListStructureDirty) {
++        if (runner->drawableListSortDirty || runner->drawableListStructureDirty || runner->drawableListCursorDirty) {
+             rebuildDrawableCacheIfDirty(runner);
++            runner->drawableListCursorDirty = false;
+ 
+             if (i != 0) {
+                 // Something created things during draw events! Figure out the new cursor position...
+@@ -1501,7 +1630,7 @@ static Instance* createAndInitInstance(Runner* runner, int32_t instanceId, int32
+     hmput(runner->instancesById, instanceId, inst);
+     arrput(runner->instances, inst);
+     Runner_addInstanceToObjectLists(runner, inst);
+-    runner->drawableListStructureDirty = true;
++    cacheNewInstanceDrawable(runner, inst);
+ 
+ #ifdef ENABLE_VM_TRACING
+     if (shgeti(runner->vmContext->instanceLifecyclesToBeTraced, "*") != -1 || shgeti(runner->vmContext->instanceLifecyclesToBeTraced, objDef->name) != -1) {
+@@ -2289,6 +2418,7 @@ void Runner_reset(Runner* runner) {
+     arrsetlen(runner->cachedDrawables, 0);
+     runner->drawableListStructureDirty = true;
+     runner->drawableListSortDirty = false;
++    runner->drawableListCursorDirty = false;
+ }
+ 
+ static int compareTargetObjectIndexAscending(const void *a, const void *b) {
+@@ -2624,6 +2754,7 @@ Instance* Runner_createInstanceWithDepth(Runner* runner, GMLReal x, GMLReal y, i
+     if (isObjectDisabled(runner, objectIndex)) return nullptr;
+     Instance* inst = createAndInitInstance(runner, runner->nextInstanceId++, objectIndex, x, y);
+     inst->depth = depth;
++    Runner_instanceDrawableDepthChanged(runner, inst);
+     Runner_executeEvent(runner, inst, EVENT_PRECREATE, 0);
+     return inst;
+ }
+@@ -2638,6 +2769,7 @@ Instance* Runner_createInstanceWithLayer(Runner* runner, GMLReal x, GMLReal y, i
+     Instance* inst = createAndInitInstance(runner, runner->nextInstanceId++, objectIndex, x, y);
+     inst->layer = layerId;
+     inst->depth = rl->depth;
++    Runner_instanceDrawableDepthChanged(runner, inst);
+     Runner_addInstanceLayerElement(runner, layerId, inst->instanceId);
+     dispatchInstanceCreationEvents(runner, inst);
+     return inst;
+@@ -2649,6 +2781,7 @@ Instance* Runner_copyInstance(Runner* runner, Instance* source, bool performEven
+ 
+     Instance* inst = createAndInitInstance(runner, runner->nextInstanceId++, source->objectIndex, source->x, source->y);
+     Instance_copyFields(source, inst);
++    Runner_instanceDrawableDepthChanged(runner, inst);
+     inst->createEventFired = true;
+     if (performEvent) {
+         Runner_executeEvent(runner, inst, EVENT_PRECREATE, 0);
+@@ -2664,39 +2797,93 @@ void Runner_setGameArgs(Runner* runner, char** argv, int32_t argc) {
+     {repeat(argc, i) arrput(runner->gameArgs, safeStrdup(argv[i]));}
+ }
+ 
+-static void Runner_clearStaleInstanceReferencesToInstance(Runner* runner, Instance* destroyedInst) {
+-    if (runner == nullptr || destroyedInst == nullptr) return;
++static int compareInstanceIds(const void* first, const void* second) {
++    int32_t a = *(const int32_t*) first;
++    int32_t b = *(const int32_t*) second;
++    return (a > b) - (a < b);
++}
+ 
+-    // A destroyed instance can still be referenced by another instance's per-instance state
+-    // as an integer id (e.g. linked-list pointers, owner ids, chain heads, etc.). Rewrite any
+-    // stale id equal to the dying instance back to -4.
++static bool containsSortedInstanceId(const int32_t* ids, int32_t count, int32_t value) {
++    int32_t low = 0;
++    int32_t high = count;
++    while (low < high) {
++        int32_t middle = low + (high - low) / 2;
++        if (ids[middle] < value)
++            low = middle + 1;
++        else
++            high = middle;
++    }
++    return low < count && ids[low] == value;
++}
+ 
+-    // This is probably not very optimal as it loops through every single instance and every single
+-    // selfVar slot, but it doesn't happen too often so maybe it should be okay?
+-    // Another option would be to keep a reverse lookup table of instance ids to instances that reference them,
+-    // but that would be more memory and complexity overhead.
++static void Runner_clearStaleInstanceReferencesToDestroyedInstances(Runner* runner) {
++    if (runner == nullptr) return;
+ 
+-    int32_t destroyedInstanceId = destroyedInst->instanceId;
++    // Collect the complete destruction batch before scanning instance state.
++    // Sand and particle effects can destroy dozens of objects in one step; the
++    // upstream per-destroy scan repeated the same O(instances * selfVars) walk
++    // for every object and caused visible missed frames on the MiSTer ARM.
++    int32_t* destroyedIds = nullptr;
+     int32_t count = (int32_t) arrlen(runner->instances);
++    for (int32_t i = 0; i < count; i++) {
++        Instance* inst = runner->instances[i];
++        if (inst != nullptr && inst->destroyed)
++            arrput(destroyedIds, inst->instanceId);
++    }
++    int32_t destroyedCount = (int32_t) arrlen(destroyedIds);
++    if (destroyedCount == 0) {
++        arrfree(destroyedIds);
++        return;
++    }
++    qsort(destroyedIds, (size_t) destroyedCount, sizeof(*destroyedIds), compareInstanceIds);
++    int32_t lowestDestroyedId = destroyedIds[0];
++    int32_t highestDestroyedId = destroyedIds[destroyedCount - 1];
++
++    // A destroyed instance can still be referenced by another instance's
++    // per-instance state as an integer id. Rewrite every reference in one pass
++    // before any instance in the batch is reclaimed. A binary lookup keeps the
++    // pass cheap even for large destructible-tile batches.
+     for (int32_t i = 0; i < count; i++) {
+         Instance* inst = runner->instances[i];
+         if (inst == nullptr || !inst->active || inst->destroyed || inst->objectIndex < 0) continue;
+-        repeat(inst->selfVars.capacity, slotIndex) {
++        repeat(inst->selfVars.instanceReferenceCount, referenceIndex) {
++            uint32_t slotIndex = inst->selfVars.instanceReferenceIndices[referenceIndex];
+             IntRValueEntry* entry = &inst->selfVars.entries[slotIndex];
+-            if (entry->key == INT_RVALUE_HASHMAP_EMPTY_KEY) continue;
+ 
+             uint8_t vtype = entry->value.type;
+-            if (
+-                (vtype == RVALUE_INT32 && entry->value.int32 == destroyedInstanceId) ||
++            int32_t referencedId;
++            bool isNumericReference = false;
++            if (vtype == RVALUE_INT32) {
++                referencedId = entry->value.int32;
++                isNumericReference = true;
+ #ifndef NO_RVALUE_INT64
+-                (vtype == RVALUE_INT64 && entry->value.int64 == destroyedInstanceId) ||
++            } else if (vtype == RVALUE_INT64 &&
++                       entry->value.int64 >= INT32_MIN &&
++                       entry->value.int64 <= INT32_MAX) {
++                referencedId = (int32_t) entry->value.int64;
++                isNumericReference = true;
+ #endif
+-                (vtype == RVALUE_REAL && entry->value.real == (GMLReal) destroyedInstanceId)
+-            ) {
++            } else if (vtype == RVALUE_REAL &&
++                       entry->value.real >= (GMLReal) INT32_MIN &&
++                       entry->value.real <= (GMLReal) INT32_MAX) {
++                referencedId = (int32_t) entry->value.real;
++                isNumericReference = entry->value.real == (GMLReal) referencedId;
++            }
++            // Nearly every AM2R self-variable is numeric, but ordinary values
++            // (coordinates, timers, flags, object indexes) are far outside the
++            // runtime instance-id interval.  Reject those with two comparisons
++            // before doing a binary lookup.  A single destroyed instance, the
++            // common projectile/sand case, then reduces to one exact compare.
++            if (isNumericReference &&
++                referencedId >= lowestDestroyedId &&
++                referencedId <= highestDestroyedId &&
++                (destroyedCount == 1 ||
++                 containsSortedInstanceId(destroyedIds, destroyedCount, referencedId))) {
+                 entry->value = RValue_makeInt32(INSTANCE_NOONE);
+             }
+         }
+     }
++    arrfree(destroyedIds);
+ }
+ 
+ void Runner_destroyInstance(MAYBE_UNUSED Runner* runner, Instance* inst, bool runDestroyEvent) {
+@@ -2711,10 +2898,6 @@ void Runner_destroyInstance(MAYBE_UNUSED Runner* runner, Instance* inst, bool ru
+     // If a destroyed instance is active, then well, something went VERY wrong
+     inst->active = false;
+ 
+-    // Any selfVars that still hold the destroyed instance's id must be invalidated back to
+-    // noone (-4) before the instance is fully reclaimed.
+-    Runner_clearStaleInstanceReferencesToInstance(runner, inst);
+-
+ #ifdef ENABLE_VM_TRACING
+     GameObject* gameObject = &runner->dataWin->objt.objects[inst->objectIndex];
+     if (shgeti(runner->vmContext->instanceLifecyclesToBeTraced, "*") != -1 || shgeti(runner->vmContext->instanceLifecyclesToBeTraced, gameObject->name) != -1) {
+@@ -2828,6 +3011,8 @@ static void Runner_sweepDeadStructs(Runner* runner) {
+ }
+ 
+ void Runner_cleanupDestroyedInstances(Runner* runner) {
++    Runner_clearStaleInstanceReferencesToDestroyedInstances(runner);
++    cacheRemoveDestroyedInstanceDrawables(runner);
+     int32_t count = (int32_t) arrlen(runner->instances);
+     int32_t writeIdx = 0;
+     repeat(count, i) {
+@@ -2840,8 +3025,6 @@ void Runner_cleanupDestroyedInstances(Runner* runner) {
+             Runner_removeInstanceLayerElement(runner, inst->instanceId);
+             hmdel(runner->instancesById, inst->instanceId);
+             Instance_free(inst);
+-            // Cached drawables hold raw Instance* that we just freed; force a rebuild before the next draw.
+-            runner->drawableListStructureDirty = true;
+         }
+     }
+     arrsetlen(runner->instances, writeIdx);
+@@ -3411,12 +3594,56 @@ static void dispatchCollisionEvents(Runner* runner) {
+                 if (0 > evt->codeId)
+                     continue;
+ 
+-                // Iterate only the descendant-inclusive list for the target object via a snapshot, so nested user code (collision handlers calling instance_exists, with (...), etc.) can push/pop their own snapshots above ours without corrupting this iteration.
+-                int32_t snapBase = Runner_pushInstancesOfObject(runner, targetObjIndex);
++                // The target bucket can contain hundreds of room solids.  The
++                // native collision manager broad-phases that list; scanning and
++                // sorting the complete descendant bucket for every projectile
++                // made AM2R's beams consume about 0.9-1.7 ms per frame on the
++                // Cortex-A9.  Snapshot only candidates whose spatial cells
++                // overlap self's current bbox.  We still sort the snapshot by
++                // object index then instance id below, preserving the exact
++                // observable dispatch order, and keep it on the normal snapshot
++                // arena so nested GML collision queries cannot corrupt it.
++                if (selfDirty) {
++                    bboxSelf = Collision_computeBBox(runner, self);
++                    sprSelf = Collision_getSprite(dataWin, self);
++                    selfDirty = false;
++                }
++                if (!bboxSelf.valid) continue;
++
++                SpatialGrid_syncGrid(runner, runner->spatialGrid);
++                SpatialGridQuery query = SpatialGrid_prepareQuery(
++                    runner, bboxSelf.left, bboxSelf.top,
++                    bboxSelf.right, bboxSelf.bottom, targetObjIndex);
++                int32_t snapBase = (int32_t) arrlen(runner->instanceSnapshots);
++                for (int32_t gx = query.range.minGridX;
++                     gx <= query.range.maxGridX; ++gx) {
++                    for (int32_t gy = query.range.minGridY;
++                         gy <= query.range.maxGridY; ++gy) {
++                        Instance** cell = runner->spatialGrid->grid[
++                            SpatialGrid_cellIndex(runner->spatialGrid, gx, gy)];
++                        repeat(arrlen(cell), ci) {
++                            Instance* candidate = cell[ci];
++                            if (candidate->lastCollisionQueryId == query.queryId)
++                                continue;
++                            candidate->lastCollisionQueryId = query.queryId;
++                            if (!candidate->active || candidate->destroyed)
++                                continue;
++                            if (!VM_isObjectOrDescendant(
++                                    dataWin, candidate->objectIndex,
++                                    targetObjIndex))
++                                continue;
++                            arrput(runner->instanceSnapshots, candidate);
++                        }
++                    }
++                }
+                 int32_t snapEnd = (int32_t) arrlen(runner->instanceSnapshots);
+ 
+                 // The YoYo Runner sorts it by the object index THEN by the instanceId
+-                qsort(runner->instanceSnapshots + snapBase, snapEnd - snapBase, sizeof(Instance*), sortInstancesByObjectIndexThenInstanceIdAscending);
++                if (snapEnd - snapBase > 1) {
++                    qsort(runner->instanceSnapshots + snapBase,
++                          (size_t)(snapEnd - snapBase), sizeof(Instance*),
++                          sortInstancesByObjectIndexThenInstanceIdAscending);
++                }
+ 
+                 for (int32_t snapIdx = snapBase; snapEnd > snapIdx; snapIdx++) {
+                     Instance* other = runner->instanceSnapshots[snapIdx];
+diff --git a/src/runner.h b/src/runner.h
+index ca22c53..29746d8 100644
+--- a/src/runner.h
++++ b/src/runner.h
+@@ -677,6 +677,10 @@ struct Runner {
+     Drawable* cachedDrawables; // stb_ds array
+     bool drawableListStructureDirty;
+     bool drawableListSortDirty;
++    // The cache is already sorted, but an incremental insert/remove changed
++    // its indices while Runner_draw may be walking it. This only invalidates
++    // the draw cursor; it must not trigger a depth refresh or qsort.
++    bool drawableListCursorDirty;
+     // Struct instances created by @@NewGMLObject@@. Reuses Instance with objectIndex=STRUCT_OBJECT_INDEX.
+     // Tracked separately so event/step/draw iteration over runner->instances stays clean.
+     Instance** structInstances;
+@@ -835,6 +839,9 @@ Instance* Runner_createInstance(Runner* runner, GMLReal x, GMLReal y, int32_t ob
+ Instance* Runner_createInstanceWithDepth(Runner* runner, GMLReal x, GMLReal y, int32_t objectIndex, int32_t depth);
+ Instance* Runner_createInstanceWithLayer(Runner* runner, GMLReal x, GMLReal y, int32_t objectIndex, int32_t layerId);
+ Instance* Runner_copyInstance(Runner* runner, Instance* source, bool performEvent);
++// Keep an existing instance's cached DrawKey synchronized after its depth is
++// changed. The cache entry is repositioned incrementally when possible.
++void Runner_instanceDrawableDepthChanged(Runner* runner, Instance* instance);
+ void Runner_destroyInstance(Runner* runner, Instance* inst, bool runDestroyEvent);
+ void Runner_cleanupDestroyedInstances(Runner* runner);
+ // Add inst to the per-object lists of its object and every ancestor.
+diff --git a/src/vm_builtins.c b/src/vm_builtins.c
+index 1802976..201bce7 100644
+--- a/src/vm_builtins.c
++++ b/src/vm_builtins.c
+@@ -1410,7 +1410,7 @@ void VMBuiltins_setVariable(VMContext* ctx, Instance* inst, int16_t builtinVarId
+             int32_t newDepth = RValue_toInt32(val);
+             if (newDepth != inst->depth) {
+                 inst->depth = newDepth;
+-                ctx->runner->drawableListSortDirty = true;
++                Runner_instanceDrawableDepthChanged(ctx->runner, inst);
+             }
+             return;
+         }
+@@ -1426,7 +1426,7 @@ void VMBuiltins_setVariable(VMContext* ctx, Instance* inst, int16_t builtinVarId
+                 inst->layer = layerId;
+                 if (inst->depth != rl->depth) {
+                     inst->depth = rl->depth;
+-                    runner->drawableListSortDirty = true;
++                    Runner_instanceDrawableDepthChanged(runner, inst);
+                 }
+             }
+             return;
+@@ -8549,7 +8549,7 @@ static RValue builtin_instance_change(VMContext* ctx, RValue* args, int32_t argC
+     inst->maskIndex = newObjDef->textureMaskId;
+     inst->imageIndex = 0.0;
+     // The instance pointer is unchanged so this is just a depth shift, not a structural change.
+-    runner->drawableListSortDirty = true;
++    Runner_instanceDrawableDepthChanged(runner, inst);
+ 
+     // Fire create event on new object if requested
+     if (performEvents) {
+@@ -13151,17 +13151,34 @@ static RValue builtin_instance_position(VMContext* ctx, RValue* args, int32_t ar
+     GMLReal px = RValue_toReal(args[0]);
+     GMLReal py = RValue_toReal(args[1]);
+     int32_t targetObjIndex = VM_resolveInstanceTarget(ctx, RValue_toInt32(args[2]));
++    if (targetObjIndex == INSTANCE_NOONE)
++        return RValue_makeReal((GMLReal) INSTANCE_NOONE);
+ 
+     if (runner->collisionCompatibilityMode) {
+         px = compatRoundCoord(px); py = compatRoundCoord(py);
+     }
+ 
++    uint32_t candidateQueryId = markCollisionCandidatesInBounds(
++        runner, px, py, px, py, targetObjIndex);
++
+     int32_t resultId = INSTANCE_NOONE;
+-    int32_t snapBase = Runner_pushInstancesForTarget(runner, targetObjIndex);
+-    int32_t snapEnd  = (int32_t) arrlen(runner->instanceSnapshots);
+-    for (int32_t i = snapBase; snapEnd > i; i++) {
+-        Instance* inst = runner->instanceSnapshots[i];
++    bool orderedCandidates = targetObjIndex >= 0 &&
++        (uint32_t)targetObjIndex < runner->dataWin->objt.count;
++    int32_t snapBase = -1;
++    Instance** candidates = runner->collisionCandidates;
++    int32_t candidateStart = 0;
++    int32_t candidateEnd = (int32_t)arrlen(candidates);
++    if (!orderedCandidates) {
++        snapBase = Runner_pushInstancesForTarget(runner, targetObjIndex);
++        candidates = runner->instanceSnapshots;
++        candidateStart = snapBase;
++        candidateEnd = (int32_t)arrlen(candidates);
++    }
++    for (int32_t candidateIndex = candidateStart;
++         candidateIndex < candidateEnd; ++candidateIndex) {
++        Instance* inst = candidates[candidateIndex];
+         if (!inst->active) continue;
++        if (inst->lastCollisionQueryId != candidateQueryId) continue;
+ 
+         if (!Collision_pointInsideInstanceBox(ctx->runner, inst, px, py)) continue;
+ 
+@@ -13172,7 +13189,8 @@ static RValue builtin_instance_position(VMContext* ctx, RValue* args, int32_t ar
+         resultId = inst->instanceId;
+         break;
+     }
+-    Runner_popInstanceSnapshot(runner, snapBase);
++    if (snapBase >= 0)
++        Runner_popInstanceSnapshot(runner, snapBase);
+ 
+     return RValue_makeReal((GMLReal) resultId);
+ }

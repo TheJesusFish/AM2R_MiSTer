@@ -7,9 +7,18 @@
   only by the testbench and is not part of the production RBF.
 - `renderer/am2r_axis_coverage_test.c` locks the pixel-center edge rule that
   prevents fractional sprite quads from sampling one extra atlas row.
+- `renderer/test_subtractive_blend.py` exhaustively proves the NEON helper's
+  divide-by-255 identity and compares 250,000 deterministic modulated channels
+  with the scalar subtractive-lighting formula.
 - `renderer/audit_sw_renderer.py` verifies that all 70 renderer vtable hooks are
-  assigned/accounted for and that unsupported FPGA states have explicit
-  coherency/fallback telemetry.
+  assigned/accounted for, subtractive/additive layers cannot trigger opaque
+  prefix removal, water samples the current application-surface export rather
+  than the prior native frame, the exact subtractive-lighting span has its
+  scalar and ARM NEON paths, zero-area hit effects remain no-ops, and
+  unsupported FPGA states have explicit coherency/fallback telemetry.
+- `runtime/audit_am2r_native_lighting.py` locks the exact AM2R 1.1 lighting
+  Step identities, redundant-Normal-Step removal, fade-out behavior, and the
+  real-hardware decision to keep the authored Other-11 producer bytecode.
 - `runtime/overlay_file_system_atomic_test.c` verifies that text/INI updates
   publish through an atomic sibling rename and that a failed temporary write
   leaves the previous destination intact.
@@ -22,6 +31,17 @@
   OOM event, and preservation of the ordinary AM2R save. The original slot is
   restored in a `finally` block. Start AM2R and load an existing game before
   running it; slot 4 is used by default.
+
+The Gamma-room hardware regression uses the user-supplied checkpoint, USB-1,
+and the UGREEN capture path. With lighting and the boss active, sample native
+game-frame progression, exercise movement and successful missile hits, and
+inspect a lossless 60 Hz capture for corruption. QA-only health and missile
+writes are applied to the live process after launch and are never compiled or
+saved. The final exact-source run advanced 1,190 game frames in 20 seconds with
+no skipped game counters, while its 1,561-frame UGREEN capture showed the
+expected dark-room motion and lighting without a wide corruption frame. The
+broader native Other-11 experiment remains disabled because its hardware A/B
+had worse tail latency than the authored bytecode path.
 
 The remaining coverage boundary is representative later-game content and
 physical controller/CRT acceptance. User game data and captures remain ignored.

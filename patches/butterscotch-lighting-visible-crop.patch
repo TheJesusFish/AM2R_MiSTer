@@ -1,0 +1,254 @@
+diff --git a/src/backends/mister.c b/src/backends/mister.c
+index 33627d1..8685792 100644
+--- a/src/backends/mister.c
++++ b/src/backends/mister.c
+@@ -825,6 +825,190 @@ uint32_t MisterGpu_uploadSparseDynamicTextureRevision(const void* rgbaPixels,
+     return uploadSparseDynamicTexture(rgbaPixels, bytes, rowBytes, sourceRevision);
+ }
+ 
++static void copyCroppedTextureRows(void* destination, const void* source,
++                                   size_t sourceRowBytes, size_t cropRowBytes,
++                                   size_t rowCount) {
++    uint8_t* destinationPixels = (uint8_t*)destination;
++    const uint8_t* sourcePixels = (const uint8_t*)source;
++    for (size_t row = 0; row < rowCount; ++row)
++        memcpy(destinationPixels + row * cropRowBytes,
++               sourcePixels + row * sourceRowBytes, cropRowBytes);
++}
++
++static MisterGpuTexture* reuseReleasedCroppedTexture(
++        const void* rgbaPixels, size_t bytes, size_t sourceRowBytes,
++        size_t cropRowBytes, size_t rowCount, uint32_t sourceRevision) {
++    MisterGpuTexture* best = NULL;
++    for (uint32_t i = 0; i < g_gpu_texture_record_count; ++i) {
++        MisterGpuTexture* record = &g_gpu_texture_records[i];
++        if (!record->released || record->bytes != bytes ||
++            record->physical[1] == 0 ||
++            record->released_frame == g_gpu_frame_serial)
++            continue;
++        if (best == NULL || (best->shadow_alt == NULL && record->shadow_alt != NULL))
++            best = record;
++    }
++    if (best == NULL || !waitGpuCompletion(NULL)) return NULL;
++    if (best->shadow_alt == NULL) {
++        best->shadow_alt = malloc(bytes);
++        if (best->shadow_alt == NULL) return NULL;
++    }
++
++    best->source = rgbaPixels;
++    best->active = 0;
++    best->dynamic = true;
++    best->source_revision = sourceRevision;
++    best->source_revision_valid = true;
++    best->shadow_valid = true;
++    best->sparse = true;
++    best->released = false;
++    best->released_frame = 0;
++    best->last_upload_frame = g_gpu_frame_serial;
++    best->generation = nextTextureGeneration();
++    best->opaque_generation = 0;
++    copyCroppedTextureRows(best->shadow, rgbaPixels, sourceRowBytes,
++                           cropRowBytes, rowCount);
++    copyCroppedTextureRows(best->shadow_alt, rgbaPixels, sourceRowBytes,
++                           cropRowBytes, rowCount);
++    copyCroppedTextureRows(
++        g_gpu_textures + (best->physical[0] - GPU_TEXTURE_PHYS), rgbaPixels,
++        sourceRowBytes, cropRowBytes, rowCount);
++    copyCroppedTextureRows(
++        g_gpu_textures + (best->physical[1] - GPU_TEXTURE_PHYS), rgbaPixels,
++        sourceRowBytes, cropRowBytes, rowCount);
++    __sync_synchronize();
++    return best;
++}
++
++uint32_t MisterGpu_uploadSparseDynamicTextureCropRevision(const void* rgbaPixels,
++                                                          size_t sourceRowBytes,
++                                                          size_t cropRowBytes,
++                                                          size_t rowCount,
++                                                          uint32_t sourceRevision) {
++    if (!g_gpu_available || rgbaPixels == NULL || sourceRowBytes == 0 ||
++        cropRowBytes == 0 || cropRowBytes > sourceRowBytes || rowCount == 0 ||
++        cropRowBytes > SIZE_MAX / rowCount)
++        return 0;
++
++    const size_t bytes = cropRowBytes * rowCount;
++    const uint8_t* sourcePixels = (const uint8_t*)rgbaPixels;
++    for (uint32_t i = 0; i < g_gpu_texture_record_count; ++i) {
++        MisterGpuTexture* record = &g_gpu_texture_records[i];
++        if (record->released || record->source != rgbaPixels ||
++            record->bytes != bytes || !record->sparse)
++            continue;
++        if (record->source_revision_valid &&
++            record->source_revision == sourceRevision)
++            return record->physical[record->active];
++
++        bool unchanged = true;
++        for (size_t row = 0; row < rowCount; ++row) {
++            if (!gpuBuffersEqual((const uint8_t*)record->shadow + row * cropRowBytes,
++                                 sourcePixels + row * sourceRowBytes,
++                                 cropRowBytes)) {
++                unchanged = false;
++                break;
++            }
++        }
++        if (unchanged) {
++            record->source_revision = sourceRevision;
++            record->source_revision_valid = true;
++            return record->physical[record->active];
++        }
++
++        const bool switchBuffer = record->last_upload_frame != g_gpu_frame_serial;
++        const uint8_t target = switchBuffer ? (record->active ^ 1u) : record->active;
++        uint8_t* targetShadow = switchBuffer ?
++            (uint8_t*)record->shadow_alt : (uint8_t*)record->shadow;
++        uint8_t* targetPixels = g_gpu_textures +
++            (record->physical[target] - GPU_TEXTURE_PHYS);
++        bool wrotePixels = false;
++        for (size_t row = 0; row < rowCount; ++row) {
++            const uint8_t* sourceRow = sourcePixels + row * sourceRowBytes;
++            uint8_t* shadowRow = targetShadow + row * cropRowBytes;
++            if (gpuBuffersEqual(shadowRow, sourceRow, cropRowBytes)) continue;
++
++            size_t first = 0;
++            while (first < cropRowBytes && shadowRow[first] == sourceRow[first]) first++;
++            size_t last = cropRowBytes;
++            while (last > first && shadowRow[last - 1] == sourceRow[last - 1]) last--;
++            first &= ~(size_t)3u;
++            last = (last + 3u) & ~(size_t)3u;
++            if (last > cropRowBytes) last = cropRowBytes;
++            memcpy(shadowRow + first, sourceRow + first, last - first);
++            memcpy(targetPixels + row * cropRowBytes + first,
++                   sourceRow + first, last - first);
++            wrotePixels = true;
++        }
++        if (wrotePixels) __sync_synchronize();
++        if (switchBuffer) {
++            void* previousShadow = record->shadow;
++            record->shadow = record->shadow_alt;
++            record->shadow_alt = previousShadow;
++            record->active = target;
++        }
++        record->last_upload_frame = g_gpu_frame_serial;
++        record->generation = nextTextureGeneration();
++        record->source_revision = sourceRevision;
++        record->source_revision_valid = true;
++        record->shadow_valid = true;
++        return record->physical[record->active];
++    }
++
++    MisterGpuTexture* reused = reuseReleasedCroppedTexture(
++        rgbaPixels, bytes, sourceRowBytes, cropRowBytes, rowCount, sourceRevision);
++    if (reused != NULL) return reused->physical[reused->active];
++    if (g_gpu_texture_record_count >= GPU_TEXTURE_RECORDS) {
++        warnTextureTableExhausted();
++        return 0;
++    }
++
++    void* shadow0 = malloc(bytes);
++    void* shadow1 = malloc(bytes);
++    if (shadow0 == NULL || shadow1 == NULL) {
++        free(shadow0);
++        free(shadow1);
++        return 0;
++    }
++    const uint32_t physical0 = reserveGpuTexture(bytes);
++    const uint32_t physical1 = reserveGpuTexture(bytes);
++    if (physical0 == 0 || physical1 == 0) {
++        free(shadow0);
++        free(shadow1);
++        return 0;
++    }
++    copyCroppedTextureRows(shadow0, rgbaPixels, sourceRowBytes,
++                           cropRowBytes, rowCount);
++    copyCroppedTextureRows(shadow1, rgbaPixels, sourceRowBytes,
++                           cropRowBytes, rowCount);
++    copyCroppedTextureRows(g_gpu_textures + (physical0 - GPU_TEXTURE_PHYS),
++                           rgbaPixels, sourceRowBytes, cropRowBytes, rowCount);
++    copyCroppedTextureRows(g_gpu_textures + (physical1 - GPU_TEXTURE_PHYS),
++                           rgbaPixels, sourceRowBytes, cropRowBytes, rowCount);
++    __sync_synchronize();
++    MisterGpuTexture* record = &g_gpu_texture_records[g_gpu_texture_record_count++];
++    record->source = rgbaPixels;
++    record->shadow = shadow0;
++    record->shadow_alt = shadow1;
++    record->bytes = bytes;
++    record->physical[0] = physical0;
++    record->physical[1] = physical1;
++    record->last_upload_frame = g_gpu_frame_serial;
++    record->generation = nextTextureGeneration();
++    record->source_revision = sourceRevision;
++    record->active = 0;
++    record->dynamic = true;
++    record->source_revision_valid = true;
++    record->shadow_valid = true;
++    record->sparse = true;
++    record->released = false;
++    record->released_frame = 0;
++    record->opaque_pixels = NULL;
++    record->opaque_word_count = 0;
++    record->opaque_generation = 0;
++    return physical0;
++}
++
+ uint32_t MisterGpu_prepareDynamicTextureGpuWrite(const void* rgbaPixels, size_t bytes,
+                                                  uint32_t sourceRevision) {
+     if (!g_gpu_available || rgbaPixels == NULL || bytes == 0) return 0;
+diff --git a/src/backends/mister_gpu.h b/src/backends/mister_gpu.h
+index dcd5812..294f29c 100644
+--- a/src/backends/mister_gpu.h
++++ b/src/backends/mister_gpu.h
+@@ -20,6 +20,11 @@ uint32_t MisterGpu_uploadSparseDynamicTextureRevision(const void* rgbaPixels,
+                                                       size_t bytes,
+                                                       size_t rowBytes,
+                                                       uint32_t sourceRevision);
++uint32_t MisterGpu_uploadSparseDynamicTextureCropRevision(const void* rgbaPixels,
++                                                          size_t sourceRowBytes,
++                                                          size_t cropRowBytes,
++                                                          size_t rowCount,
++                                                          uint32_t sourceRevision);
+ uint32_t MisterGpu_prepareDynamicTextureGpuWrite(const void* rgbaPixels, size_t bytes,
+                                                  uint32_t sourceRevision);
+ void MisterGpu_releaseTexture(const void* rgbaPixels);
+diff --git a/src/sw_renderer.c b/src/sw_renderer.c
+index eb7bc93..f6e2cfc 100644
+--- a/src/sw_renderer.c
++++ b/src/sw_renderer.c
+@@ -1088,19 +1088,25 @@ static bool rasterizeAxisAlignedQuad(SWRenderer* sw, SWVertex v[4], const uint8_
+                        texW == 512 && texH == 256 &&
+                        sw->surfaceWidths[sourceSurface] == texW &&
+                        sw->surfaceHeights[sourceSurface] == texH) {
+-                // AM2R's lighting engine rebuilds a 512x256 subtractive mask
+-                // every tick, even when only the character-following light
+-                // moved by a few pixels.  A conventional dynamic upload
+-                // writes both complete 512 KiB buffers on alternating frames.
+-                // Keep the exact RGBA surface and 2048-byte source stride, but
+-                // update only rows/spans which differ from the corresponding
+-                // double-buffer shadow.  Stationary masks become comparison-
+-                // only frames and moving lights transfer their small union of
+-                // old/new bounds instead of the entire power-of-two surface.
+-                gpuStride = (uint32_t)texW * 4u;
+-                textureAddress = MisterGpu_uploadSparseDynamicTextureRevision(
+-                    texPixels, (size_t)texW * texH * 4u, gpuStride,
+-                    sw->surfaceRevisions[sourceSurface]);
++                if (minX == 0 && minY == 0 && maxX == 320 && maxY == 240 &&
++                    gpuU == 0x00008000 && gpuV == 0x00008000 &&
++                    gpuDu == 0x00010000 && gpuDv == 0x00010000) {
++                    // AM2R rebuilds a power-of-two 512x256 subtractive mask,
++                    // but this output command samples only its upper-left
++                    // 320x240 viewport. Keep compact double-buffer shadows and
++                    // copy only changed spans into equally compact FPGA
++                    // textures. This avoids scanning and retaining the unused
++                    // 192 columns and 16 rows every tick.
++                    gpuStride = 320u * 4u;
++                    textureAddress = MisterGpu_uploadSparseDynamicTextureCropRevision(
++                        texPixels, (size_t)texW * 4u, gpuStride, 240u,
++                        sw->surfaceRevisions[sourceSurface]);
++                } else {
++                    gpuStride = (uint32_t)texW * 4u;
++                    textureAddress = MisterGpu_uploadSparseDynamicTextureRevision(
++                        texPixels, (size_t)texW * texH * 4u, gpuStride,
++                        sw->surfaceRevisions[sourceSurface]);
++                }
+             } else if (coordinatesFit) {
+                 textureAddress = swGpuPrepareAxisTexture(sw,texPixels,texW,texH,
+                     maxX-minX,maxY-minY,&gpuU,&gpuV,&gpuDu,&gpuDv,&gpuStride);

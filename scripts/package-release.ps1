@@ -86,8 +86,9 @@ The first launch validates and extracts AM2R.zip into a generated
 Later launches reuse that cache while the archive is unchanged. Save states
 contain executable memory and only load with the exact runtime build which
 created them. Keep at least 256 MiB free for a checkpoint; low-space requests
-are refused without replacing the previous slot. Weapon Select+Start exits to
-the MiSTer menu.
+are refused without replacing the previous slot. After loading a state, relaunch
+the core before saving another one; an unsafe nested save is refused and the
+previous slot is preserved. Weapon Select+Start exits to the MiSTer menu.
 
 AM2R.zip and all other proprietary game files are intentionally excluded.
 '@

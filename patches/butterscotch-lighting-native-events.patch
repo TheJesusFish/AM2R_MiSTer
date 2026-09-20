@@ -1,0 +1,131 @@
+diff --git a/src/runner.c b/src/runner.c
+--- a/src/runner.c
++++ b/src/runner.c
+@@ -608,6 +608,66 @@ static bool Runner_tryExecuteAm2rSandDraw(Runner* runner, Instance* instance,
+     }
+     return true;
+ }
++
++// AM2R 1.1 requests the same complete light-mask rebuild from both Normal Step
++// and End Step.  Nothing presents or samples that surface between those two
++// phases; End Step runs after movement, collisions, and every ordinary Step
++// handler and therefore produces the mask that Draw actually consumes.  Keep
++// the Normal Step fade-out state change but defer its redundant rebuild to the
++// authored End Step event.  Fall back unless that exact companion handler is
++// present, so other games/data revisions retain interpreted semantics.
++static bool Runner_tryExecuteAm2rLightStep(Runner* runner,
++                                           Instance* instance,
++                                           int32_t eventType,
++                                           int32_t eventSubtype,
++                                           int32_t codeId,
++                                           int32_t ownerObjectIndex) {
++    static const char objectName[] = "oLightEngine";
++    static const char codeName[] = "gml_Object_oLightEngine_Step_0";
++    static const char endStepCodeName[] = "gml_Object_oLightEngine_Step_2";
++
++    if (eventType != EVENT_STEP || eventSubtype != STEP_NORMAL ||
++        instance == nullptr || codeId < 0 ||
++        (uint32_t)codeId >= runner->dataWin->code.count ||
++        ownerObjectIndex < 0 ||
++        (uint32_t)ownerObjectIndex >= runner->dataWin->objt.count)
++        return false;
++
++    const CodeEntry* code = &runner->dataWin->code.entries[codeId];
++    const GameObject* owner = &runner->dataWin->objt.objects[ownerObjectIndex];
++    if (code->name == nullptr || owner->name == nullptr ||
++        strcmp(code->name, codeName) != 0 ||
++        strcmp(owner->name, objectName) != 0)
++        return false;
++
++    int32_t endOwner = -1;
++    int32_t endCodeId = findEventCodeIdAndOwner(
++        runner, instance->objectIndex, EVENT_STEP, STEP_END, &endOwner);
++    if (endCodeId < 0 || (uint32_t)endCodeId >= runner->dataWin->code.count ||
++        endOwner != ownerObjectIndex ||
++        runner->dataWin->code.entries[endCodeId].name == nullptr ||
++        strcmp(runner->dataWin->code.entries[endCodeId].name,
++               endStepCodeName) != 0)
++        return false;
++
++    ptrdiff_t fadeoutSlot = shgeti(runner->vmContext->varNameMap, "fadeout");
++    if (fadeoutSlot < 0) return false;
++    int32_t fadeoutVariable =
++        runner->vmContext->varNameMap[fadeoutSlot].value;
++    if (!IntRValueHashMap_contains(&instance->selfVars, fadeoutVariable))
++        return false;
++
++    if (!RValue_toBool(Instance_getSelfVar(instance, fadeoutVariable)))
++        return true;
++    if (instance->imageAlpha > 0.0f) {
++        instance->imageAlpha =
++            (float)((GMLReal)instance->imageAlpha - (GMLReal)0.01);
++    } else {
++        Runner_destroyInstance(runner, instance, true);
++    }
++    return true;
++}
++
+ #endif
+ 
+ // Executes an already-resolved event handler (see findEventCodeIdAndOwner) and verified codeId >= 0.
+@@ -651,6 +711,10 @@ static void Runner_executeResolvedEvent(Runner* runner, Instance* instance, int3
+             runner, instance, eventType, eventSubtype, codeId,
+             ownerObjectIndex);
+     if (!handledNatively)
++        handledNatively = Runner_tryExecuteAm2rLightStep(
++            runner, instance, eventType, eventSubtype, codeId,
++            ownerObjectIndex);
++    if (!handledNatively)
+ #endif
+         executeCode(runner, instance, codeId);
+ 
+diff --git a/src/sw_renderer.c b/src/sw_renderer.c
+index 7a11720..7e6303d 100644
+--- a/src/sw_renderer.c
++++ b/src/sw_renderer.c
+@@ -32,6 +32,12 @@ static inline uint8_t floatColorByte(float value) {
+     return clampByte((int32_t)lroundf(value * 255.0f));
+ }
+ 
++static inline uint8_t divideBy255U32(uint32_t value) {
++    // Exact floor divide by 255 for an unsigned 8x8-bit product.
++    // The renderer only passes values in [0, 255 * 255].
++    return (uint8_t)((value + 1u + (value >> 8)) >> 8);
++}
++
+ #if defined(USE_MISTER) && defined(__ARM_NEON)
+ static inline uint8x8_t divideBy255U16(uint16x8_t value) {
+     // Exact floor divide by 255 for an unsigned 8x8-bit product.
+@@ -45,8 +51,9 @@ static inline uint8x8_t divideBy255U16(uint16x8_t value) {
+ // light sprites into a CPU surface. The generic per-pixel path re-evaluates
+ // render state and performs six scalar colour divisions for every texel. Keep
+ // the same two /255 stages, but process the common contiguous atlas spans
+-// eight pixels at a time on the Cortex-A9. Scalar edges retain clamped
+-// nearest-neighbour sampling, so scaled or clipped lights remain exact.
++// eight pixels at a time on the Cortex-A9. Scaled/clipped spans retain
++// clamped nearest-neighbour sampling and use an exact division-free scalar
++// /255 operation, so their pixels remain bit-identical to the original path.
+ static void blendSubtractTextureSpan(uint32_t* destination,
+                                      const uint32_t* sourceRow,
+                                      int32_t textureWidth,
+@@ -101,13 +108,13 @@ static void blendSubtractTextureSpan(uint32_t* destination,
+         if (sourceIndex < 0) sourceIndex = 0;
+         if (sourceIndex >= textureWidth) sourceIndex = textureWidth - 1;
+         uint32_t pixel = sourceRow[sourceIndex];
+-        uint32_t alpha = ((pixel >> 24) & 255u) * tintA / 255u;
+-        uint32_t red = (pixel & 255u) * tintR / 255u;
+-        uint32_t green = ((pixel >> 8) & 255u) * tintG / 255u;
+-        uint32_t blue = ((pixel >> 16) & 255u) * tintB / 255u;
+-        red = red * alpha / 255u;
+-        green = green * alpha / 255u;
+-        blue = blue * alpha / 255u;
++        uint32_t alpha = divideBy255U32(((pixel >> 24) & 255u) * tintA);
++        uint32_t red = divideBy255U32((pixel & 255u) * tintR);
++        uint32_t green = divideBy255U32(((pixel >> 8) & 255u) * tintG);
++        uint32_t blue = divideBy255U32(((pixel >> 16) & 255u) * tintB);
++        red = divideBy255U32(red * alpha);
++        green = divideBy255U32(green * alpha);
++        blue = divideBy255U32(blue * alpha);
+         uint8_t* target = (uint8_t*)&destination[output];
+         target[0] = target[0] > red ? (uint8_t)(target[0] - red) : 0;
+         target[1] = target[1] > green ? (uint8_t)(target[1] - green) : 0;

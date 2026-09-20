@@ -158,6 +158,7 @@ struct StateControl {
     int activeRestoreSlot = -1;
     bool loadRequested = false;
     bool freshRestartRequested = false;
+    bool activeTimelineRestored = false;
     int coordinatorPort = 0;
     char sessionDirectory[PATH_MAX] = {};
     char tempDirectory[PATH_MAX] = {};
@@ -234,6 +235,7 @@ bool request_runner_state(StateControl &state, Am2rStateMessageType type,
 bool checkpoint_slot(StateControl &state, int slot, FILE *log);
 bool reap_state_persistence(StateControl &state, bool block, FILE *log,
                             bool notify);
+void release_quiesced_runner(int error, FILE *log);
 enum StateSlotStatus {
     STATE_SLOT_MISSING,
     STATE_SLOT_INCOMPATIBLE,
@@ -260,6 +262,21 @@ void handle_state_events(StateControl &state, pid_t active, FILE *log)
         case AM2R_STATE_SNAPSHOT_READY: {
             log_line(log, "savestate_quiesced slot=%d pid=%d frame=%d",
                      message.slot + 1, message.pid, message.frame);
+            if (state.activeTimelineRestored) {
+                // The ARM DMTCP port reliably restores a checkpoint captured
+                // from a fresh launch, but a second-generation image captured
+                // from that restored process can SIGSEGV on its next load.
+                // Resume immediately and leave the existing durable slot
+                // untouched instead of publishing a checkpoint we cannot
+                // promise to restore.
+                release_quiesced_runner(ENOTSUP, log);
+                state.saveRequestNs[message.slot] = 0;
+                log_line(log,
+                         "savestate_nested_rejected slot=%d pid=%d frame=%d errno=%d",
+                         message.slot + 1, message.pid, message.frame, ENOTSUP);
+                InfoMessage("Relaunch core before saving a state", 2200, "AM2R");
+                break;
+            }
             checkpoint_slot(state, message.slot, log);
             break;
         }
@@ -292,13 +309,17 @@ void handle_state_events(StateControl &state, pid_t active, FILE *log)
             }
             break;
         }
-        case AM2R_STATE_RESTORED:
+        case AM2R_STATE_RESTORED: {
+            const bool restoredFromSlot =
+                state.activeRestoreSlot == message.slot;
             log_line(log, "savestate_restored slot=%d pid=%d frame=%d elapsed_ms=%.1f",
                      message.slot + 1, message.pid, message.frame,
                      elapsed_ms(state.loadRequestNs[message.slot]));
             state.loadRequestNs[message.slot] = 0;
             state.activeRestoreSlot = -1;
+            if (restoredFromSlot) state.activeTimelineRestored = true;
             break;
+        }
         case AM2R_STATE_SNAPSHOT_ERROR:
             log_line(log, "savestate_error slot=%d pid=%d frame=%d errno=%d",
                      message.slot + 1, message.pid, message.frame, message.error);
@@ -1465,6 +1486,7 @@ int run_child(FILE *wrapperLog)
 
             if (state.freshRestartRequested) {
                 state.freshRestartRequested = false;
+                state.activeTimelineRestored = false;
                 stop_dmtcp(state, wrapperLog);
                 unlink(AM2R_STATE_RESUME_PATH);
                 unlink(AM2R_STATE_RUNNER_SOCKET);
@@ -1506,6 +1528,7 @@ int run_child(FILE *wrapperLog)
             if (state.activeRestoreSlot >= 0) {
                 int failedSlot = state.activeRestoreSlot;
                 state.activeRestoreSlot = -1;
+                state.activeTimelineRestored = false;
                 log_line(wrapperLog, "savestate_restart_failed slot=%d", failedSlot + 1);
                 InfoMessage("Save state is corrupt or incompatible", 2200, "AM2R");
                 if (!start_coordinator(state, wrapperLog)) {

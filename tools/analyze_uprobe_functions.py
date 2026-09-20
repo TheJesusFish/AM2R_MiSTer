@@ -25,16 +25,21 @@ def percentile(values: list[float], fraction: float) -> float:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("trace", type=Path)
+    parser.add_argument("--start-ms", type=float, default=0.0)
+    parser.add_argument("--end-ms", type=float, default=float("inf"))
     args = parser.parse_args()
 
     starts: dict[tuple[str, str], list[float]] = defaultdict(list)
     durations: dict[str, list[float]] = defaultdict(list)
     counts: dict[str, int] = defaultdict(int)
+    trace_start: float | None = None
     for line in args.trace.read_text(errors="replace").splitlines():
         match = EVENT.search(line)
         if not match:
             continue
         timestamp = float(match.group("timestamp")) * 1000.0
+        if trace_start is None:
+            trace_start = timestamp
         label = match.group("label")
         pid = match.group("pid")
         if label.endswith("_ret"):
@@ -42,10 +47,13 @@ def main() -> int:
             key = (pid, function)
             if starts[key]:
                 started = starts[key].pop()
-                if timestamp >= started:
+                elapsed = timestamp - trace_start
+                if timestamp >= started and args.start_ms <= elapsed < args.end_ms:
                     durations[function].append(timestamp - started)
         else:
-            counts[label] += 1
+            elapsed = timestamp - trace_start
+            if args.start_ms <= elapsed < args.end_ms:
+                counts[label] += 1
             starts[(pid, label)].append(timestamp)
 
     for function in sorted(counts):

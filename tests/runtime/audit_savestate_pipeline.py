@@ -31,6 +31,9 @@ def main() -> None:
         'rename(temporary, destination) != 0',
         '"savestate_committed slot=%d bytes=%lld install=%s path=%s"',
         '"savestate_save_complete slot=%d elapsed_ms=%.1f result=%d"',
+        "bool activeTimelineRestored = false;",
+        "release_quiesced_runner(ENOTSUP, log);",
+        '"savestate_nested_rejected slot=%d pid=%d frame=%d errno=%d"',
         '"am2r-state-v30-main-915ca339-dmtcp-3.2.0-mister1"',
     ):
         require(source, contract)
@@ -51,9 +54,20 @@ def main() -> None:
     if not space_check < dmtcp_call < release:
         raise SystemExit("save-state space-check/quiesce ordering changed")
 
+    snapshot_case = source[
+        source.index("case AM2R_STATE_SNAPSHOT_READY:") :
+        source.index("case AM2R_STATE_REQUEST_LOAD:")
+    ]
+    nested_guard = snapshot_case.index("if (state.activeTimelineRestored)")
+    nested_release = snapshot_case.index("release_quiesced_runner(ENOTSUP, log)")
+    checkpoint_call = snapshot_case.index("checkpoint_slot(state, message.slot, log)")
+    if not nested_guard < nested_release < checkpoint_call:
+        raise SystemExit("nested save refusal no longer precedes checkpointing")
+
     print(
         "AM2R save-state audit passed: disk staging, 256 MiB preflight, "
-        "atomic slot publication, runner release, and v30 compatibility retained"
+        "atomic slot publication, runner release, safe nested-save refusal, "
+        "and v30 compatibility retained"
     )
 
 

@@ -1,5 +1,5 @@
 diff --git a/src/backends/mister.c b/src/backends/mister.c
-index 5676e73..6a409de 100644
+index c4e70a5..bf6e6ec 100644
 --- a/src/backends/mister.c
 +++ b/src/backends/mister.c
 @@ -35,7 +35,8 @@
@@ -68,7 +68,7 @@ index 5676e73..6a409de 100644
      }
      if (g_gpu_control == NULL || g_gpu_command_buffers[0] == NULL ||
          g_gpu_command_buffers[1] == NULL || g_gpu_textures == NULL ||
-@@ -866,14 +876,10 @@ static bool decodeFusibleWaterRow(const MisterGpuCommand *command,
+@@ -869,14 +879,10 @@ static bool decodeFusibleWaterRow(const MisterGpuCommand *command,
          return false;
  
      // The compact hardware engine assumes one consecutive source pixel per
@@ -87,77 +87,20 @@ index 5676e73..6a409de 100644
  
      row->destination_x = destinationX;
      row->destination_y = destinationY;
-@@ -975,6 +981,191 @@ static uint32_t tryFuseWaterEffect(void) {
+@@ -978,6 +984,134 @@ static uint32_t tryFuseWaterEffect(void) {
      return fusedRows;
  }
  
-+static bool commandReadsTexture(const MisterGpuCommand *command,
-+                                uint32_t texture, bool *eligibleWater) {
-+    uint8_t opcode = (uint8_t)command->word[0];
-+    if (opcode != 2u && opcode != 4u && opcode != 7u) return false;
-+    if ((uint32_t)command->word[1] != texture) return false;
-+    if (eligibleWater != NULL)
-+        *eligibleWater = opcode == 7u &&
-+            (command->word[0] & GPU_WATER_NATIVE_ALIAS_FLAG) != 0;
-+    return true;
-+}
-+
-+// AM2R copies the completed application surface into a 320x240 user surface
-+// immediately before the next renderer frame, then uses that snapshot only as
-+// the source of its guarded water pass. The same completed image already lives
-+// in the FPGA's immutable published native buffer. When the complete command
-+// list proves there are no other readers or duplicate writers for the export,
-+// replace the water source with that buffer and drop one full-frame DDR write.
-+static uint32_t aliasExclusiveWaterExports(void) {
-+    uint32_t aliasedRows = 0;
-+    for (uint32_t exportIndex = 0; exportIndex < g_gpu_command_count;
-+         ++exportIndex) {
-+        MisterGpuCommand *exportCommand = &g_gpu_commands[exportIndex];
-+        if ((uint8_t)exportCommand->word[0] != 6u) continue;
-+        uint32_t texture = (uint32_t)exportCommand->word[1];
-+        uint32_t exportCount = 0;
-+        uint32_t readerCount = 0;
-+        bool exclusive = true;
-+
-+        for (uint32_t i = 0; i < g_gpu_command_count; ++i) {
-+            MisterGpuCommand *command = &g_gpu_commands[i];
-+            if ((uint8_t)command->word[0] == 6u &&
-+                (uint32_t)command->word[1] == texture) {
-+                exportCount++;
-+                continue;
-+            }
-+            bool eligibleWater = false;
-+            if (commandReadsTexture(command, texture, &eligibleWater)) {
-+                readerCount++;
-+                if (!eligibleWater || i < exportIndex) exclusive = false;
-+            }
-+        }
-+        if (exportCount != 1u || readerCount == 0u || !exclusive) continue;
-+
-+        for (uint32_t i = 0; i < g_gpu_command_count; ++i) {
-+            MisterGpuCommand *command = &g_gpu_commands[i];
-+            bool eligibleWater = false;
-+            if (!commandReadsTexture(command, texture, &eligibleWater) ||
-+                !eligibleWater)
-+                continue;
-+            aliasedRows += (uint16_t)(command->word[0] >> 16);
-+            command->word[0] = (command->word[0] & ~0x1ffull) | 8u;
-+        }
-+        memmove(&g_gpu_commands[exportIndex],
-+                &g_gpu_commands[exportIndex + 1u],
-+                (g_gpu_command_count - exportIndex - 1u) *
-+                    sizeof(*g_gpu_commands));
-+        g_gpu_command_count--;
-+        exportIndex--;
-+    }
-+
-+    // The marker is HPS-only. Any direct water command that could not prove a
-+    // safe alias remains the existing external-texture opcode 7.
++// Water must sample the application-surface export made in this command list.
++// The completed native buffer is one game frame older, so substituting it here
++// creates a visible stale-image band whenever the camera moves through lava.
++// Strip the HPS-only recognition marker and leave both the export and opcode 7
++// source intact.
++static void finalizeWaterExports(void) {
 +    for (uint32_t i = 0; i < g_gpu_command_count; ++i) {
 +        if ((uint8_t)g_gpu_commands[i].word[0] == 7u)
 +            g_gpu_commands[i].word[0] &= ~GPU_WATER_NATIVE_ALIAS_FLAG;
 +    }
-+    return aliasedRows;
 +}
 +
 +// AM2R's underwater foreground is emitted as a clipped leading slice,
@@ -279,7 +222,7 @@ index 5676e73..6a409de 100644
  #if defined(__ARM_NEON)
  static uint8x8_t neonScaleFloor255(uint8x8_t values, uint8_t multiplier) {
      uint16x8_t product = vmull_u8(values, vdup_n_u8(multiplier));
-@@ -2008,7 +2199,8 @@ bool MisterGpu_addWaterRows(uint32_t source, uint32_t stride,
+@@ -2011,7 +2145,8 @@ bool MisterGpu_addWaterRows(uint32_t source, uint32_t stride,
  
      MisterGpuCommand* command = &g_gpu_commands[g_gpu_command_count++];
      memset(command, 0, sizeof(*command));
@@ -289,7 +232,7 @@ index 5676e73..6a409de 100644
      command->word[1] = source | ((uint64_t)stride << 32);
      command->word[2] = tablePhysical |
                         ((uint64_t)(uint16_t)firstDestinationY << 32);
-@@ -2353,8 +2545,8 @@ void platformExit(void) {
+@@ -2356,8 +2491,8 @@ void platformExit(void) {
      if (g_gpu_native_mapping != NULL) {
          munmap(g_gpu_native_mapping, GPU_NATIVE_WINDOW_BYTES);
          g_gpu_native_mapping = NULL;
@@ -300,16 +243,17 @@ index 5676e73..6a409de 100644
      }
      for (uint32_t i = 0; i < GPU_COMMAND_BUFFER_COUNT; ++i) {
          if (g_gpu_command_buffers[i] != NULL) {
-@@ -2462,6 +2654,8 @@ void platformSwapBuffers(void) {
+@@ -2465,6 +2600,9 @@ void platformSwapBuffers(void) {
  
      if (!softwareFrame && g_gpu_command_count != 0) {
          uint32_t waterRows = tryFuseWaterEffect();
-+        uint32_t nativeWaterRows = aliasExclusiveWaterExports();
++        uint32_t nativeWaterRows = 0;
++        finalizeWaterExports();
 +        uint32_t repeatedTileCommands = tryFuseRepeatedAdditiveTiles();
          tryFuseMapBackground();
          cullFullyCoveredPrefix();
          uint32_t cycles = 0;
-@@ -2470,10 +2664,12 @@ void platformSwapBuffers(void) {
+@@ -2473,10 +2611,12 @@ void platformSwapBuffers(void) {
          if (MisterGpu_finishFrame(&cycles)) {
              double waitMs = (int64_t)(nowNanos() - waitStart) / 1000000.0;
              g_gpu_submitted_frames++;

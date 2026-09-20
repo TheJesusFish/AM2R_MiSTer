@@ -11,6 +11,7 @@ import argparse
 import os
 import pathlib
 import posixpath
+import re
 import shlex
 import sys
 import time
@@ -26,6 +27,7 @@ STATE_ROOT = "/media/fat/savestates/AM2R"
 WRAPPER_LOG = "/tmp/am2r-wrapper.log"
 SAVE_PATH = "/media/fat/saves/AM2R/sav1"
 SPACE_FLOOR = 256 * 1024 * 1024
+LINUX_ENOTSUP = 95
 
 
 def run(client, command: str, *, check: bool = True, timeout: int = 300) -> str:
@@ -91,12 +93,43 @@ def free_bytes(client) -> int:
     return int(lines[-1].split()[3]) * 1024
 
 
-def assert_runtime_alive(client) -> None:
-    run(
-        client,
-        "test -S /tmp/am2r-state-wrapper.sock && "
-        "test -S /tmp/am2r-state-runner.sock",
-    )
+def assert_runtime_alive(client, timeout: float = 10.0) -> None:
+    # The runner socket is deliberately closed while the process is quiesced,
+    # including the fast ENOSPC refusal path. Give the resumed runner time to
+    # publish its replacement socket before declaring the live core dead.
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        ready = run(
+            client,
+            "if test -S /tmp/am2r-state-wrapper.sock && "
+            "test -S /tmp/am2r-state-runner.sock; then printf ready; fi",
+            check=False,
+        )
+        if ready == "ready":
+            return
+        time.sleep(0.1)
+    raise RuntimeError("AM2R save-state control sockets did not return")
+
+
+def assert_restored_runtime_stable(
+    client, restart_pid: int, duration: float = 5.0
+) -> None:
+    """Reject a restore that briefly reconnects and then crashes/relaunches."""
+    assert_runtime_alive(client)
+    deadline = time.monotonic() + duration
+    while time.monotonic() < deadline:
+        ready = run(
+            client,
+            f"if kill -0 {restart_pid} 2>/dev/null && "
+            "test -S /tmp/am2r-state-wrapper.sock && "
+            "test -S /tmp/am2r-state-runner.sock; then printf ready; fi",
+            check=False,
+        )
+        if ready != "ready":
+            raise RuntimeError(
+                "restored runner exited during stability window"
+            )
+        time.sleep(0.25)
 
 
 def main() -> int:
@@ -200,18 +233,57 @@ def main() -> int:
                     raise RuntimeError("low-space refusal changed the valid slot")
                 assert_runtime_alive(client)
 
+            # Checkpoint completion is followed by a runner-side resume marker.
+            # Drain that marker before requesting a load; otherwise it can be
+            # mistaken for the later DMTCP restart's restore notification.
+            log_offset, _ = wait_for_log(
+                sftp,
+                log_offset,
+                f"savestate_restored slot={slot}",
+                15,
+            )
+
             load_offset = log_offset
             run(client, f"{shlex.quote(remote_helper)} load {slot}")
-            _, load_log = wait_for_log(
+            log_offset, restart_log = wait_for_log(
                 sftp,
                 load_offset,
+                f"savestate_restart slot={slot}",
+                30,
+            )
+            restart_pids = re.findall(
+                rf"savestate_restart slot={slot} pid=(\d+)", restart_log
+            )
+            if not restart_pids:
+                raise RuntimeError("save-state restart PID was not logged")
+            log_offset, load_log = wait_for_log(
+                sftp,
+                log_offset,
                 f"savestate_restored slot={slot}",
                 30,
             )
             if f"savestate_restored slot={slot}" not in load_log:
                 raise RuntimeError("save-state load did not restore the runner")
-            assert_runtime_alive(client)
-            outcome = "save/load"
+            assert_restored_runtime_stable(client, int(restart_pids[-1]))
+
+            # ARM DMTCP can restore a fresh-launch checkpoint, but a new image
+            # captured from that restored process is not reliably restartable.
+            # The frontend must reject this generation before touching the
+            # existing slot, resume the game, and keep the loaded process live.
+            nested_hash = hash_or_missing(client, image)
+            run(client, f"{shlex.quote(remote_helper)} save {slot}")
+            log_offset, nested_log = wait_for_log(
+                sftp,
+                log_offset,
+                f"savestate_nested_rejected slot={slot}",
+                15,
+            )
+            if f"errno={LINUX_ENOTSUP}" not in nested_log:
+                raise RuntimeError("nested save was not rejected with ENOTSUP")
+            if hash_or_missing(client, image) != nested_hash:
+                raise RuntimeError("nested save rejection changed the valid slot")
+            assert_restored_runtime_stable(client, int(restart_pids[-1]))
+            outcome = "save/load plus safe nested-save refusal"
 
         ordinary_after = hash_or_missing(client, SAVE_PATH)
         if ordinary_after != ordinary_before:

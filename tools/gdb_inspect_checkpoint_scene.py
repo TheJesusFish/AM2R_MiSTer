@@ -34,7 +34,11 @@ def locate_runner():
     # Retain the scan below for older checkpoints whose original ELF is gone.
     try:
         direct = gdb.parse_and_eval("g_runner")
-        if int(direct):
+        # A stripped DMTCP image can retain the old executable's load
+        # addresses while GDB reads types from an otherwise identical
+        # unstripped companion.  Do not trust a non-null value by itself:
+        # a small value here is a relocated data-symbol mismatch, not a Runner.
+        if 0x001D0000 <= int(direct) < 0xB0000000:
             return int(gdb.parse_and_eval("&g_runner")), int(direct), direct.dereference()
     except (gdb.error, gdb.MemoryError):
         pass

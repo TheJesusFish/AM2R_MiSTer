@@ -1,5 +1,5 @@
 diff --git a/src/backends/mister.c b/src/backends/mister.c
-index f8bcd8b..c74e717 100644
+index f8bcd8b..c24e4a9 100644
 --- a/src/backends/mister.c
 +++ b/src/backends/mister.c
 @@ -69,6 +69,9 @@ typedef struct {
@@ -64,7 +64,7 @@ index f8bcd8b..c74e717 100644
          uint32_t copies = record->dynamic ? 2u : 1u;
          for (uint32_t copy = 0; copy < copies; ++copy) {
              uint32_t base = record->physical[copy];
-@@ -560,6 +573,186 @@ static const MisterGpuTexture* textureRecordForPhysical(uint32_t physical,
+@@ -560,6 +573,189 @@ static const MisterGpuTexture* textureRecordForPhysical(uint32_t physical,
      return NULL;
  }
  
@@ -115,7 +115,10 @@ index f8bcd8b..c74e717 100644
 +}
 +
 +static bool axisCommandCanOverwrite(const MisterGpuCommand *command) {
-+    return (command->word[0] & 0x1ffu) == 2u &&
++    // Only normal-blend blits replace the destination.  Bits 8 and 9 select
++    // additive and subtractive blending respectively; neither can make the
++    // commands below it redundant, even when the source is fully opaque.
++    return (command->word[0] & 0x3ffu) == 2u &&
 +        (uint32_t)command->word[5] == 0x00010000u &&
 +        (uint32_t)(command->word[5] >> 32) == 0x00010000u &&
 +        (uint8_t)(command->word[6] >> 24) == 255u &&
@@ -251,7 +254,7 @@ index f8bcd8b..c74e717 100644
  static uint8_t gpuMul255(uint8_t a, uint8_t b) {
      uint32_t product = (uint32_t)a * b;
      return (uint8_t)((product + 128u + ((product + 128u) >> 8)) >> 8);
-@@ -1881,6 +2074,10 @@ void platformExit(void) {
+@@ -1881,6 +2077,10 @@ void platformExit(void) {
      for (uint32_t i = 0; i < g_gpu_texture_record_count; ++i) {
          free(g_gpu_texture_records[i].shadow);
          g_gpu_texture_records[i].shadow = NULL;
@@ -262,7 +265,7 @@ index f8bcd8b..c74e717 100644
      }
      g_gpu_texture_record_count = 0;
      free(g_gpu_fused_base_pixels);
-@@ -2029,6 +2226,7 @@ void platformSwapBuffers(void) {
+@@ -2029,6 +2229,7 @@ void platformSwapBuffers(void) {
  
      if (!softwareFrame && g_gpu_command_count != 0) {
          tryFuseMapBackground();

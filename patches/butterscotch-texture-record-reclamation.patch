@@ -1,0 +1,384 @@
+diff --git a/src/backends/mister.c b/src/backends/mister.c
+index 82ad264..df37cc4 100644
+--- a/src/backends/mister.c
++++ b/src/backends/mister.c
+@@ -46,7 +46,7 @@
+ #define GPU_COMMAND_CAPACITY (GPU_COMMAND_BYTES / sizeof(MisterGpuCommand))
+ #define GPU_COMMAND_BUFFER_COUNT 2u
+ #define GPU_TEXTURE_BYTES (128u * 1024u * 1024u)
+-#define GPU_TEXTURE_RECORDS 64
++#define GPU_TEXTURE_RECORDS 128
+ #define GPU_FUSED_PREFIX_COMMANDS 12u
+ #define GPU_FUSED_BASE_SOURCES 8u
+ #define GPU_WATER_ROWS MISTER_HEIGHT
+@@ -81,6 +81,8 @@ typedef struct {
+     bool source_revision_valid;
+     bool shadow_valid;
+     bool sparse;
++    bool released;
++    uint32_t released_frame;
+     uint64_t *opaque_pixels;
+     size_t opaque_word_count;
+     uint32_t opaque_generation;
+@@ -118,6 +120,7 @@ static bool g_gpu_presented = false;
+ static bool g_gpu_software_frame = false;
+ static uint32_t g_gpu_submitted_frames = 0;
+ static uint32_t g_gpu_texture_generation = 0;
++static uint32_t g_gpu_software_frame_physical = 0;
+ static uint32_t g_gpu_deferred_exports[GPU_TEXTURE_RECORDS];
+ static uint32_t g_gpu_deferred_export_count = 0;
+ static bool g_gpu_frame_open = false;
+@@ -166,6 +169,7 @@ static uint64_t g_gpu_opaque_coverage[MISTER_HEIGHT][MISTER_WIDTH / 64];
+ 
+ static bool openJoyShared(void);
+ static void openVirtualInput(void);
++static uint32_t reserveGpuTexture(size_t bytes);
+ 
+ static bool mapFramebuffer(void) {
+     g_fb_fd = open("/dev/fb0", O_RDWR | O_SYNC | O_CLOEXEC);
+@@ -392,6 +396,15 @@ static bool initGpu(void) {
+     g_gpu_last_presented_buffer = 0;
+     g_gpu_last_presented_valid = false;
+     g_gpu_available = true;
++    if (g_gpu_software_frame_physical == 0) {
++        // Native scanout cannot see Linux's /dev/fb0. Keep one guaranteed
++        // staging allocation outside the ordinary texture-record table so a
++        // CPU fallback can still be presented after a long session has loaded
++        // or churned through every GameMaker texture record.
++        g_gpu_software_frame_physical = reserveGpuTexture(MISTER_FB_BYTES);
++        if (g_gpu_software_frame_physical == 0)
++            logWarn("MiSTer GPU: could not reserve software-frame staging buffer\n");
++    }
+     MisterGpu_beginFrame();
+     MisterGpu_addClear(0xff000000u);
+     appendGpuEnd();
+@@ -473,15 +486,72 @@ static uint32_t nextTextureGeneration(void) {
+     return g_gpu_texture_generation;
+ }
+ 
++static void warnTextureTableExhausted(void) {
++    static uint32_t warningCount = 0;
++    if (warningCount < 8 || (g_gpu_frame_serial % 300u) == 0)
++        logWarn("MiSTer GPU: texture record table exhausted\n");
++    warningCount++;
++}
++
++static MisterGpuTexture* reuseReleasedTexture(const void* rgbaPixels,
++                                              size_t bytes,
++                                              bool requireSecondCopy,
++                                              bool requireAlternateShadow,
++                                              bool sourceRevisionValid,
++                                              uint32_t sourceRevision) {
++    MisterGpuTexture* best = NULL;
++    for (uint32_t i = 0; i < g_gpu_texture_record_count; ++i) {
++        MisterGpuTexture* record = &g_gpu_texture_records[i];
++        if (!record->released || record->bytes != bytes ||
++            record->released_frame == g_gpu_frame_serial)
++            continue;
++        if (requireSecondCopy && record->physical[1] == 0) continue;
++        if (best == NULL || (requireAlternateShadow && best->shadow_alt == NULL &&
++                             record->shadow_alt != NULL))
++            best = record;
++    }
++    if (best == NULL || !waitGpuCompletion(NULL)) return NULL;
++
++    if (requireAlternateShadow && best->shadow_alt == NULL) {
++        best->shadow_alt = malloc(bytes);
++        if (best->shadow_alt == NULL) return NULL;
++    }
++    best->source = rgbaPixels;
++    best->active = 0;
++    best->dynamic = best->physical[1] != 0;
++    best->source_revision = sourceRevision;
++    best->source_revision_valid = sourceRevisionValid;
++    best->shadow_valid = true;
++    best->sparse = requireAlternateShadow;
++    best->released = false;
++    best->released_frame = 0;
++    best->last_upload_frame = g_gpu_frame_serial;
++    best->generation = nextTextureGeneration();
++    best->opaque_generation = 0;
++    memcpy(best->shadow, rgbaPixels, bytes);
++    memcpy(g_gpu_textures + (best->physical[0] - GPU_TEXTURE_PHYS),
++           rgbaPixels, bytes);
++    if (best->physical[1] != 0)
++        memcpy(g_gpu_textures + (best->physical[1] - GPU_TEXTURE_PHYS),
++               rgbaPixels, bytes);
++    if (best->shadow_alt != NULL) memcpy(best->shadow_alt, rgbaPixels, bytes);
++    __sync_synchronize();
++    return best;
++}
++
+ uint32_t MisterGpu_uploadTexture(const void* rgbaPixels, size_t bytes) {
+     if (!g_gpu_available || rgbaPixels == NULL || bytes == 0) return 0;
+     for (uint32_t i = 0; i < g_gpu_texture_record_count; ++i) {
+-        if (g_gpu_texture_records[i].source == rgbaPixels &&
++        if (!g_gpu_texture_records[i].released &&
++            g_gpu_texture_records[i].source == rgbaPixels &&
+             g_gpu_texture_records[i].bytes == bytes)
+             return g_gpu_texture_records[i].physical[g_gpu_texture_records[i].active];
+     }
++    MisterGpuTexture* reused = reuseReleasedTexture(
++        rgbaPixels, bytes, false, false, false, 0);
++    if (reused != NULL) return reused->physical[reused->active];
+     if (g_gpu_texture_record_count >= GPU_TEXTURE_RECORDS) {
+-        logWarn("MiSTer GPU: texture record table exhausted\n");
++        warnTextureTableExhausted();
+         return 0;
+     }
+     void* shadow = malloc(bytes);
+@@ -509,6 +579,8 @@ uint32_t MisterGpu_uploadTexture(const void* rgbaPixels, size_t bytes) {
+     record->source_revision_valid = false;
+     record->shadow_valid = true;
+     record->sparse = false;
++    record->released = false;
++    record->released_frame = 0;
+     record->opaque_pixels = NULL;
+     record->opaque_word_count = 0;
+     record->opaque_generation = 0;
+@@ -528,7 +600,8 @@ static uint32_t uploadSparseDynamicTexture(const void* rgbaPixels, size_t bytes,
+         return 0;
+     for (uint32_t i = 0; i < g_gpu_texture_record_count; ++i) {
+         MisterGpuTexture* record = &g_gpu_texture_records[i];
+-        if (record->source != rgbaPixels || record->bytes != bytes) continue;
++        if (record->released || record->source != rgbaPixels ||
++            record->bytes != bytes) continue;
+         if (!record->sparse) return uploadDynamicTexture(
+             rgbaPixels, bytes, true, sourceRevision);
+         if (record->source_revision_valid &&
+@@ -582,6 +655,10 @@ static uint32_t uploadSparseDynamicTexture(const void* rgbaPixels, size_t bytes,
+         return record->physical[record->active];
+     }
+ 
++    MisterGpuTexture* reused = reuseReleasedTexture(
++        rgbaPixels, bytes, true, true, true, sourceRevision);
++    if (reused != NULL) return reused->physical[reused->active];
++
+     if (g_gpu_texture_record_count >= GPU_TEXTURE_RECORDS) return 0;
+     void* shadow0 = malloc(bytes);
+     void* shadow1 = malloc(bytes);
+@@ -617,6 +694,8 @@ static uint32_t uploadSparseDynamicTexture(const void* rgbaPixels, size_t bytes,
+     record->source_revision_valid = true;
+     record->shadow_valid = true;
+     record->sparse = true;
++    record->released = false;
++    record->released_frame = 0;
+     record->opaque_pixels = NULL;
+     record->opaque_word_count = 0;
+     record->opaque_generation = 0;
+@@ -628,7 +707,8 @@ static uint32_t uploadDynamicTexture(const void* rgbaPixels, size_t bytes,
+                                      uint32_t sourceRevision) {
+     if (!g_gpu_available || rgbaPixels == NULL || bytes == 0) return 0;
+     for (uint32_t i = 0; i < g_gpu_texture_record_count; ++i) {
+-        if (g_gpu_texture_records[i].source == rgbaPixels &&
++        if (!g_gpu_texture_records[i].released &&
++            g_gpu_texture_records[i].source == rgbaPixels &&
+             g_gpu_texture_records[i].bytes == bytes) {
+             MisterGpuTexture* record = &g_gpu_texture_records[i];
+             if (record->sparse)
+@@ -677,8 +757,11 @@ static uint32_t uploadDynamicTexture(const void* rgbaPixels, size_t bytes,
+             return physical;
+         }
+     }
++    MisterGpuTexture* reused = reuseReleasedTexture(
++        rgbaPixels, bytes, true, false, sourceRevisionValid, sourceRevision);
++    if (reused != NULL) return reused->physical[reused->active];
+     if (g_gpu_texture_record_count >= GPU_TEXTURE_RECORDS) {
+-        logWarn("MiSTer GPU: texture record table exhausted\n");
++        warnTextureTableExhausted();
+         return 0;
+     }
+     void* shadow = malloc(bytes);
+@@ -707,6 +790,8 @@ static uint32_t uploadDynamicTexture(const void* rgbaPixels, size_t bytes,
+     record->source_revision_valid = sourceRevisionValid;
+     record->shadow_valid = true;
+     record->sparse = false;
++    record->released = false;
++    record->released_frame = 0;
+     record->opaque_pixels = NULL;
+     record->opaque_word_count = 0;
+     record->opaque_generation = 0;
+@@ -736,12 +821,17 @@ uint32_t MisterGpu_prepareDynamicTextureGpuWrite(const void* rgbaPixels, size_t
+     if (!g_gpu_available || rgbaPixels == NULL || bytes == 0) return 0;
+     MisterGpuTexture* record = NULL;
+     for (uint32_t i = 0; i < g_gpu_texture_record_count; ++i) {
+-        if (g_gpu_texture_records[i].source == rgbaPixels &&
++        if (!g_gpu_texture_records[i].released &&
++            g_gpu_texture_records[i].source == rgbaPixels &&
+             g_gpu_texture_records[i].bytes == bytes) {
+             record = &g_gpu_texture_records[i];
+             break;
+         }
+     }
++    if (record == NULL) {
++        record = reuseReleasedTexture(
++            rgbaPixels, bytes, true, false, true, sourceRevision);
++    }
+     if (record == NULL) {
+         if (g_gpu_texture_record_count >= GPU_TEXTURE_RECORDS) return 0;
+         void* shadow = malloc(bytes);
+@@ -766,6 +856,8 @@ uint32_t MisterGpu_prepareDynamicTextureGpuWrite(const void* rgbaPixels, size_t
+         record->opaque_pixels = NULL;
+         record->opaque_word_count = 0;
+         record->opaque_generation = 0;
++        record->released = false;
++        record->released_frame = 0;
+     } else if (!record->dynamic) {
+         record->physical[1] = reserveGpuTexture(bytes);
+         if (record->physical[1] == 0) return 0;
+@@ -783,10 +875,52 @@ uint32_t MisterGpu_prepareDynamicTextureGpuWrite(const void* rgbaPixels, size_t
+     return record->physical[record->active];
+ }
+ 
++void MisterGpu_releaseTexture(const void* rgbaPixels) {
++    if (rgbaPixels == NULL) return;
++    for (uint32_t i = 0; i < g_gpu_texture_record_count; ++i) {
++        MisterGpuTexture* record = &g_gpu_texture_records[i];
++        if (record->released || record->source != rgbaPixels) continue;
++        record->released = true;
++        record->released_frame = g_gpu_frame_serial;
++        record->source_revision_valid = false;
++        record->opaque_generation = 0;
++
++        // A freed GameMaker surface cannot remain the source of a deferred
++        // export or a derived fused/map cache. These caches are cheap to
++        // rebuild and keeping their record pointers would make record reuse
++        // unsafe.
++        uint32_t write = 0;
++        for (uint32_t read = 0; read < g_gpu_deferred_export_count; ++read) {
++            uint32_t physical = g_gpu_deferred_exports[read];
++            bool belongs = false;
++            for (uint32_t copy = 0; copy < (record->dynamic ? 2u : 1u); ++copy) {
++                uint32_t base = record->physical[copy];
++                if (base != 0 && physical >= base &&
++                    (size_t)(physical - base) < record->bytes) {
++                    belongs = true;
++                    break;
++                }
++            }
++            if (!belongs) g_gpu_deferred_exports[write++] = physical;
++        }
++        g_gpu_deferred_export_count = write;
++        g_gpu_fused_base_valid = false;
++        g_gpu_fused_valid = false;
++        g_gpu_fused_source_record = NULL;
++        g_gpu_fused_overlay_record = NULL;
++        g_gpu_fused_base_source_count = 0;
++        g_gpu_map_overlay_cache_record = NULL;
++        g_gpu_map_overlay_cache_valid = false;
++        g_gpu_map_base_cache_record = NULL;
++        g_gpu_map_base_cache_valid = false;
++    }
++}
++
+ static MisterGpuTexture* textureRecordForPhysical(uint32_t physical,
+                                                    size_t *recordOffset) {
+     for (uint32_t i = 0; i < g_gpu_texture_record_count; ++i) {
+         MisterGpuTexture *record = &g_gpu_texture_records[i];
++        if (record->released) continue;
+         uint32_t copies = record->dynamic ? 2u : 1u;
+         for (uint32_t copy = 0; copy < copies; ++copy) {
+             uint32_t base = record->physical[copy];
+@@ -2503,7 +2637,8 @@ bool MisterGpu_prepareSaveState(void) {
+     // the post-restore texture republish loop remains self-contained.
+     for (uint32_t i = 0; i < g_gpu_texture_record_count; ++i) {
+         MisterGpuTexture* record = &g_gpu_texture_records[i];
+-        if (record->shadow_valid || !record->dynamic || record->shadow == NULL)
++        if (record->released || record->shadow_valid || !record->dynamic ||
++            record->shadow == NULL)
+             continue;
+         if (!g_gpu_available || g_gpu_textures == NULL) return false;
+         uint32_t physical = record->physical[record->active];
+@@ -2577,7 +2712,8 @@ bool MisterGpu_afterSaveStateRestore(void) {
+ 
+     for (uint32_t i = 0; i < g_gpu_texture_record_count; ++i) {
+         MisterGpuTexture* record = &g_gpu_texture_records[i];
+-        if (record->shadow == NULL || record->bytes == 0 || !record->shadow_valid)
++        if (record->released || record->shadow == NULL || record->bytes == 0 ||
++            !record->shadow_valid)
+             continue;
+         if (record->sparse && record->shadow_alt != NULL)
+             memcpy(record->shadow_alt, record->shadow, record->bytes);
+@@ -2740,6 +2876,8 @@ void platformExit(void) {
+         g_gpu_texture_records[i].opaque_generation = 0;
+     }
+     g_gpu_texture_record_count = 0;
++    g_gpu_texture_offset = 0;
++    g_gpu_software_frame_physical = 0;
+     free(g_gpu_fused_base_pixels);
+     g_gpu_fused_base_pixels = NULL;
+     g_gpu_fused_base_valid = false;
+@@ -2843,8 +2981,16 @@ void platformSwapBuffers(void) {
+         // Main_MiSTer's Linux framebuffer. Upload a completed CPU fallback as
+         // one texture and let the FPGA publish it through the same atomic
+         // present path as hardware-rendered frames.
++        if (!waitGpuCompletion(NULL)) return;
+         MisterGpu_beginFrame();
+-        uint32_t source = MisterGpu_uploadDynamicTexture(g_next_frame, MISTER_FB_BYTES);
++        uint32_t source = g_gpu_software_frame_physical;
++        if (source != 0) {
++            memcpy(g_gpu_textures + (source - GPU_TEXTURE_PHYS),
++                   g_next_frame, MISTER_FB_BYTES);
++            __sync_synchronize();
++        } else {
++            source = MisterGpu_uploadDynamicTexture(g_next_frame, MISTER_FB_BYTES);
++        }
+         if (source != 0 && MisterGpu_addClear(0xff000000u) &&
+             MisterGpu_addBlit(source, MISTER_WIDTH * 4u, 0, 0,
+                               MISTER_WIDTH, MISTER_HEIGHT,
+diff --git a/src/backends/mister_gpu.h b/src/backends/mister_gpu.h
+index 7e4361b..333ee73 100644
+--- a/src/backends/mister_gpu.h
++++ b/src/backends/mister_gpu.h
+@@ -18,6 +18,7 @@ uint32_t MisterGpu_uploadSparseDynamicTextureRevision(const void* rgbaPixels,
+                                                       uint32_t sourceRevision);
+ uint32_t MisterGpu_prepareDynamicTextureGpuWrite(const void* rgbaPixels, size_t bytes,
+                                                  uint32_t sourceRevision);
++void MisterGpu_releaseTexture(const void* rgbaPixels);
+ bool MisterGpu_addClear(uint32_t rgba);
+ bool MisterGpu_addFill(int16_t x, int16_t y, uint16_t width, uint16_t height,
+                        uint32_t rgba, bool additive);
+diff --git a/src/sw_renderer.c b/src/sw_renderer.c
+index 6f70e0e..c734831 100644
+--- a/src/sw_renderer.c
++++ b/src/sw_renderer.c
+@@ -2281,6 +2281,9 @@ static int32_t swCreateSurface(Renderer* renderer, int32_t width, int32_t height
+         swEnsureSurfaceCapacity(sw, id + 1);
+         sw->surfaceCount = id + 1;
+     }
++#ifdef USE_MISTER
++    MisterGpu_releaseTexture(sw->surfacePixels[id]);
++#endif
+     free(sw->surfacePixels[id]);
+     sw->surfacePixels[id] = (uint8_t*)safeCalloc((size_t)width * (size_t)height, 4);
+     sw->surfaceWidths[id] = width;
+@@ -2306,6 +2309,9 @@ static int32_t swEnsureApplicationSurface(Renderer* renderer, int32_t width, int
+         renderer->runner->applicationSurfaceId = id;
+     } else if (sw->surfaceWidths[id] != width || sw->surfaceHeights[id] != height) {
+         uint8_t* pixels = (uint8_t*)safeCalloc((size_t)width * (size_t)height, 4);
++#ifdef USE_MISTER
++        MisterGpu_releaseTexture(sw->surfacePixels[id]);
++#endif
+         free(sw->surfacePixels[id]);
+         sw->surfacePixels[id] = pixels;
+         sw->surfaceWidths[id] = width;
+@@ -2338,6 +2344,9 @@ static void swSurfaceResize(Renderer* renderer, int32_t id, int32_t width, int32
+     SWRenderer* sw=(SWRenderer*)renderer;
+     if (!swSurfaceExists(renderer,id) || width <= 0 || height <= 0) return;
+     bool current = sw->currentSurface == id;
++#ifdef USE_MISTER
++    MisterGpu_releaseTexture(sw->surfacePixels[id]);
++#endif
+     free(sw->surfacePixels[id]);
+     sw->surfacePixels[id]=(uint8_t*)safeCalloc((size_t)width*(size_t)height,4);
+     sw->surfaceWidths[id]=width; sw->surfaceHeights[id]=height;
+@@ -2361,6 +2370,9 @@ static void swSurfaceFree(Renderer* renderer, int32_t id) {
+     }
+ #endif
+     if (sw->currentSurface == id) swUseHostTarget(sw);
++#ifdef USE_MISTER
++    MisterGpu_releaseTexture(sw->surfacePixels[id]);
++#endif
+     free(sw->surfacePixels[id]); sw->surfacePixels[id]=nullptr;
+     sw->surfaceWidths[id]=sw->surfaceHeights[id]=0; sw->surfaceExistsFlags[id]=false;
+     sw->surfaceRevisions[id]=0;

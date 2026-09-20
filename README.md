@@ -27,6 +27,36 @@ the Equipment connector-line and Logs gradient fallbacks that produced partial
 flashing frames are removed. The four-way chooser caches its quarter-turned
 art for the paired blitter, keeping repeated page changes at native cadence.
 
+Projectile and destructible-sand churn now use dense live-variable lists,
+ordered nearby collision candidates, and incremental drawable-list updates.
+On USB-1, the two supplied sand-room routes cleared the right wall and floor
+without the previous sustained shooting hitch; the final 28.017-second
+jump/down-shot capture contained 1,681 frames with 23 isolated adjacent
+repeats.
+
+Long-running surface churn can no longer exhaust the FPGA texture-record
+table and strand the core on a black frame. Freed GameMaker surfaces now return
+their records for reuse, the table has additional headroom, and CPU fallback
+presentation owns a separate staging buffer. The supplied first-pit checkpoint
+reproduced the former failure on USB-1; a forced-full-table hardware test of the
+fixed runtime presented every fallback frame without a black interval.
+
+The supplied slot-3 and room-159 regressions were AM2R's subtractive lighting
+engine rebuilding a 512×256 surface every frame. Exact opaque subtract fills,
+FPGA subtract blending, and compact sparse uploads of the visible 320×240
+viewport raised the controlled USB-1 room-159 movement workload to a 59.86 Hz
+sequence rate. The corrected Draw stage stays below 3.7 ms at the 95th
+percentile, and the lossless UGREEN capture has no alternating blank lighting
+frames. The game loop and audio callback also use the established hybrid-core
+real-time priority split, eliminating a recurring five-second Linux
+housekeeping hitch while leaving DMTCP and audio worker threads at normal
+priority after save-state restore.
+
+The supplied slot-1 lava bands were traced to a water optimization sampling the
+previous completed native frame while the camera moved. Batched FPGA water rows
+now retain AM2R's current-frame application-surface export, removing the stale
+vertical bands without returning the effect to the CPU renderer.
+
 This repository contains no AM2R game data. Testers must provide their own
 lawfully obtained AM2R 1.1 files and place the required files into a ZIP.
 
@@ -77,8 +107,11 @@ least 256 MiB must be free before capture begins. If it is not, the request is
 rejected, the previous slot remains valid, and gameplay resumes. The final file
 is published by an atomic same-filesystem rename. Wait for the **Save state
 written** message before loading or copying that slot. Save time depends heavily
-on SD/network storage and can approach 90 seconds on a nearly full card;
-hardware-tested loads completed in a few seconds.
+on SD/network storage and measured 49–135 seconds in the latest USB-1 runs;
+hardware-tested loads completed in a few seconds. Capturing a checkpoint after
+loading another checkpoint is not supported: the frontend immediately refuses
+the request, preserves the existing slot, and resumes gameplay. Relaunch the
+core before writing a replacement state.
 
 ## Controls
 

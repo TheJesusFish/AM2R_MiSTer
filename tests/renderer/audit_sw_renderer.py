@@ -20,6 +20,11 @@ def require(source: str, marker: str) -> None:
         raise SystemExit(f"missing renderer contract: {marker}")
 
 
+def forbid(source: str, marker: str) -> None:
+    if marker in source:
+        raise SystemExit(f"forbidden renderer contract: {marker}")
+
+
 def main() -> None:
     header = RENDERER_H.read_text(encoding="utf-8")
     source = SW_RENDERER_C.read_text(encoding="utf-8")
@@ -65,7 +70,7 @@ def main() -> None:
     # opaque tint, no gradient, valid CPU shadow, and exact bit coverage.
     for contract in (
         "static uint32_t cullFullyCoveredPrefix(void)",
-        "(command->word[0] & 0x1ffu) == 2u",
+        "(command->word[0] & 0x3ffu) == 2u",
         "(uint32_t)command->word[5] == 0x00010000u",
         "(uint32_t)(command->word[5] >> 32) == 0x00010000u",
         "(uint8_t)(command->word[6] >> 24) == 255u",
@@ -82,6 +87,21 @@ def main() -> None:
         "MiSTer pacing: transient FPGA heartbeat timeout",
     ):
         require(mister_source, contract)
+
+    # AM2R's water rows consume an application-surface export produced earlier
+    # in the same command list. The completed native buffer is the prior game
+    # frame, so it must never replace that export merely because water is the
+    # only reader. Keep the optimized batched rows but clear their HPS-only
+    # recognition bit before submission as ordinary opcode 7 commands.
+    for contract in (
+        "static void finalizeWaterExports(void)",
+        "g_gpu_commands[i].word[0] &= ~GPU_WATER_NATIVE_ALIAS_FLAG;",
+        "uint32_t waterRows = tryFuseWaterEffect();\n"
+        "        uint32_t nativeWaterRows = 0;\n"
+        "        finalizeWaterExports();",
+    ):
+        require(mister_source, contract)
+    forbid(mister_source, "aliasExclusiveWaterExports")
 
     # Sampling application_surface into a user-created surface is not the
     # normal host-framebuffer handoff.  AM2R uses this exact route to freeze
@@ -120,10 +140,44 @@ def main() -> None:
     ):
         require(source, contract)
 
+    # The AM2R light engine draws a 320x240 viewport from a 512x256 backing
+    # surface. The unused power-of-two padding must not return to the hot path:
+    # cropped sparse shadows preserve the exact source stride while keeping the
+    # FPGA allocation and row scans limited to visible pixels.
+    for contract in (
+        "MisterGpu_uploadSparseDynamicTextureCropRevision(",
+        "gpuStride = 320u * 4u;",
+        "texPixels, (size_t)texW * 4u, gpuStride, 240u,",
+        "static void copyCroppedTextureRows",
+        "reuseReleasedCroppedTexture(",
+        "record->bytes != bytes || !record->sparse",
+        "targetPixels + row * cropRowBytes + first",
+    ):
+        require(source if "MisterGpu_" in contract or "gpuStride" in contract or
+                "texPixels" in contract else mister_source, contract)
+
+    # The remaining AM2R lighting work is the subtractive CPU mask itself.
+    # Preserve its exact two-stage integer modulation while allowing contiguous
+    # light-sprite spans to use the Cortex-A9 NEON lanes. A rotated zero-scale
+    # missile-hit sprite covers no samples and must not force a GPU readback.
+    for contract in (
+        "#include <arm_neon.h>",
+        "static inline uint8x8_t divideBy255U16",
+        "static void blendSubtractTextureSpan",
+        "red = divideBy255U16(vmull_u8(red, alpha));",
+        "target.val[0] = vqsub_u8(target.val[0], red);",
+        "target[0] = target[0] > red ? (uint8_t)(target[0] - red) : 0;",
+        "sw->blendEnable && sw->blendMode == bm_subtract && normalState",
+        "blendSubtractTextureSpan(destination, source, texW,",
+        "fabsf(edgeX0 * edgeY1 - edgeY0 * edgeX1) < 0.000001f",
+    ):
+        require(source, contract)
+
     print(
         f"AM2R renderer audit passed: {len(fields)} vtable hooks accounted for; "
-        "surface zero is reserved; opaque-prefix guards are present; only optional "
-        "drawTile uses the documented fallback"
+        "surface zero is reserved; blend-safe opaque-prefix, same-frame water, and "
+        "cropped/vectorized subtractive-lighting contracts are present; zero-area "
+        "effects are no-ops; only optional drawTile uses the documented fallback"
     )
 
 

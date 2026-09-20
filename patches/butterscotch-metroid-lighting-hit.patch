@@ -1,0 +1,146 @@
+diff --git a/src/sw_renderer.c b/src/sw_renderer.c
+index f6e2cfc..7a11720 100644
+--- a/src/sw_renderer.c
++++ b/src/sw_renderer.c
+@@ -18,6 +18,10 @@
+ #include <string.h>
+ #include <math.h>
+ 
++#if defined(USE_MISTER) && defined(__ARM_NEON)
++#include <arm_neon.h>
++#endif
++
+ // ===[ Pixel Helpers ]===
+ 
+ static inline uint8_t clampByte(int32_t value) {
+@@ -28,6 +32,89 @@ static inline uint8_t floatColorByte(float value) {
+     return clampByte((int32_t)lroundf(value * 255.0f));
+ }
+ 
++#if defined(USE_MISTER) && defined(__ARM_NEON)
++static inline uint8x8_t divideBy255U16(uint16x8_t value) {
++    // Exact floor divide by 255 for an unsigned 8x8-bit product.
++    uint16x8_t quotient = vaddq_u16(value, vdupq_n_u16(1));
++    quotient = vaddq_u16(quotient, vshrq_n_u16(value, 8));
++    return vmovn_u16(vshrq_n_u16(quotient, 8));
++}
++#endif
++
++// AM2R builds its lighting mask by subtractively blending large, axis-aligned
++// light sprites into a CPU surface. The generic per-pixel path re-evaluates
++// render state and performs six scalar colour divisions for every texel. Keep
++// the same two /255 stages, but process the common contiguous atlas spans
++// eight pixels at a time on the Cortex-A9. Scalar edges retain clamped
++// nearest-neighbour sampling, so scaled or clipped lights remain exact.
++static void blendSubtractTextureSpan(uint32_t* destination,
++                                     const uint32_t* sourceRow,
++                                     int32_t textureWidth,
++                                     int64_t sourceX,
++                                     int64_t sourceStep,
++                                     int32_t count,
++                                     uint8_t tintR,
++                                     uint8_t tintG,
++                                     uint8_t tintB,
++                                     uint8_t tintA) {
++    int32_t output = 0;
++#if defined(USE_MISTER) && defined(__ARM_NEON)
++    const bool contiguous = sourceStep == (1ll << 16) ||
++                            sourceStep == -(1ll << 16);
++    const uint8x8_t tintRv = vdup_n_u8(tintR);
++    const uint8x8_t tintGv = vdup_n_u8(tintG);
++    const uint8x8_t tintBv = vdup_n_u8(tintB);
++    const uint8x8_t tintAv = vdup_n_u8(tintA);
++    while (contiguous && output + 8 <= count) {
++        int32_t sourceIndex = (int32_t)(sourceX >> 16);
++        const bool forward = sourceStep > 0;
++        if ((forward && (sourceIndex < 0 || sourceIndex + 7 >= textureWidth)) ||
++            (!forward && (sourceIndex - 7 < 0 || sourceIndex >= textureWidth)))
++            break;
++        const uint8_t* source = (const uint8_t*)(sourceRow +
++            (forward ? sourceIndex : sourceIndex - 7));
++        uint8x8x4_t pixels = vld4_u8(source);
++        if (!forward) {
++            pixels.val[0] = vrev64_u8(pixels.val[0]);
++            pixels.val[1] = vrev64_u8(pixels.val[1]);
++            pixels.val[2] = vrev64_u8(pixels.val[2]);
++            pixels.val[3] = vrev64_u8(pixels.val[3]);
++        }
++        uint8x8_t alpha = divideBy255U16(vmull_u8(pixels.val[3], tintAv));
++        uint8x8_t red = divideBy255U16(vmull_u8(pixels.val[0], tintRv));
++        uint8x8_t green = divideBy255U16(vmull_u8(pixels.val[1], tintGv));
++        uint8x8_t blue = divideBy255U16(vmull_u8(pixels.val[2], tintBv));
++        red = divideBy255U16(vmull_u8(red, alpha));
++        green = divideBy255U16(vmull_u8(green, alpha));
++        blue = divideBy255U16(vmull_u8(blue, alpha));
++        uint8x8x4_t target = vld4_u8((const uint8_t*)(destination + output));
++        target.val[0] = vqsub_u8(target.val[0], red);
++        target.val[1] = vqsub_u8(target.val[1], green);
++        target.val[2] = vqsub_u8(target.val[2], blue);
++        vst4_u8((uint8_t*)(destination + output), target);
++        output += 8;
++        sourceX += sourceStep * 8;
++    }
++#endif
++    for (; output < count; ++output, sourceX += sourceStep) {
++        int32_t sourceIndex = (int32_t)(sourceX >> 16);
++        if (sourceIndex < 0) sourceIndex = 0;
++        if (sourceIndex >= textureWidth) sourceIndex = textureWidth - 1;
++        uint32_t pixel = sourceRow[sourceIndex];
++        uint32_t alpha = ((pixel >> 24) & 255u) * tintA / 255u;
++        uint32_t red = (pixel & 255u) * tintR / 255u;
++        uint32_t green = ((pixel >> 8) & 255u) * tintG / 255u;
++        uint32_t blue = ((pixel >> 16) & 255u) * tintB / 255u;
++        red = red * alpha / 255u;
++        green = green * alpha / 255u;
++        blue = blue * alpha / 255u;
++        uint8_t* target = (uint8_t*)&destination[output];
++        target[0] = target[0] > red ? (uint8_t)(target[0] - red) : 0;
++        target[1] = target[1] > green ? (uint8_t)(target[1] - green) : 0;
++        target[2] = target[2] > blue ? (uint8_t)(target[2] - blue) : 0;
++    }
++}
++
+ static inline void blendPixel(SWRenderer* sw, uint8_t* dst, uint8_t sr, uint8_t sg, uint8_t sb, uint8_t sa) {
+     if (sw->alphaTestEnable && sa < sw->alphaTestRef) return;
+     if (sa == 0) return;
+@@ -771,6 +858,17 @@ static bool rasterizeAxisAlignedQuad(SWRenderer* sw, SWVertex v[4], const uint8_
+     const float epsilon = 0.01f;
+     if (fabsf(v[0].y-v[1].y)>epsilon || fabsf(v[2].y-v[3].y)>epsilon ||
+         fabsf(v[0].x-v[3].x)>epsilon || fabsf(v[1].x-v[2].x)>epsilon) {
++        // A zero-scale rotated sprite is a pair of zero-area triangles. It
++        // cannot cover a sample, so treating it as an unsupported affine draw
++        // only forces a needless GPU readback. AM2R emits this exact geometry
++        // at the start of a missile-hit effect; the mid-frame handoff was the
++        // source of its full-screen corrupted flash.
++        const float edgeX0 = v[1].x - v[0].x;
++        const float edgeY0 = v[1].y - v[0].y;
++        const float edgeX1 = v[3].x - v[0].x;
++        const float edgeY1 = v[3].y - v[0].y;
++        if (fabsf(edgeX0 * edgeY1 - edgeY0 * edgeX1) < 0.000001f)
++            return true;
+ #ifdef USE_MISTER
+ #if defined(MISTER_GPU_DIAGNOSTICS)
+         static uint32_t nonAxisLogs = 0;
+@@ -1129,6 +1227,22 @@ static bool rasterizeAxisAlignedQuad(SWRenderer* sw, SWVertex v[4], const uint8_
+ #endif
+ #ifdef USE_MISTER
+         swExtendSurfaceContentBounds(sw, minX, minY, maxX, maxY);
++        if (sw->blendEnable && sw->blendMode == bm_subtract && normalState) {
++            const int32_t width = maxX - minX;
++            for (int32_t y = minY; y < maxY; ++y) {
++                int32_t sourceY = (int32_t)(srcY0 +
++                    (((double)y + 0.5) - v[0].y) * srcDy);
++                if (sourceY < 0) sourceY = 0;
++                if (sourceY >= texH) sourceY = texH - 1;
++                uint32_t* destination = (uint32_t*)(sw->framebuffer +
++                    ((size_t)y * sw->fbWidth + minX) * 4u);
++                const uint32_t* source = (const uint32_t*)(texPixels +
++                    (size_t)sourceY * texW * 4u);
++                blendSubtractTextureSpan(destination, source, texW,
++                    startX, stepX, width, tintR, tintG, tintB, tintA);
++            }
++            return true;
++        }
+ #endif
+         for(int32_t y=minY;y<maxY;++y){
+             int32_t sy=(int32_t)(srcY0+(((double)y+0.5)-v[0].y)*srcDy);

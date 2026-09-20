@@ -29,7 +29,7 @@ module am2r_gpu_tb;
 	reg scan_underflow_toggle = 0;
 
 	reg [63:0] control [0:3];
-	reg [63:0] commands [0:111];
+	reg [63:0] commands [0:119];
 	reg [63:0] textures [0:319];
 	reg [63:0] water_table [0:2];
 	reg [63:0] captured_frame [0:FB_WORDS-1];
@@ -69,7 +69,7 @@ module am2r_gpu_tb;
 			read_memory = 64'h0;
 			if (address >= CONTROL_WORD && address < CONTROL_WORD + 4)
 				read_memory = control[address - CONTROL_WORD];
-			else if (address >= COMMAND_WORD && address < COMMAND_WORD + 112)
+			else if (address >= COMMAND_WORD && address < COMMAND_WORD + 120)
 				read_memory = commands[address - COMMAND_WORD];
 			else if (address >= TEXTURE_WORD && address < TEXTURE_WORD + 320)
 				read_memory = textures[address - TEXTURE_WORD];
@@ -240,7 +240,7 @@ module am2r_gpu_tb;
 	reg [7:0] expected_r, expected_g, expected_b;
 	initial begin
 		for (n = 0; n < 4; n = n + 1) control[n] = 0;
-		for (n = 0; n < 112; n = n + 1) commands[n] = 0;
+		for (n = 0; n < 120; n = n + 1) commands[n] = 0;
 		for (n = 0; n < 320; n = n + 1) textures[n] = 0;
 		for (n = 0; n < FB_WORDS; n = n + 1) begin
 			captured_frame[n] = 64'hx;
@@ -353,11 +353,20 @@ module am2r_gpu_tb;
 		commands[88] = 64'd8 | (64'd1 << 16);
 		commands[90] = (64'd10 << 32) | 64'h26000010;
 		commands[94] = 64'h0000000033ffffff;
-		commands[96] = 64'd6;
-		commands[97] = 64'h0000000025000000;
-		commands[104] = 0;
+		// Subtractively blend the first red/green texture pair over the earlier
+		// 50%-tinted pair. Bit 9 selects GameMaker bm_subtract. With a 50%
+		// colour/alpha tint, each channel contribution is 64, leaving 64.
+		commands[96] = (64'd2) | (64'd1 << 9) | (64'd2 << 16) | (64'd1 << 32);
+		commands[97] = (64'd16 << 32) | 64'h24000000;
+		commands[98] = (64'd1 << 16) | 64'd30;
+		commands[100] = 0;
+		commands[101] = (64'h00010000 << 32) | 64'h00010000;
+		commands[102] = 64'h0000000080808080;
+		commands[104] = 64'd6;
+		commands[105] = 64'h0000000025000000;
+		commands[112] = 0;
 
-		control[1] = (64'd14 << 32) | 64'h23fe0000;
+		control[1] = (64'd15 << 32) | 64'h23fe0000;
 		control[2] = 64'h0000000022001000;
 		control[3] = 0;
 
@@ -409,8 +418,8 @@ module am2r_gpu_tb;
 		expect_pixel(20, 2, 32'h00089020);
 		expect_pixel(21, 2, 32'h00081020);
 		expect_pixel(22, 2, 32'h00081020);
-		expect_pixel(30, 1, 32'h00800000);
-		expect_pixel(31, 1, 32'h00008000);
+		expect_pixel(30, 1, 32'h00400000);
+		expect_pixel(31, 1, 32'h00004000);
 		expect_pixel(40, 1, 32'h00ff0000);
 		expected_r = blend_component(127, 8, 191);
 		expected_g = blend_component(64, 16, 191);
@@ -489,7 +498,7 @@ module am2r_gpu_tb;
 			exported_frame[n] = 64'hx;
 			captured_frame[n] = 64'hx;
 		end
-		for (n = 0; n < 112; n = n + 1) commands[n] = 0;
+		for (n = 0; n < 120; n = n + 1) commands[n] = 0;
 		commands[0] = 64'd6;
 		commands[1] = 64'h0000000025000000;
 		commands[8] = 0;

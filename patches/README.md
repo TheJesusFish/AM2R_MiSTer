@@ -45,10 +45,16 @@ git apply ../../patches/butterscotch-hardware-reattach-vblank.patch
 git apply ../../patches/butterscotch-opaque-suffix-cull.patch
 git apply ../../patches/butterscotch-room122-collision-hud.patch
 git apply ../../patches/butterscotch-subscreen-rendering.patch
+git apply ../../patches/butterscotch-sand-churn-performance.patch
+git apply ../../patches/butterscotch-texture-record-reclamation.patch
+git apply ../../patches/butterscotch-lighting-pacing.patch
+git apply ../../patches/butterscotch-lighting-visible-crop.patch
+git apply ../../patches/butterscotch-metroid-lighting-hit.patch
+git apply ../../patches/butterscotch-lighting-native-events.patch
 ```
 
-The thirty-four files were generated from the hardware-validated working tree.
-Each clean-applies in the order above, and applying all thirty-four to a fresh
+The forty files were generated from the hardware-validated working tree.
+Each clean-applies in the order above, and applying all forty to a fresh
 detached clone at the base commit reconstructs the current runner source after
 normalizing checkout line endings. See the final hardware and save-state
 reports under `reports/` for build identities and test results. The first
@@ -112,11 +118,12 @@ The twenty-fourth patch preserves application-surface exports requested during
 AM2R's Step event and lowers its guarded row-by-row water distortion to the
 compact FPGA water command. This fixes the jumping corruption caused when the
 old bridge discarded the pre-frame export. The twenty-fifth patch proves exact
-unit-step water rows in O(1), aliases their exclusive source to the immutable
-published native frame, and fuses the repeated additive 32-pixel underwater
-foreground. It also matches the three-buffer native publication ABI used by
-the current RBF. A 28.017-second USB-1 underwater jump capture contained 1,681
-frames at 60 fps with zero horizontal- or vertical-artifact flags.
+unit-step water rows in O(1), preserves their same-frame application-surface
+source, and fuses the repeated additive 32-pixel underwater foreground. The
+earlier native-buffer alias was removed after an exact USB-1 A/B showed that it
+sampled a one-frame-old scene and caused motion-dependent bands in lava. The
+patch also matches the three-buffer native publication ABI used by the current
+RBF.
 The twenty-sixth patch uses the metadata-free POSIX `access(F_OK)` operation for
 overlay file-existence checks. This avoids 32-bit ARM `stat()` returning
 `EOVERFLOW` for ordinary saves on CIFS shares whose server-provided inode
@@ -185,6 +192,57 @@ art as row-major textures for the paired axis blitter. USB-1's fallback count
 stayed flat through Map, Equipment, Logs, and Options, consecutive-frame sheets
 contained no partial menu frames, and steady chooser cost fell from about
 2.15 million to 0.76 million FPGA cycles.
+The thirty-fifth patch removes the remaining full-table and full-room work from
+AM2R's high-churn projectile and destructible-sand paths. Self-variable maps now
+keep dense occupied/reference lists, collision dispatch uses the exact
+GameMaker-ordered spatial candidate set, and drawable create, destroy, and depth
+changes update the ordered list incrementally instead of rebuilding and sorting
+the entire room. On USB-1, 24 rightward shots visibly cleared the supplied sand
+wall with no sustained freeze; a separate 28.017-second jump/down-shot capture
+cleared the floor and contained only 23 adjacent repeated frames in 1,681
+captured frames.
+The thirty-sixth patch gives released GameMaker surfaces back to the FPGA
+texture-record pool and doubles the record-table capacity. It also reserves a
+dedicated native-scanout staging allocation outside that table, so an uncommon
+software fallback remains presentable even when every ordinary texture record
+is occupied. The supplied first-pit checkpoint reproduced the old persistent
+black screen with all 64 records occupied. A forced-full 128-record stress run
+on USB-1 subsequently exercised an unsupported-draw fallback for 12.017 seconds
+with no failed presentation and no black capture interval.
+The thirty-seventh patch accelerates AM2R's subtractive lighting surface with
+an exact opaque-rectangle path, sparse double-buffer uploads, and FPGA
+subtractive blending. It executes the exact `oBlockSand` Draw event natively,
+removes recurring production diagnostics, and gives the vblank-paced game and
+audio callback explicit real-time priorities while keeping helper threads at
+normal priority across DMTCP save/load. The supplied slot-3 lighting workload
+rose from about 29.4 to 58.4 FPS; a final post-restore USB-1 movement capture
+contained 1,230 frames with two isolated repeats and no hitch cluster.
+The thirty-eighth patch recognizes the exact 320x240 viewport AM2R samples from
+its 512x256 subtractive-lighting surface. It keeps compact sparse double-buffer
+shadows and FPGA textures for only those visible rows and columns, while the
+full-stride path remains available for any other sampling geometry. In the
+user-supplied room-159 workload, real USB-1 movement held a 59.86 Hz sequence
+rate with all 103 GPU commands present; Draw fell from roughly 5.9 ms to 3.6 ms
+at the 95th percentile, and a 1,441-frame lossless UGREEN capture contained no
+alternating bright/blank lighting frames.
+The thirty-ninth patch vectorizes AM2R's exact subtractive light-sprite blend
+on ARM NEON while preserving both integer divide-by-255 stages and the target
+alpha channel. It also treats a rotated zero-area sprite as the no-op its two
+software triangles already were, preventing the missile-hit effect from
+forcing a mid-frame FPGA readback. In the supplied Gamma Metroid room on
+USB-1, active lighting rose from roughly 43 FPS to 59.7 FPS; a 12-second
+ten-missile run advanced 710 native game frames, damaged the boss from 100 to
+50 health, and left the non-axis fallback count at zero. The prior capture's
+wide green-corruption frames occupied as many as 65 spatial analysis tiles;
+the fixed 2,101-frame UGREEN capture never exceeded 40.
+The fortieth patch omits AM2R 1.1's redundant lighting Normal Step rebuild
+while retaining its fade-out state change and the authored End Step rebuild.
+It also replaces the common scaled-edge subtractive blend's integer divisions
+with an exact divide-by-255 identity. A broader native replacement for the
+Other-11 producer sequence was rejected after an exact-room USB-1 A/B: the
+authored bytecode path advanced at 59.807 FPS with a 21.112 ms p99 and 52.702
+ms maximum, while the native candidate measured 57.265 FPS with a 24.989 ms
+p99 and 259.639 ms maximum. Other 11 therefore remains interpreted.
 
 | Patch | SHA-256 |
 | --- | --- |
@@ -210,9 +268,9 @@ contained no partial menu frames, and steady chooser cost fell from about
 | `butterscotch-atomic-text-writes.patch` | `1595ff91501acec18ccc20eadff1ca6a4ad448ccdb4f12830d9da15c579837c4` |
 | `butterscotch-room-state-restoration.patch` | `fb65161ba5b9d2bd935d2a142b14f9c96909b9504c2b6256f45da2bffc485d27` |
 | `butterscotch-application-surface-snapshot.patch` | `b4ba265d5dec7be08c92b5b09fea9a60be374302f3ab2ffd025a04d3081c20a4` |
-| `butterscotch-opaque-prefix-cull.patch` | `bce817b57163b2ac6661064fc6bacdbcccee20c1493945d11daab2adfc737d58` |
+| `butterscotch-opaque-prefix-cull.patch` | `db1544cf91ee718365d9a769c4f9d7fb4f44f98ed4c26fee1a60612b0d2ced95` |
 | `butterscotch-water-native-deferred-export.patch` | `fd3c2335f90ab461adba4bc59882c3be19ef158d265aeaebde1c9caba5a920bc` |
-| `butterscotch-water-pipeline-performance.patch` | `95d1c60a743ef916f0c779b92eae033b40c2628730ab02b8fb47a9ee2e2dc1c2` |
+| `butterscotch-water-pipeline-performance.patch` | `61c5ab75182020d717c3925319efa3478c2ac1af679a59d60492491b032937e2` |
 | `butterscotch-large-file-metadata.patch` | `498ac455036b22d9b3e2061c6c798a46d140830279494abcb517fe102cfff9e0` |
 | `butterscotch-crt-ui-inset.patch` | `9abbe0daa25b2b047ea4e14834a373445775aa0c316c24d40c46344f78d0711f` |
 | `butterscotch-savestate-reliability.patch` | `d7ee348ca1308212e0462a40657d119ff0cf11c8536c73e1acea9e18fa1554ad` |
@@ -222,6 +280,12 @@ contained no partial menu frames, and steady chooser cost fell from about
 | `butterscotch-opaque-suffix-cull.patch` | `e644139a42d9a68db86b6c27a4d748e4c1a7a48a2b146d09ffcb8005eda4f034` |
 | `butterscotch-room122-collision-hud.patch` | `e749e752243988a3cf660a6ccca3504f658beb38a190c9810a65cfc25209451a` |
 | `butterscotch-subscreen-rendering.patch` | `26ea5183f48dbdc4c2b94bac8142f82bd39ee6bd36d34acb5f6189b92e5d9b7e` |
+| `butterscotch-sand-churn-performance.patch` | `69da8604b2c8815395f25b299b2046112c0a3a8b55a07661813c670b98fc59ee` |
+| `butterscotch-texture-record-reclamation.patch` | `b60b7a462168296c7328b5339144986eac34bd9ffcc97801f9803becddfbc0d9` |
+| `butterscotch-lighting-pacing.patch` | `4c97a9c828f99cd6b990458729caf32a5dbb56086427d8c583a1621db1a1334e` |
+| `butterscotch-lighting-visible-crop.patch` | `33af39ca9e3030e4229abd1027c8250d8215dba54ae48175fad1b3f0305e674e` |
+| `butterscotch-metroid-lighting-hit.patch` | `3102a3da64e5b98a0084586bac8b67b8fa6766c26ed693b16e305b23616c7b38` |
+| `butterscotch-lighting-native-events.patch` | `e5649a320b56f98589a87e57b0348bc1775e942f23487f72e3b1f25f7d7f72e3` |
 
 Persistent checkpoints use DMTCP 3.2.0. Apply the MiSTer ARMv7 portability
 patch to a clean DMTCP checkout at commit
