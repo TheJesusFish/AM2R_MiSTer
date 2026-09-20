@@ -43,7 +43,7 @@ scripted opening route remains an explicit user-test boundary.
 ```text
 User-supplied AM2R.zip → validated generated local cache
                     |
-HPS frontend: normal core lifecycle, OSD, DMTCP slot coordinator
+HPS frontend: normal core lifecycle and OSD state routing
                     |
 HPS runner: Butterscotch VM, game, input, persistent saves,
             audio, CPU texture shadows and upload
@@ -56,7 +56,7 @@ FPGA GPU: clear/fill, axis + affine texture, tint/gradient,
 FPGA DDR present DMA → MiSTer local framebuffer → framework video
 HPS ALSA audio ───────────────────────────────→ framework audio
 
-DMTCP image + metadata ──atomic commit──→ /media/fat/savestates/AM2R
+versioned logical snapshot ──atomic commit──→ /media/fat/savestates/AM2R
 ```
 
 The command ABI is implemented in `rtl/am2r_gpu.sv` and
@@ -96,31 +96,26 @@ generated cache beside the archive,
 starts the runner, services MiSTer OSD save/load triggers, and returns to the
 stock menu after the runner exits.
 
-Save states are DMTCP process checkpoints retained in four disk slots under
-`/media/fat/savestates/AM2R`. Before a checkpoint the runner waits for FPGA GPU
-completion, tears down the miniaudio worker/device, and disconnects its
-frontend socket and dynamically numbered input endpoints. The coordinator
-captures the image in a hidden session directory beside the persistent slots,
-not in RAM; this avoids exhausting Linux memory while the live game process is
-resident. The frontend requires 256 MiB free before capture and releases the
-quiesced runner with `ENOSPC` without touching the prior slot when that check
-fails. After capture the game resumes and a background writer atomically
-publishes both the uncompressed checkpoint and exact-build metadata through a
-same-filesystem rename. Format-3 metadata includes both the frontend build
-identifier and a CRC32 of the installed runner. Because DMTCP restores
-executable memory as well as game data, the wrapper rejects either mismatch
-before terminating the live game; this prevents an older checkpoint from
-silently replacing newer runtime fixes. An interrupted write cannot replace
-the previous good slot, and a slot still being written cannot be loaded.
+Save states are version-4 logical GameMaker snapshots retained as four `.fast`
+files under `/media/fat/savestates/AM2R`. Capture occurs only at a frame
+boundary. The serializer records global and instance variables, the exact
+current and persistent-room objects, mutable tiles and views, GameMaker data
+structures and buffers, particles, callbacks, open text/enumeration state,
+dynamic software-renderer surfaces, PRNG/time fields, and active audio
+instances. Immutable decoded resources and derived FPGA texture caches are not
+stored; they remain process-local or are reconstructed.
 
-On restore, DMTCP reconstructs the selected GameMaker/runner process. The
-runner re-uploads every CPU-shadowed texture to shared DDR, reconstructs the
-audio engine and active sounds, and reconnects to the current frontend through
-a resume marker and Unix datagram socket. This keeps a state reusable across
-core exit/relaunch as well as within one session. Empty slots leave the active
-game running; corrupt or incompatible states are rejected and recover to a new
-game instead of stranding the core. Normal AM2R save files remain separately
-persistent under `/media/fat/saves/AM2R` on the SD card.
+The header carries a format version, ABI/resource counts, data-file size,
+GameMaker game/license/GUID identity, and code/sprite counts. A CRC32 covers the
+payload. All header, fingerprint, size, and CRC checks complete before the live
+runner is reset. A successful write is flushed to `slotN.fast.new`, synced, and
+atomically renamed over `slotN.fast`. Loading tears down only mutable game
+state, rebuilds the exact captured object graph without firing Create or room
+events, restores surfaces/audio, and invalidates derived renderer caches.
+States therefore remain reusable across core exit/relaunch without embedding
+the executable or Linux process image. Empty, corrupt, foreign-game, and
+unsupported states leave the process alive. Normal AM2R saves remain separately
+persistent under `/media/fat/saves/AM2R`.
 
 The FPGA increments a shared-DDR heartbeat at each native vblank. Ordinary
 60 Hz game rooms wait on that edge so ARM game ticks and frame publication are

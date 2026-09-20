@@ -320,9 +320,29 @@ void handle_state_events(StateControl &state, pid_t active, FILE *log)
             if (restoredFromSlot) state.activeTimelineRestored = true;
             break;
         }
+        case AM2R_STATE_FAST_SAVE_COMPLETE:
+            log_line(log, "savestate_fast_saved slot=%d pid=%d frame=%d elapsed_ms=%.1f",
+                     message.slot + 1, message.pid, message.frame,
+                     elapsed_ms(state.saveRequestNs[message.slot]));
+            state.saveRequestNs[message.slot] = 0;
+            InfoMessage("Save state written", 1200, "AM2R");
+            break;
+        case AM2R_STATE_FAST_LOAD_COMPLETE:
+            log_line(log, "savestate_fast_loaded slot=%d pid=%d frame=%d elapsed_ms=%.1f",
+                     message.slot + 1, message.pid, message.frame,
+                     elapsed_ms(state.loadRequestNs[message.slot]));
+            state.loadRequestNs[message.slot] = 0;
+            InfoMessage("Save state loaded", 1200, "AM2R");
+            break;
         case AM2R_STATE_SNAPSHOT_ERROR:
             log_line(log, "savestate_error slot=%d pid=%d frame=%d errno=%d",
                      message.slot + 1, message.pid, message.frame, message.error);
+            state.saveRequestNs[message.slot] = 0;
+            state.loadRequestNs[message.slot] = 0;
+            InfoMessage(message.error == ENOENT ? "Save state slot is empty" :
+                        message.error == ENOTSUP ? "State uses unsupported game data" :
+                        message.error == EBADMSG ? "Save state is corrupt or incompatible" :
+                        "Save state failed", 1800, "AM2R");
             break;
         default:
             break;

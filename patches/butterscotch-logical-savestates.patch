@@ -1,0 +1,1751 @@
+diff --git a/src/am2r_fast_state.c b/src/am2r_fast_state.c
+new file mode 100644
+index 0000000..ffb9e0b
+--- /dev/null
++++ b/src/am2r_fast_state.c
+@@ -0,0 +1,1352 @@
++#include "am2r_fast_state.h"
++
++#ifdef USE_MISTER
++
++#include "runner.h"
++#include "vm.h"
++#include "sw_renderer.h"
++#include "gml_array.h"
++#include "int_rvalue_hashmap.h"
++#include "audio/miniaudio/ma_audio_system.h"
++#include "gettime.h"
++#include "stb_ds.h"
++#include "utils.h"
++
++#include <errno.h>
++#include <fcntl.h>
++#include <limits.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++#define FAST_STATE_VERSION 4u
++#define FAST_STATE_MAX_BYTES (128u * 1024u * 1024u)
++#define FAST_STATE_MAX_COUNT 1000000u
++#define FAST_STATE_ARRAY_DEPTH 64u
++#define FAST_STATE_PATH "/media/fat/savestates/AM2R"
++
++typedef struct {
++    char magic[8];
++    uint32_t version;
++    uint32_t headerSize;
++    uint32_t payloadSize;
++    uint32_t payloadCrc32;
++    uint32_t roomCount;
++    uint32_t objectCount;
++    uint32_t instanceSize;
++    uint32_t rvalueSize;
++    uint64_t dataFileSize;
++    uint32_t gameId;
++    uint32_t licenseCrc32;
++    uint8_t directPlayGuid[16];
++    uint32_t codeCount;
++    uint32_t spriteCount;
++} FastStateHeader;
++
++typedef struct {
++    uint8_t* data;
++    size_t size;
++    size_t capacity;
++    int error;
++    GMLArray** arrays;
++} FastWriter;
++
++typedef struct {
++    const uint8_t* data;
++    size_t size;
++    size_t offset;
++    int error;
++    GMLArray** arrays;
++} FastReader;
++
++typedef struct {
++    uint32_t instanceId;
++    int32_t objectIndex;
++    float x, y, xprevious, yprevious, xstart, ystart;
++    uint8_t persistent, solid, active, destroyed, visible, createEventFired;
++    uint8_t outsideRoom, mouseOver;
++    uint16_t activeAlarmMask;
++    int32_t maskIndex;
++    int32_t spriteIndex;
++    float imageSpeed, imageIndex, imageXscale, imageYscale, imageAngle, imageAlpha;
++    uint32_t imageBlend;
++    int32_t depth, layer;
++    float speed, direction, hspeed, vspeed, friction, gravity, gravityDirection;
++    int32_t pathIndex;
++    float pathPosition, pathPositionPrevious, pathSpeed, pathScale, pathOrientation;
++    int32_t pathEndAction;
++    float pathXStart, pathYStart;
++    int32_t alarm[GML_ALARM_COUNT];
++    int32_t timelineIndex;
++    float timelinePosition, timelineSpeed;
++    uint8_t timelineLoop, timelineRunning;
++} FastInstanceFields;
++
++typedef struct {
++    int32_t frameCount;
++    uint32_t nextInstanceId;
++    uint8_t gameStartFired;
++    int32_t viewCurrent;
++    uint8_t viewsEnabled;
++    uint32_t backgroundColor;
++    uint8_t drawBackgroundColor;
++    uint8_t appSurfaceEnabled, appSurfaceAutoDraw, usingAppSurface;
++    int32_t applicationWidth, applicationHeight;
++    int32_t oldApplicationWidth, oldApplicationHeight;
++    int32_t widescreenExtraWidth, widescreenExtraHeight;
++    float displayScaleX, displayScaleY;
++    int32_t applicationSurfaceId;
++    uint32_t nextLayerId;
++    GMLReal deltaTime;
++    GMLReal score, lives, health;
++    int32_t guiWidth, guiHeight;
++    GMLReal mpPotMaxrot, mpPotStep, mpPotAhead;
++    uint8_t mpPotOnSpot;
++    int32_t lastMusicInstance;
++    int32_t nextCallLaterId;
++    int32_t asyncLoadMapId;
++    int32_t asyncBufferNextRequestId;
++    int32_t dialogAsyncIdCounter;
++    int32_t xboxAccountPickerPendingId;
++    int32_t xboxAccountPickerPadIndex;
++    int32_t xboxAsyncIdCounter;
++    int32_t currentCursor;
++    uint64_t gameElapsedNanos;
++    Random random;
++    int32_t surfaceStack[MAX_SURFACES];
++} FastRunnerFields;
++
++static uint32_t crc32Bytes(const uint8_t* bytes, size_t length) {
++    uint32_t crc = 0xffffffffu;
++    for (size_t i = 0; i < length; ++i) {
++        crc ^= bytes[i];
++        for (int bit = 0; bit < 8; ++bit)
++            crc = (crc >> 1) ^ (0xedb88320u & (uint32_t)-(int32_t)(crc & 1u));
++    }
++    return ~crc;
++}
++
++static bool writerReserve(FastWriter* writer, size_t bytes) {
++    if (writer->error) return false;
++    if (bytes > FAST_STATE_MAX_BYTES || writer->size > FAST_STATE_MAX_BYTES - bytes) {
++        writer->error = EFBIG;
++        return false;
++    }
++    size_t needed = writer->size + bytes;
++    if (needed <= writer->capacity) return true;
++    size_t capacity = writer->capacity ? writer->capacity : 65536;
++    while (capacity < needed) capacity *= 2;
++    uint8_t* replacement = (uint8_t*)realloc(writer->data, capacity);
++    if (replacement == nullptr) {
++        writer->error = ENOMEM;
++        return false;
++    }
++    writer->data = replacement;
++    writer->capacity = capacity;
++    return true;
++}
++
++static bool writerBytes(FastWriter* writer, const void* data, size_t bytes) {
++    if (!writerReserve(writer, bytes)) return false;
++    if (bytes != 0) memcpy(writer->data + writer->size, data, bytes);
++    writer->size += bytes;
++    return true;
++}
++
++static bool writerU8(FastWriter* writer, uint8_t value) {
++    return writerBytes(writer, &value, sizeof(value));
++}
++
++static bool writerU32(FastWriter* writer, uint32_t value) {
++    return writerBytes(writer, &value, sizeof(value));
++}
++
++static bool writerI32(FastWriter* writer, int32_t value) {
++    return writerBytes(writer, &value, sizeof(value));
++}
++
++static bool readerBytes(FastReader* reader, void* target, size_t bytes) {
++    if (reader->error) return false;
++    if (bytes > reader->size || reader->offset > reader->size - bytes) {
++        reader->error = EBADMSG;
++        return false;
++    }
++    if (bytes != 0) memcpy(target, reader->data + reader->offset, bytes);
++    reader->offset += bytes;
++    return true;
++}
++
++static uint8_t readerU8(FastReader* reader) {
++    uint8_t value = 0;
++    readerBytes(reader, &value, sizeof(value));
++    return value;
++}
++
++static uint32_t readerU32(FastReader* reader) {
++    uint32_t value = 0;
++    readerBytes(reader, &value, sizeof(value));
++    return value;
++}
++
++static int32_t readerI32(FastReader* reader) {
++    int32_t value = 0;
++    readerBytes(reader, &value, sizeof(value));
++    return value;
++}
++
++static bool countOkay(FastReader* reader, uint32_t count) {
++    if (count <= FAST_STATE_MAX_COUNT) return true;
++    reader->error = EBADMSG;
++    return false;
++}
++
++static bool writeString(FastWriter* writer, const char* string) {
++    size_t length = string ? strlen(string) : 0;
++    if (length > UINT32_MAX) {
++        writer->error = EFBIG;
++        return false;
++    }
++    return writerU32(writer, (uint32_t)length) &&
++           writerBytes(writer, string ? string : "", length);
++}
++
++static char* readString(FastReader* reader) {
++    uint32_t length = readerU32(reader);
++    if (reader->error || length > 4u * 1024u * 1024u ||
++        length > reader->size - reader->offset) {
++        reader->error = EBADMSG;
++        return nullptr;
++    }
++    char* result = (char*)malloc((size_t)length + 1u);
++    if (result == nullptr) {
++        reader->error = ENOMEM;
++        return nullptr;
++    }
++    readerBytes(reader, result, length);
++    result[length] = '\0';
++    return result;
++}
++
++static bool writeRValue(FastWriter* writer, RValue value, uint32_t depth);
++static RValue readRValue(FastReader* reader, Runner* runner, uint32_t depth);
++
++static int32_t writerArrayIndex(FastWriter* writer, GMLArray* array) {
++    repeat((int32_t)arrlen(writer->arrays), i) {
++        if (writer->arrays[i] == array) return i;
++    }
++    return -1;
++}
++
++static bool writeArray(FastWriter* writer, GMLArray* array, uint32_t depth) {
++    if (array == nullptr || depth >= FAST_STATE_ARRAY_DEPTH) {
++        writer->error = array ? ELOOP : EBADMSG;
++        return false;
++    }
++    int32_t existing = writerArrayIndex(writer, array);
++    if (existing >= 0)
++        return writerU32(writer, (uint32_t)existing) && writerU8(writer, 0);
++
++    uint32_t id = (uint32_t)arrlen(writer->arrays);
++    arrput(writer->arrays, array);
++    if (!writerU32(writer, id) || !writerU8(writer, 1) ||
++        !writerU32(writer, (uint32_t)array->type)) return false;
++    if (array->type == GML_LEGACY_ARRAY) {
++        uint32_t rows = (uint32_t)array->legacy.rowCount;
++        if (!writerU32(writer, rows)) return false;
++        repeat(rows, rowIndex) {
++            GMLArrayRow* row = &array->legacy.rows[rowIndex];
++            if (!writerU32(writer, (uint32_t)row->length)) return false;
++            repeat(row->length, itemIndex) {
++                if (!writeRValue(writer, row->data[itemIndex], depth + 1)) return false;
++            }
++        }
++        return true;
++    }
++    if (array->type == GML_MODERN_ARRAY) {
++        if (!writerU32(writer, (uint32_t)array->modern.length)) return false;
++        repeat(array->modern.length, itemIndex) {
++            if (!writeRValue(writer, array->modern.data[itemIndex], depth + 1)) return false;
++        }
++        return true;
++    }
++    writer->error = ENOTSUP;
++    return false;
++}
++
++static GMLArray* createEmptyArray(Runner* runner, uint32_t type) {
++    GMLArray* array = GMLArray_create(runner->dataWin->gen8.wadVersion, 0);
++    if (array == nullptr) return nullptr;
++    if ((uint32_t)array->type != type) {
++        // WAD14 AM2R is legacy-array-only. Keeping this guard makes a future
++        // format extension explicit instead of misreading a newer VM state.
++        GMLArray_decRef(array);
++        return nullptr;
++    }
++    return array;
++}
++
++static RValue readArray(FastReader* reader, Runner* runner, uint32_t depth) {
++    if (depth >= FAST_STATE_ARRAY_DEPTH) {
++        reader->error = ELOOP;
++        return RValue_makeUndefined();
++    }
++    uint32_t id = readerU32(reader);
++    uint8_t isNew = readerU8(reader);
++    if (reader->error) return RValue_makeUndefined();
++    if (!isNew) {
++        if (id >= arrlenu(reader->arrays) || reader->arrays[id] == nullptr) {
++            reader->error = EBADMSG;
++            return RValue_makeUndefined();
++        }
++        GMLArray_incRef(reader->arrays[id]);
++        return RValue_makeArray(reader->arrays[id]);
++    }
++    if (id != arrlenu(reader->arrays)) {
++        reader->error = EBADMSG;
++        return RValue_makeUndefined();
++    }
++    uint32_t type = readerU32(reader);
++    GMLArray* array = createEmptyArray(runner, type);
++    if (array == nullptr) {
++        reader->error = ENOTSUP;
++        return RValue_makeUndefined();
++    }
++    arrput(reader->arrays, array);
++    uint32_t outer = readerU32(reader);
++    if (!countOkay(reader, outer)) return RValue_makeArray(array);
++    if (array->type == GML_LEGACY_ARRAY) {
++        repeat(outer, rowIndex) {
++            uint32_t length = readerU32(reader);
++            if (!countOkay(reader, length) ||
++                rowIndex > (uint32_t)INT32_MAX / GML_LEGACY_ARRAY_STRIDE ||
++                length > GML_LEGACY_ARRAY_STRIDE) {
++                reader->error = EBADMSG;
++                break;
++            }
++            if (length > 0)
++                GMLArray_growTo(array, (int32_t)rowIndex * GML_LEGACY_ARRAY_STRIDE +
++                                       (int32_t)length);
++            repeat(length, itemIndex) {
++                RValue value = readRValue(reader, runner, depth + 1);
++                if (reader->error) {
++                    RValue_free(&value);
++                    break;
++                }
++                RValue* slot = &array->legacy.rows[rowIndex].data[itemIndex];
++                RValue_free(slot);
++                *slot = value;
++            }
++            if (reader->error) break;
++        }
++    } else {
++        if (outer > 0) GMLArray_growTo(array, (int32_t)outer);
++        repeat(outer, itemIndex) {
++            RValue value = readRValue(reader, runner, depth + 1);
++            if (reader->error) {
++                RValue_free(&value);
++                break;
++            }
++            RValue* slot = &array->modern.data[itemIndex];
++            RValue_free(slot);
++            *slot = value;
++        }
++    }
++    return RValue_makeArray(array);
++}
++
++static bool writeRValue(FastWriter* writer, RValue value, uint32_t depth) {
++    if (!writerU8(writer, value.type) || !writerU8(writer, value.gmlStackType) ||
++        !writerU8(writer, value.assetRefType)) return false;
++    switch (value.type) {
++    case RVALUE_UNDEFINED: return true;
++    case RVALUE_STRING: return writeString(writer, value.string);
++    case RVALUE_INT32:
++    case RVALUE_BOOL:
++    case RVALUE_ASSETREF: return writerI32(writer, value.int32);
++#ifndef NO_RVALUE_INT64
++    case RVALUE_INT64: return writerBytes(writer, &value.int64, sizeof(value.int64));
++#endif
++    case RVALUE_REAL: return writerBytes(writer, &value.real, sizeof(value.real));
++    case RVALUE_ARRAY: return writeArray(writer, value.array, depth);
++    case RVALUE_METHOD:
++    case RVALUE_STRUCT:
++    default:
++        writer->error = ENOTSUP;
++        return false;
++    }
++}
++
++static RValue readRValue(FastReader* reader, Runner* runner, uint32_t depth) {
++    uint8_t type = readerU8(reader);
++    uint8_t stackType = readerU8(reader);
++    uint8_t assetType = readerU8(reader);
++    RValue value = RValue_makeUndefined();
++    if (reader->error) return value;
++    switch (type) {
++    case RVALUE_UNDEFINED: break;
++    case RVALUE_STRING: {
++        char* string = readString(reader);
++        if (!reader->error) value = RValue_makeOwnedString(string);
++        else free(string);
++        break;
++    }
++    case RVALUE_INT32: value = RValue_makeInt32(readerI32(reader)); break;
++    case RVALUE_BOOL: value = RValue_makeBool(readerI32(reader) != 0); break;
++    case RVALUE_ASSETREF:
++        value = RValue_makeInt32(readerI32(reader));
++        value.type = RVALUE_ASSETREF;
++        value.assetRefType = assetType;
++        break;
++#ifndef NO_RVALUE_INT64
++    case RVALUE_INT64:
++        value = RValue_makeInt64(0);
++        readerBytes(reader, &value.int64, sizeof(value.int64));
++        break;
++#endif
++    case RVALUE_REAL:
++        value = RValue_makeReal(0);
++        readerBytes(reader, &value.real, sizeof(value.real));
++        break;
++    case RVALUE_ARRAY: value = readArray(reader, runner, depth); break;
++    default: reader->error = ENOTSUP; break;
++    }
++    value.gmlStackType = stackType;
++    return value;
++}
++
++static bool writeVarMap(FastWriter* writer, const IntRValueHashMap* map) {
++    uint32_t count = map->count;
++    if (!writerU32(writer, count)) return false;
++    repeat(count, i) {
++        uint32_t index = map->occupiedIndices[i];
++        const IntRValueEntry* entry = &map->entries[index];
++        if (!writerI32(writer, entry->key) ||
++            !writeRValue(writer, entry->value, 0)) return false;
++    }
++    return true;
++}
++
++static bool readVarMap(FastReader* reader, Runner* runner, Instance* instance) {
++    uint32_t count = readerU32(reader);
++    if (!countOkay(reader, count)) return false;
++    repeat(count, i) {
++        int32_t key = readerI32(reader);
++        RValue value = readRValue(reader, runner, 0);
++        if (reader->error) {
++            RValue_free(&value);
++            return false;
++        }
++        Instance_setSelfVar(instance, key, value);
++        RValue_free(&value);
++    }
++    return !reader->error;
++}
++
++static FastInstanceFields captureInstance(const Instance* instance) {
++    FastInstanceFields fields = {0};
++    fields.instanceId = instance->instanceId;
++    fields.objectIndex = instance->objectIndex;
++    fields.x = instance->x; fields.y = instance->y;
++    fields.xprevious = instance->xprevious; fields.yprevious = instance->yprevious;
++    fields.xstart = instance->xstart; fields.ystart = instance->ystart;
++    fields.persistent = instance->persistent; fields.solid = instance->solid;
++    fields.active = instance->active; fields.destroyed = instance->destroyed;
++    fields.visible = instance->visible; fields.createEventFired = instance->createEventFired;
++    fields.outsideRoom = instance->outsideRoom; fields.mouseOver = instance->mouseOver;
++    fields.activeAlarmMask = instance->activeAlarmMask; fields.maskIndex = instance->maskIndex;
++    fields.spriteIndex = instance->spriteIndex; fields.imageSpeed = instance->imageSpeed;
++    fields.imageIndex = instance->imageIndex; fields.imageXscale = instance->imageXscale;
++    fields.imageYscale = instance->imageYscale; fields.imageAngle = instance->imageAngle;
++    fields.imageAlpha = instance->imageAlpha; fields.imageBlend = instance->imageBlend;
++    fields.depth = instance->depth; fields.layer = instance->layer;
++    fields.speed = instance->speed; fields.direction = instance->direction;
++    fields.hspeed = instance->hspeed; fields.vspeed = instance->vspeed;
++    fields.friction = instance->friction; fields.gravity = instance->gravity;
++    fields.gravityDirection = instance->gravityDirection;
++    fields.pathIndex = instance->pathIndex; fields.pathPosition = instance->pathPosition;
++    fields.pathPositionPrevious = instance->pathPositionPrevious;
++    fields.pathSpeed = instance->pathSpeed; fields.pathScale = instance->pathScale;
++    fields.pathOrientation = instance->pathOrientation;
++    fields.pathEndAction = instance->pathEndAction;
++    fields.pathXStart = instance->pathXStart; fields.pathYStart = instance->pathYStart;
++    memcpy(fields.alarm, instance->alarm, sizeof(fields.alarm));
++    fields.timelineIndex = instance->timelineIndex;
++    fields.timelinePosition = instance->timelinePosition;
++    fields.timelineSpeed = instance->timelineSpeed;
++    fields.timelineLoop = instance->timelineLoop;
++    fields.timelineRunning = instance->timelineRunning;
++    return fields;
++}
++
++static void restoreInstance(Instance* instance, const FastInstanceFields* fields) {
++    uint32_t id = instance->instanceId;
++    int32_t object = instance->objectIndex;
++    IntRValueHashMap vars = instance->selfVars;
++    *instance = (Instance){0};
++    instance->instanceId = id;
++    instance->objectIndex = object;
++    instance->selfVars = vars;
++    instance->x = fields->x; instance->y = fields->y;
++    instance->xprevious = fields->xprevious; instance->yprevious = fields->yprevious;
++    instance->xstart = fields->xstart; instance->ystart = fields->ystart;
++    instance->persistent = fields->persistent; instance->solid = fields->solid;
++    instance->active = fields->active; instance->destroyed = fields->destroyed;
++    instance->visible = fields->visible; instance->createEventFired = fields->createEventFired;
++    instance->outsideRoom = fields->outsideRoom; instance->mouseOver = fields->mouseOver;
++    instance->activeAlarmMask = fields->activeAlarmMask; instance->maskIndex = fields->maskIndex;
++    instance->spriteIndex = fields->spriteIndex; instance->imageSpeed = fields->imageSpeed;
++    instance->imageIndex = fields->imageIndex; instance->imageXscale = fields->imageXscale;
++    instance->imageYscale = fields->imageYscale; instance->imageAngle = fields->imageAngle;
++    instance->imageAlpha = fields->imageAlpha; instance->imageBlend = fields->imageBlend;
++    instance->depth = fields->depth; instance->layer = fields->layer;
++    instance->speed = fields->speed; instance->direction = fields->direction;
++    instance->hspeed = fields->hspeed; instance->vspeed = fields->vspeed;
++    instance->friction = fields->friction; instance->gravity = fields->gravity;
++    instance->gravityDirection = fields->gravityDirection;
++    instance->pathIndex = fields->pathIndex; instance->pathPosition = fields->pathPosition;
++    instance->pathPositionPrevious = fields->pathPositionPrevious;
++    instance->pathSpeed = fields->pathSpeed; instance->pathScale = fields->pathScale;
++    instance->pathOrientation = fields->pathOrientation;
++    instance->pathEndAction = fields->pathEndAction;
++    instance->pathXStart = fields->pathXStart; instance->pathYStart = fields->pathYStart;
++    memcpy(instance->alarm, fields->alarm, sizeof(instance->alarm));
++    instance->timelineIndex = fields->timelineIndex;
++    instance->timelinePosition = fields->timelinePosition;
++    instance->timelineSpeed = fields->timelineSpeed;
++    instance->timelineLoop = fields->timelineLoop;
++    instance->timelineRunning = fields->timelineRunning;
++}
++
++static bool writeInstance(FastWriter* writer, const Instance* instance) {
++    FastInstanceFields fields = captureInstance(instance);
++    return writerBytes(writer, &fields, sizeof(fields)) &&
++           writeVarMap(writer, &instance->selfVars);
++}
++
++static Instance* readInstance(FastReader* reader, Runner* runner, bool currentRoom) {
++    FastInstanceFields fields = {0};
++    if (!readerBytes(reader, &fields, sizeof(fields)) ||
++        fields.objectIndex < 0 ||
++        (uint32_t)fields.objectIndex >= runner->dataWin->objt.count) {
++        reader->error = EBADMSG;
++        return nullptr;
++    }
++    Instance* instance = Runner_createFastStateInstance(
++        runner, fields.instanceId, fields.objectIndex, currentRoom);
++    if (instance == nullptr) {
++        reader->error = EBADMSG;
++        return nullptr;
++    }
++    restoreInstance(instance, &fields);
++    if (!readVarMap(reader, runner, instance)) return nullptr;
++    return instance;
++}
++
++static bool writeTileMap(FastWriter* writer, TileLayerMapEntry* map) {
++    uint32_t count = (uint32_t)hmlen(map);
++    if (!writerU32(writer, count)) return false;
++    repeat(count, i) {
++        if (!writerBytes(writer, &map[i], sizeof(map[i]))) return false;
++    }
++    return true;
++}
++
++static bool readTileMap(FastReader* reader, TileLayerMapEntry** map) {
++    uint32_t count = readerU32(reader);
++    if (!countOkay(reader, count)) return false;
++    repeat(count, i) {
++        TileLayerMapEntry entry = {0};
++        if (!readerBytes(reader, &entry, sizeof(entry))) return false;
++        hmput(*map, entry.key, entry.value);
++    }
++    return true;
++}
++
++static bool writeInstances(FastWriter* writer, Instance** instances) {
++    uint32_t count = (uint32_t)arrlen(instances);
++    if (!writerU32(writer, count)) return false;
++    repeat(count, i) if (!writeInstance(writer, instances[i])) return false;
++    return true;
++}
++
++static bool readInstances(FastReader* reader, Runner* runner,
++                          Instance*** destination, bool currentRoom) {
++    uint32_t count = readerU32(reader);
++    if (!countOkay(reader, count)) return false;
++    repeat(count, i) {
++        Instance* instance = readInstance(reader, runner, currentRoom);
++        if (instance == nullptr) return false;
++        if (!currentRoom) arrput(*destination, instance);
++    }
++    return true;
++}
++
++static bool writeRoomVisual(FastWriter* writer, const RuntimeBackground* backgrounds,
++                            uint32_t backgroundColor, bool drawBackgroundColor,
++                            TileLayerMapEntry* tileMap, const RoomTile* tiles,
++                            uint32_t tileCount, const RuntimeView* views,
++                            bool viewsEnabled, const GMLCamera* cameras) {
++    return writerBytes(writer, backgrounds, sizeof(RuntimeBackground) * 8u) &&
++           writerU32(writer, backgroundColor) && writerU8(writer, drawBackgroundColor) &&
++           writeTileMap(writer, tileMap) && writerU32(writer, tileCount) &&
++           writerBytes(writer, tiles, sizeof(RoomTile) * tileCount) &&
++           writerBytes(writer, views, sizeof(RuntimeView) * MAX_VIEWS) &&
++           writerU8(writer, viewsEnabled) &&
++           writerBytes(writer, cameras, sizeof(GMLCamera) * MAX_DEFAULT_ROOM_CAMERAS);
++}
++
++static bool readRoomVisual(FastReader* reader, RuntimeBackground* backgrounds,
++                           uint32_t* backgroundColor, bool* drawBackgroundColor,
++                           TileLayerMapEntry** tileMap, RoomTile** tiles,
++                           uint32_t* tileCount, RuntimeView* views,
++                           bool* viewsEnabled, GMLCamera* cameras) {
++    if (!readerBytes(reader, backgrounds, sizeof(RuntimeBackground) * 8u)) return false;
++    *backgroundColor = readerU32(reader);
++    *drawBackgroundColor = readerU8(reader) != 0;
++    if (!readTileMap(reader, tileMap)) return false;
++    *tileCount = readerU32(reader);
++    if (!countOkay(reader, *tileCount)) return false;
++    if (*tileCount > 0) {
++        *tiles = (RoomTile*)malloc(sizeof(RoomTile) * *tileCount);
++        if (*tiles == nullptr) { reader->error = ENOMEM; return false; }
++        if (!readerBytes(reader, *tiles, sizeof(RoomTile) * *tileCount)) return false;
++    }
++    return readerBytes(reader, views, sizeof(RuntimeView) * MAX_VIEWS) &&
++           ((*viewsEnabled = readerU8(reader) != 0), !reader->error) &&
++           readerBytes(reader, cameras, sizeof(GMLCamera) * MAX_DEFAULT_ROOM_CAMERAS);
++}
++
++static FastRunnerFields captureRunnerFields(Runner* runner) {
++    FastRunnerFields fields = {0};
++    fields.frameCount = runner->frameCount;
++    fields.nextInstanceId = runner->nextInstanceId;
++    fields.gameStartFired = runner->gameStartFired;
++    fields.viewCurrent = runner->viewCurrent;
++    fields.viewsEnabled = runner->viewsEnabled;
++    fields.backgroundColor = runner->backgroundColor;
++    fields.drawBackgroundColor = runner->drawBackgroundColor;
++    fields.appSurfaceEnabled = runner->appSurfaceEnabled;
++    fields.appSurfaceAutoDraw = runner->appSurfaceAutoDraw;
++    fields.usingAppSurface = runner->usingAppSurface;
++    fields.applicationWidth = runner->applicationWidth;
++    fields.applicationHeight = runner->applicationHeight;
++    fields.oldApplicationWidth = runner->oldApplicationWidth;
++    fields.oldApplicationHeight = runner->oldApplicationHeight;
++    fields.widescreenExtraWidth = runner->widescreenExtraWidth;
++    fields.widescreenExtraHeight = runner->widescreenExtraHeight;
++    fields.displayScaleX = runner->displayScaleX;
++    fields.displayScaleY = runner->displayScaleY;
++    fields.applicationSurfaceId = runner->applicationSurfaceId;
++    fields.nextLayerId = runner->nextLayerId;
++    fields.deltaTime = runner->deltaTime;
++    fields.score = runner->score; fields.lives = runner->lives; fields.health = runner->health;
++    fields.guiWidth = runner->guiWidth; fields.guiHeight = runner->guiHeight;
++    fields.mpPotMaxrot = runner->mpPotMaxrot; fields.mpPotStep = runner->mpPotStep;
++    fields.mpPotAhead = runner->mpPotAhead; fields.mpPotOnSpot = runner->mpPotOnSpot;
++    fields.lastMusicInstance = runner->lastMusicInstance;
++    fields.nextCallLaterId = runner->nextCallLaterId;
++    fields.asyncLoadMapId = runner->asyncLoadMapId;
++    fields.asyncBufferNextRequestId = runner->asyncBufferNextRequestId;
++    fields.dialogAsyncIdCounter = runner->dialogAsyncIdCounter;
++    fields.xboxAccountPickerPendingId = runner->xboxAccountPickerPendingId;
++    fields.xboxAccountPickerPadIndex = runner->xboxAccountPickerPadIndex;
++    fields.xboxAsyncIdCounter = runner->xboxAsyncIdCounter;
++    fields.currentCursor = runner->currentCursor;
++    uint64_t now = nowNanos();
++    fields.gameElapsedNanos = now >= runner->gameStartTime ? now - runner->gameStartTime : 0;
++    fields.random = runner->random;
++    memcpy(fields.surfaceStack, runner->surfaceStack, sizeof(fields.surfaceStack));
++    return fields;
++}
++
++static void restoreRunnerFields(Runner* runner, const FastRunnerFields* fields) {
++    runner->frameCount = fields->frameCount;
++    runner->nextInstanceId = fields->nextInstanceId;
++    runner->gameStartFired = fields->gameStartFired;
++    runner->viewCurrent = fields->viewCurrent;
++    runner->viewsEnabled = fields->viewsEnabled;
++    runner->backgroundColor = fields->backgroundColor;
++    runner->drawBackgroundColor = fields->drawBackgroundColor;
++    runner->appSurfaceEnabled = fields->appSurfaceEnabled;
++    runner->appSurfaceAutoDraw = fields->appSurfaceAutoDraw;
++    runner->usingAppSurface = fields->usingAppSurface;
++    runner->applicationWidth = fields->applicationWidth;
++    runner->applicationHeight = fields->applicationHeight;
++    runner->oldApplicationWidth = fields->oldApplicationWidth;
++    runner->oldApplicationHeight = fields->oldApplicationHeight;
++    runner->widescreenExtraWidth = fields->widescreenExtraWidth;
++    runner->widescreenExtraHeight = fields->widescreenExtraHeight;
++    runner->displayScaleX = fields->displayScaleX;
++    runner->displayScaleY = fields->displayScaleY;
++    runner->applicationSurfaceId = fields->applicationSurfaceId;
++    runner->nextLayerId = fields->nextLayerId;
++    runner->deltaTime = fields->deltaTime;
++    runner->score = fields->score; runner->lives = fields->lives; runner->health = fields->health;
++    runner->guiWidth = fields->guiWidth; runner->guiHeight = fields->guiHeight;
++    runner->mpPotMaxrot = fields->mpPotMaxrot; runner->mpPotStep = fields->mpPotStep;
++    runner->mpPotAhead = fields->mpPotAhead; runner->mpPotOnSpot = fields->mpPotOnSpot;
++    runner->lastMusicInstance = fields->lastMusicInstance;
++    runner->nextCallLaterId = fields->nextCallLaterId;
++    runner->asyncLoadMapId = fields->asyncLoadMapId;
++    runner->asyncBufferNextRequestId = fields->asyncBufferNextRequestId;
++    runner->dialogAsyncIdCounter = fields->dialogAsyncIdCounter;
++    runner->xboxAccountPickerPendingId = fields->xboxAccountPickerPendingId;
++    runner->xboxAccountPickerPadIndex = fields->xboxAccountPickerPadIndex;
++    runner->xboxAsyncIdCounter = fields->xboxAsyncIdCounter;
++    runner->currentCursor = fields->currentCursor;
++    uint64_t now = nowNanos();
++    runner->gameStartTime = now >= fields->gameElapsedNanos ?
++                            now - fields->gameElapsedNanos : 0;
++    runner->random = fields->random;
++    memcpy(runner->surfaceStack, fields->surfaceStack, sizeof(runner->surfaceStack));
++}
++
++static bool writeRValueArray(FastWriter* writer, RValue* values, uint32_t count) {
++    if (!writerU32(writer, count)) return false;
++    repeat(count, i) if (!writeRValue(writer, values[i], 0)) return false;
++    return true;
++}
++
++static bool readRValueArray(FastReader* reader, Runner* runner, RValue** values) {
++    uint32_t count = readerU32(reader);
++    if (!countOkay(reader, count)) return false;
++    repeat(count, i) {
++        RValue value = readRValue(reader, runner, 0);
++        if (reader->error) { RValue_free(&value); return false; }
++        arrput(*values, value);
++    }
++    return true;
++}
++
++static bool writeDataStructures(FastWriter* writer, Runner* runner) {
++    uint32_t count = (uint32_t)arrlen(runner->dsMapPool);
++    if (!writerU32(writer, count)) return false;
++    repeat(count, i) {
++        DsMapEntry* map = runner->dsMapPool[i];
++        uint8_t present = map != nullptr;
++        if (!writerU8(writer, present)) return false;
++        if (!present) continue;
++        uint32_t entries = (uint32_t)shlen(map);
++        if (!writerU32(writer, entries)) return false;
++        repeat(entries, j) {
++            if (!writeString(writer, map[j].key) ||
++                !writeRValue(writer, map[j].value, 0)) return false;
++        }
++    }
++#define WRITE_SIMPLE_POOL(poolName) do { \
++    count = (uint32_t)arrlen(runner->poolName); \
++    if (!writerU32(writer, count)) return false; \
++    repeat(count, i) { \
++        if (!writerU8(writer, runner->poolName[i].freed) || \
++            !writeRValueArray(writer, runner->poolName[i].items, \
++                              (uint32_t)arrlen(runner->poolName[i].items))) return false; \
++    } \
++} while (0)
++    WRITE_SIMPLE_POOL(dsListPool);
++    WRITE_SIMPLE_POOL(dsQueuePool);
++    WRITE_SIMPLE_POOL(dsStackPool);
++#undef WRITE_SIMPLE_POOL
++    count = (uint32_t)arrlen(runner->dsPriorityPool);
++    if (!writerU32(writer, count)) return false;
++    repeat(count, i) {
++        DsPriority* priority = &runner->dsPriorityPool[i];
++        uint32_t items = (uint32_t)arrlen(priority->items);
++        if (!writerU8(writer, priority->freed) || !writerU32(writer, items)) return false;
++        repeat(items, j) {
++            if (!writerBytes(writer, &priority->items[j].depth, sizeof(GMLReal)) ||
++                !writeRValue(writer, priority->items[j].item, 0)) return false;
++        }
++    }
++    count = (uint32_t)arrlen(runner->dsGridPool);
++    if (!writerU32(writer, count)) return false;
++    repeat(count, i) {
++        DsGrid* grid = &runner->dsGridPool[i];
++        uint64_t items = (uint64_t)(uint32_t)grid->width * (uint64_t)(uint32_t)grid->height;
++        if (items > FAST_STATE_MAX_COUNT || !writerU8(writer, grid->freed) ||
++            !writerI32(writer, grid->width) || !writerI32(writer, grid->height)) {
++            if (!writer->error) writer->error = EFBIG;
++            return false;
++        }
++        repeat((uint32_t)items, j)
++            if (!writeRValue(writer, grid->items[j], 0)) return false;
++    }
++    return true;
++}
++
++static bool readDataStructures(FastReader* reader, Runner* runner) {
++    uint32_t count = readerU32(reader);
++    if (!countOkay(reader, count)) return false;
++    arrsetlen(runner->dsMapPool, count);
++    memset(runner->dsMapPool, 0, sizeof(*runner->dsMapPool) * count);
++    repeat(count, i) {
++        if (!readerU8(reader)) continue;
++        uint32_t entries = readerU32(reader);
++        if (!countOkay(reader, entries)) return false;
++        repeat(entries, j) {
++            char* key = readString(reader);
++            RValue value = readRValue(reader, runner, 0);
++            if (reader->error) { free(key); RValue_free(&value); return false; }
++            shput(runner->dsMapPool[i], key, value);
++        }
++    }
++#define READ_SIMPLE_POOL(poolName, poolType) do { \
++    count = readerU32(reader); \
++    if (!countOkay(reader, count)) return false; \
++    arrsetlen(runner->poolName, count); \
++    memset(runner->poolName, 0, sizeof(poolType) * count); \
++    repeat(count, i) { \
++        runner->poolName[i].freed = readerU8(reader) != 0; \
++        if (!readRValueArray(reader, runner, &runner->poolName[i].items)) return false; \
++    } \
++} while (0)
++    READ_SIMPLE_POOL(dsListPool, DsList);
++    READ_SIMPLE_POOL(dsQueuePool, DsQueue);
++    READ_SIMPLE_POOL(dsStackPool, DsStack);
++#undef READ_SIMPLE_POOL
++    count = readerU32(reader);
++    if (!countOkay(reader, count)) return false;
++    arrsetlen(runner->dsPriorityPool, count);
++    memset(runner->dsPriorityPool, 0, sizeof(DsPriority) * count);
++    repeat(count, i) {
++        DsPriority* priority = &runner->dsPriorityPool[i];
++        priority->freed = readerU8(reader) != 0;
++        uint32_t items = readerU32(reader);
++        if (!countOkay(reader, items)) return false;
++        repeat(items, j) {
++            DsPriorityItem item = {0};
++            readerBytes(reader, &item.depth, sizeof(GMLReal));
++            item.item = readRValue(reader, runner, 0);
++            if (reader->error) { RValue_free(&item.item); return false; }
++            arrput(priority->items, item);
++        }
++    }
++    count = readerU32(reader);
++    if (!countOkay(reader, count)) return false;
++    arrsetlen(runner->dsGridPool, count);
++    memset(runner->dsGridPool, 0, sizeof(DsGrid) * count);
++    repeat(count, i) {
++        DsGrid* grid = &runner->dsGridPool[i];
++        grid->freed = readerU8(reader) != 0;
++        grid->width = readerI32(reader); grid->height = readerI32(reader);
++        uint64_t items = (uint64_t)(uint32_t)grid->width * (uint64_t)(uint32_t)grid->height;
++        if (grid->width < 0 || grid->height < 0 || items > FAST_STATE_MAX_COUNT) {
++            reader->error = EBADMSG; return false;
++        }
++        grid->items = items ? (RValue*)calloc((size_t)items, sizeof(RValue)) : nullptr;
++        if (items && grid->items == nullptr) { reader->error = ENOMEM; return false; }
++        repeat((uint32_t)items, j) {
++            grid->items[j] = readRValue(reader, runner, 0);
++            if (reader->error) return false;
++        }
++    }
++    return true;
++}
++
++static bool writeAuxiliaryPools(FastWriter* writer, Runner* runner) {
++    uint32_t count = (uint32_t)arrlen(runner->gmlBufferPool);
++    if (!writerU32(writer, count)) return false;
++    repeat(count, i) {
++        GmlBuffer* buffer = &runner->gmlBufferPool[i];
++        if (!writerBytes(writer, &buffer->size, sizeof(int32_t) * 5u) ||
++            !writerU8(writer, buffer->isValid) ||
++            (buffer->isValid && !writerBytes(writer, buffer->data, (size_t)buffer->size)))
++            return false;
++    }
++    count = (uint32_t)arrlen(runner->mpGridPool);
++    if (!writerU32(writer, count)) return false;
++    repeat(count, i) {
++        MpGrid copy = runner->mpGridPool[i];
++        copy.cells = nullptr;
++        uint64_t cells = (uint64_t)(uint32_t)copy.hcells * (uint64_t)(uint32_t)copy.vcells;
++        if (cells > FAST_STATE_MAX_COUNT || !writerBytes(writer, &copy, sizeof(copy)) ||
++            (copy.inUse && !writerBytes(writer, runner->mpGridPool[i].cells, (size_t)cells))) {
++            if (!writer->error) writer->error = EFBIG;
++            return false;
++        }
++    }
++    count = (uint32_t)arrlen(runner->particleTypePool);
++    if (!writerU32(writer, count) ||
++        !writerBytes(writer, runner->particleTypePool, sizeof(ParticleType) * count)) return false;
++    count = (uint32_t)arrlen(runner->particleSystemPool);
++    if (!writerU32(writer, count)) return false;
++    repeat(count, i) {
++        ParticleSystem copy = runner->particleSystemPool[i];
++        copy.particles = nullptr; copy.emitters = nullptr;
++        uint32_t particles = (uint32_t)arrlen(runner->particleSystemPool[i].particles);
++        uint32_t emitters = (uint32_t)arrlen(runner->particleSystemPool[i].emitters);
++        if (!writerBytes(writer, &copy, sizeof(copy)) || !writerU32(writer, particles) ||
++            !writerBytes(writer, runner->particleSystemPool[i].particles,
++                         sizeof(Particle) * particles) || !writerU32(writer, emitters) ||
++            !writerBytes(writer, runner->particleSystemPool[i].emitters,
++                         sizeof(ParticleEmitter) * emitters)) return false;
++    }
++    count = (uint32_t)arrlen(runner->callLaterEntries);
++    if (!writerU32(writer, count)) return false;
++    repeat(count, i) {
++        CallLaterEntry copy = runner->callLaterEntries[i];
++        copy.callback = RValue_makeUndefined();
++        if (!writerBytes(writer, &copy, sizeof(copy)) ||
++            !writeRValue(writer, runner->callLaterEntries[i].callback, 0)) return false;
++    }
++    return true;
++}
++
++static bool readAuxiliaryPools(FastReader* reader, Runner* runner) {
++    uint32_t count = readerU32(reader);
++    if (!countOkay(reader, count)) return false;
++    arrsetlen(runner->gmlBufferPool, count);
++    memset(runner->gmlBufferPool, 0, sizeof(GmlBuffer) * count);
++    repeat(count, i) {
++        GmlBuffer* buffer = &runner->gmlBufferPool[i];
++        if (!readerBytes(reader, &buffer->size, sizeof(int32_t) * 5u)) return false;
++        buffer->isValid = readerU8(reader) != 0;
++        if (buffer->size < 0 || (uint32_t)buffer->size > FAST_STATE_MAX_BYTES) {
++            reader->error = EBADMSG; return false;
++        }
++        if (buffer->isValid && buffer->size > 0) {
++            buffer->data = (uint8_t*)malloc((size_t)buffer->size);
++            if (buffer->data == nullptr) { reader->error = ENOMEM; return false; }
++            if (!readerBytes(reader, buffer->data, (size_t)buffer->size)) return false;
++        }
++    }
++    count = readerU32(reader);
++    if (!countOkay(reader, count)) return false;
++    arrsetlen(runner->mpGridPool, count);
++    memset(runner->mpGridPool, 0, sizeof(MpGrid) * count);
++    repeat(count, i) {
++        MpGrid* grid = &runner->mpGridPool[i];
++        if (!readerBytes(reader, grid, sizeof(*grid))) return false;
++        grid->cells = nullptr;
++        uint64_t cells = (uint64_t)(uint32_t)grid->hcells * (uint64_t)(uint32_t)grid->vcells;
++        if (grid->hcells < 0 || grid->vcells < 0 || cells > FAST_STATE_MAX_COUNT) {
++            reader->error = EBADMSG; return false;
++        }
++        if (grid->inUse && cells) {
++            grid->cells = (uint8_t*)malloc((size_t)cells);
++            if (grid->cells == nullptr) { reader->error = ENOMEM; return false; }
++            if (!readerBytes(reader, grid->cells, (size_t)cells)) return false;
++        }
++    }
++    count = readerU32(reader);
++    if (!countOkay(reader, count)) return false;
++    arrsetlen(runner->particleTypePool, count);
++    if (!readerBytes(reader, runner->particleTypePool, sizeof(ParticleType) * count)) return false;
++    count = readerU32(reader);
++    if (!countOkay(reader, count)) return false;
++    arrsetlen(runner->particleSystemPool, count);
++    memset(runner->particleSystemPool, 0, sizeof(ParticleSystem) * count);
++    repeat(count, i) {
++        ParticleSystem* system = &runner->particleSystemPool[i];
++        if (!readerBytes(reader, system, sizeof(*system))) return false;
++        system->particles = nullptr; system->emitters = nullptr;
++        uint32_t particles = readerU32(reader);
++        if (!countOkay(reader, particles)) return false;
++        arrsetlen(system->particles, particles);
++        if (!readerBytes(reader, system->particles, sizeof(Particle) * particles)) return false;
++        uint32_t emitters = readerU32(reader);
++        if (!countOkay(reader, emitters)) return false;
++        arrsetlen(system->emitters, emitters);
++        if (!readerBytes(reader, system->emitters, sizeof(ParticleEmitter) * emitters)) return false;
++    }
++    count = readerU32(reader);
++    if (!countOkay(reader, count)) return false;
++    repeat(count, i) {
++        CallLaterEntry entry = {0};
++        if (!readerBytes(reader, &entry, sizeof(entry))) return false;
++        entry.callback = readRValue(reader, runner, 0);
++        if (reader->error) { RValue_free(&entry.callback); return false; }
++        arrput(runner->callLaterEntries, entry);
++    }
++    return true;
++}
++
++static bool writeSurfaces(FastWriter* writer, Runner* runner) {
++    SWRenderer* sw = (SWRenderer*)runner->renderer;
++    if (!writerU32(writer, sw->surfaceCount) || !writerI32(writer, sw->currentSurface))
++        return false;
++    repeat(sw->surfaceCount, id) {
++        bool exists = sw->surfaceExistsFlags[id];
++        if (!writerU8(writer, exists)) return false;
++        if (!exists) continue;
++        int32_t width = sw->surfaceWidths[id], height = sw->surfaceHeights[id];
++        uint64_t bytes = (uint64_t)(uint32_t)width * (uint64_t)(uint32_t)height * 4u;
++        if (width <= 0 || height <= 0 || bytes > FAST_STATE_MAX_BYTES ||
++            !writerI32(writer, width) || !writerI32(writer, height) ||
++            !writerU32(writer, sw->surfaceRevisions[id]) ||
++            !writerBytes(writer, sw->surfacePixels[id], (size_t)bytes)) {
++            if (!writer->error) writer->error = EFBIG;
++            return false;
++        }
++    }
++    return true;
++}
++
++static bool readSurfaces(FastReader* reader, Runner* runner) {
++    uint32_t count = readerU32(reader);
++    int32_t current = readerI32(reader);
++    if (!countOkay(reader, count) || count > 4096) return false;
++    SWRenderer_fastStateResetSurfaces(runner->renderer);
++    repeat(count, id) {
++        if (!readerU8(reader)) continue;
++        int32_t width = readerI32(reader), height = readerI32(reader);
++        uint32_t revision = readerU32(reader);
++        uint64_t bytes = (uint64_t)(uint32_t)width * (uint64_t)(uint32_t)height * 4u;
++        if (width <= 0 || height <= 0 || bytes > FAST_STATE_MAX_BYTES ||
++            bytes > reader->size - reader->offset) {
++            reader->error = EBADMSG; return false;
++        }
++        if (!SWRenderer_fastStateRestoreSurface(runner->renderer, id, width, height,
++                                                revision, reader->data + reader->offset)) {
++            reader->error = ENOMEM; return false;
++        }
++        reader->offset += (size_t)bytes;
++    }
++    SWRenderer* sw = (SWRenderer*)runner->renderer;
++    if (current != -1 &&
++        (current <= 0 || (uint32_t)current >= sw->surfaceCount ||
++         !sw->surfaceExistsFlags[current])) {
++        reader->error = EBADMSG;
++        return false;
++    }
++    sw->currentSurface = current;
++    return true;
++}
++
++static bool writeAudio(FastWriter* writer, Runner* runner) {
++    MaAudioSystem* audio = (MaAudioSystem*)runner->audioSystem;
++    if (!audio->checkpointValid) { writer->error = EIO; return false; }
++    if (!writerI32(writer, audio->nextInstanceCounter) ||
++        !writerBytes(writer, audio->listenerGains, sizeof(audio->listenerGains)) ||
++        !writerBytes(writer, audio->checkpoint, sizeof(audio->checkpoint))) return false;
++    repeat(MAX_AUDIO_STREAMS, i) {
++        AudioStreamEntry* stream = &audio->streams[i];
++        if (!writerU8(writer, stream->active)) return false;
++        if (!stream->active) continue;
++        if (!writerBytes(writer, &stream->initialGain, sizeof(float)) ||
++            !writerBytes(writer, &stream->initialPitch, sizeof(float)) ||
++            !writeString(writer, stream->filePath)) return false;
++    }
++    return true;
++}
++
++static bool readAudio(FastReader* reader, Runner* runner) {
++    MaAudioSystem* audio = (MaAudioSystem*)runner->audioSystem;
++    audio->nextInstanceCounter = readerI32(reader);
++    if (!readerBytes(reader, audio->listenerGains, sizeof(audio->listenerGains)) ||
++        !readerBytes(reader, audio->checkpoint, sizeof(audio->checkpoint))) return false;
++    repeat(MAX_AUDIO_STREAMS, i) {
++        free(audio->streams[i].filePath);
++        memset(&audio->streams[i], 0, sizeof(audio->streams[i]));
++        audio->streams[i].active = readerU8(reader) != 0;
++        if (!audio->streams[i].active) continue;
++        if (!readerBytes(reader, &audio->streams[i].initialGain, sizeof(float)) ||
++            !readerBytes(reader, &audio->streams[i].initialPitch, sizeof(float))) return false;
++        audio->streams[i].filePath = readString(reader);
++        if (reader->error) return false;
++    }
++    audio->checkpointValid = true;
++    return true;
++}
++
++static bool writeOpenTextFiles(FastWriter* writer, Runner* runner) {
++    repeat(MAX_OPEN_TEXT_FILES, i) {
++        OpenTextFile* file = &runner->openTextFiles[i];
++        if (!writerU8(writer, file->isOpen)) return false;
++        if (!file->isOpen) continue;
++        if (!writerU8(writer, file->isWriteMode) ||
++            !writerI32(writer, file->readPos) ||
++            !writeString(writer, file->content) ||
++            !writeString(writer, file->writeBuffer) ||
++            !writeString(writer, file->filePath)) return false;
++    }
++    return true;
++}
++
++static bool readOpenTextFiles(FastReader* reader, Runner* runner) {
++    repeat(MAX_OPEN_TEXT_FILES, i) {
++        OpenTextFile* file = &runner->openTextFiles[i];
++        bool isOpen = readerU8(reader) != 0;
++        if (reader->error) return false;
++        if (!isOpen) continue;
++
++        file->isWriteMode = readerU8(reader) != 0;
++        file->readPos = readerI32(reader);
++        file->content = readString(reader);
++        file->writeBuffer = readString(reader);
++        file->filePath = readString(reader);
++        if (reader->error) return false;
++        file->contentLen = (int32_t)strlen(file->content);
++        if (file->readPos < 0 || file->readPos > file->contentLen) {
++            reader->error = EBADMSG;
++            return false;
++        }
++        file->isOpen = true;
++    }
++    return true;
++}
++
++static bool writeFileFindState(FastWriter* writer, Runner* runner) {
++    uint32_t count = (uint32_t)arrlen(runner->fileFindResults);
++    if (!writerU32(writer, count) || !writerI32(writer, runner->fileFindPosition))
++        return false;
++    repeat(count, i) {
++        if (!writeString(writer, runner->fileFindResults[i])) return false;
++    }
++    return true;
++}
++
++static bool readFileFindState(FastReader* reader, Runner* runner) {
++    uint32_t count = readerU32(reader);
++    int32_t position = readerI32(reader);
++    if (!countOkay(reader, count) || position < 0 ||
++        (uint32_t)position > count) {
++        reader->error = EBADMSG;
++        return false;
++    }
++    repeat(count, i) {
++        char* result = readString(reader);
++        if (reader->error) {
++            free(result);
++            return false;
++        }
++        arrput(runner->fileFindResults, result);
++    }
++    runner->fileFindPosition = position;
++    return true;
++}
++
++static int auditUnsupportedState(Runner* runner) {
++    if (arrlen(runner->structInstances) || arrlen(runner->runtimeLayers) ||
++        arrlen(runner->asyncBufferGroupOps) || arrlen(runner->asyncSaveLoadQueue) ||
++        runner->asyncBufferGroupActive || runner->currentIni != nullptr) {
++        logWarn("AM2R logical state unsupported: structs=%zu layers=%zu buffer_ops=%zu "
++                "save_ops=%zu buffer_active=%d ini=%d\n",
++                arrlen(runner->structInstances), arrlen(runner->runtimeLayers),
++                arrlen(runner->asyncBufferGroupOps), arrlen(runner->asyncSaveLoadQueue),
++                runner->asyncBufferGroupActive, runner->currentIni != nullptr);
++        return ENOTSUP;
++    }
++    repeat(runner->dataWin->room.count, i) {
++        if (arrlen(runner->savedRoomStates[i].runtimeLayers)) {
++            logWarn("AM2R logical state unsupported: saved room %d has %zu runtime layers\n",
++                    i, arrlen(runner->savedRoomStates[i].runtimeLayers));
++            return ENOTSUP;
++        }
++    }
++    repeat(MAX_OPEN_BINARY_FILES, i) if (runner->openBinaryFiles[i].isOpen) {
++        logWarn("AM2R logical state busy: binary file handle %d is open\n", i);
++        return EBUSY;
++    }
++    return 0;
++}
++
++static bool serializeState(FastWriter* writer, Runner* runner) {
++    FastStateHeader header = {0};
++    memcpy(header.magic, "AM2RFST", 7);
++    header.version = FAST_STATE_VERSION;
++    header.headerSize = sizeof(header);
++    header.roomCount = runner->dataWin->room.count;
++    header.objectCount = runner->dataWin->objt.count;
++    header.instanceSize = sizeof(FastInstanceFields);
++    header.rvalueSize = sizeof(RValue);
++    header.dataFileSize = runner->dataWin->fileSize;
++    header.gameId = runner->dataWin->gen8.gameID;
++    header.licenseCrc32 = runner->dataWin->gen8.licenseCRC32;
++    memcpy(header.directPlayGuid, runner->dataWin->gen8.directPlayGuid,
++           sizeof(header.directPlayGuid));
++    header.codeCount = runner->dataWin->code.count;
++    header.spriteCount = runner->dataWin->sprt.count;
++    if (!writerBytes(writer, &header, sizeof(header))) return false;
++
++    FastRunnerFields fields = captureRunnerFields(runner);
++    if (!writerI32(writer, runner->currentRoomIndex) ||
++        !writerBytes(writer, &fields, sizeof(fields)) ||
++        !writeVarMap(writer, &runner->vmContext->globalScopeInstance->selfVars) ||
++        !writerBytes(writer, runner->views, sizeof(runner->views)) ||
++        !writerBytes(writer, runner->defaultCameras, sizeof(runner->defaultCameras)) ||
++        !writerBytes(writer, runner->userCameras, sizeof(runner->userCameras)) ||
++        !writerBytes(writer, &runner->surfaceCamera, sizeof(runner->surfaceCamera)) ||
++        !writerBytes(writer, &runner->guiCamera, sizeof(runner->guiCamera)) ||
++        !writeRoomVisual(writer, runner->backgrounds, runner->backgroundColor,
++                         runner->drawBackgroundColor, runner->tileLayerMap,
++                         runner->currentRoom->tiles, runner->currentRoom->tileCount,
++                         runner->views, runner->viewsEnabled, runner->defaultCameras) ||
++        !writeInstances(writer, runner->instances)) return false;
++
++    if (!writerU32(writer, runner->dataWin->room.count)) return false;
++    repeat(runner->dataWin->room.count, i) {
++        SavedRoomState* state = &runner->savedRoomStates[i];
++        if (!writerU8(writer, state->initialized)) return false;
++        if (!state->initialized) continue;
++        if (!writeRoomVisual(writer, state->backgrounds, state->backgroundColor,
++                             state->drawBackgroundColor, state->tileLayerMap,
++                             state->tiles, state->tileCount, state->views,
++                             state->viewsEnabled, state->defaultCameras) ||
++            !writeInstances(writer, state->instances)) return false;
++    }
++    if (!writeDataStructures(writer, runner) || !writeAuxiliaryPools(writer, runner) ||
++        !writeOpenTextFiles(writer, runner) || !writeFileFindState(writer, runner) ||
++        !writeSurfaces(writer, runner) || !writeAudio(writer, runner)) return false;
++
++    header.payloadSize = (uint32_t)(writer->size - sizeof(header));
++    header.payloadCrc32 = crc32Bytes(writer->data + sizeof(header), header.payloadSize);
++    memcpy(writer->data, &header, sizeof(header));
++    return true;
++}
++
++static bool deserializeState(FastReader* reader, Runner* runner) {
++    FastStateHeader header = {0};
++    if (!readerBytes(reader, &header, sizeof(header)) ||
++        memcmp(header.magic, "AM2RFST", 7) != 0 ||
++        header.version != FAST_STATE_VERSION || header.headerSize != sizeof(header) ||
++        header.payloadSize != reader->size - sizeof(header) ||
++        header.roomCount != runner->dataWin->room.count ||
++        header.objectCount != runner->dataWin->objt.count ||
++        header.instanceSize != sizeof(FastInstanceFields) ||
++        header.rvalueSize != sizeof(RValue) ||
++        header.dataFileSize != runner->dataWin->fileSize ||
++        header.gameId != runner->dataWin->gen8.gameID ||
++        header.licenseCrc32 != runner->dataWin->gen8.licenseCRC32 ||
++        memcmp(header.directPlayGuid, runner->dataWin->gen8.directPlayGuid,
++               sizeof(header.directPlayGuid)) != 0 ||
++        header.codeCount != runner->dataWin->code.count ||
++        header.spriteCount != runner->dataWin->sprt.count ||
++        header.payloadCrc32 != crc32Bytes(reader->data + sizeof(header), header.payloadSize)) {
++        reader->error = EBADMSG;
++        return false;
++    }
++    int32_t roomIndex = readerI32(reader);
++    FastRunnerFields fields = {0};
++    if (!readerBytes(reader, &fields, sizeof(fields)) ||
++        !Runner_beginFastStateRestore(runner, roomIndex)) {
++        reader->error = EBADMSG;
++        return false;
++    }
++    if (!readVarMap(reader, runner, runner->vmContext->globalScopeInstance) ||
++        !readerBytes(reader, runner->views, sizeof(runner->views)) ||
++        !readerBytes(reader, runner->defaultCameras, sizeof(runner->defaultCameras)) ||
++        !readerBytes(reader, runner->userCameras, sizeof(runner->userCameras)) ||
++        !readerBytes(reader, &runner->surfaceCamera, sizeof(runner->surfaceCamera)) ||
++        !readerBytes(reader, &runner->guiCamera, sizeof(runner->guiCamera))) return false;
++
++    RoomTile* currentTiles = nullptr;
++    uint32_t currentTileCount = 0;
++    hmfree(runner->tileLayerMap); runner->tileLayerMap = nullptr;
++    if (!readRoomVisual(reader, runner->backgrounds, &runner->backgroundColor,
++                        &runner->drawBackgroundColor, &runner->tileLayerMap,
++                        &currentTiles, &currentTileCount, runner->views,
++                        &runner->viewsEnabled, runner->defaultCameras)) return false;
++    free(runner->currentRoom->tiles);
++    runner->currentRoom->tiles = currentTiles;
++    runner->currentRoom->tileCount = currentTileCount;
++    if (!readInstances(reader, runner, &runner->instances, true)) return false;
++
++    uint32_t roomCount = readerU32(reader);
++    if (roomCount != runner->dataWin->room.count) { reader->error = EBADMSG; return false; }
++    repeat(roomCount, i) {
++        SavedRoomState* state = &runner->savedRoomStates[i];
++        state->initialized = readerU8(reader) != 0;
++        if (!state->initialized) continue;
++        if (!readRoomVisual(reader, state->backgrounds, &state->backgroundColor,
++                            &state->drawBackgroundColor, &state->tileLayerMap,
++                            &state->tiles, &state->tileCount, state->views,
++                            &state->viewsEnabled, state->defaultCameras) ||
++            !readInstances(reader, runner, &state->instances, false)) return false;
++    }
++    if (!readDataStructures(reader, runner) || !readAuxiliaryPools(reader, runner) ||
++        !readOpenTextFiles(reader, runner) || !readFileFindState(reader, runner) ||
++        !readSurfaces(reader, runner) || !readAudio(reader, runner)) return false;
++    if (reader->offset != reader->size) { reader->error = EBADMSG; return false; }
++    restoreRunnerFields(runner, &fields);
++    Runner_finishFastStateRestore(runner);
++    return true;
++}
++
++static void statePath(char* target, size_t size, int slot, const char* suffix) {
++    snprintf(target, size, FAST_STATE_PATH "/slot%d.fast%s", slot + 1, suffix);
++}
++
++static int writeAtomic(const uint8_t* data, size_t size, int slot) {
++    mkdir("/media/fat/savestates", 0755);
++    mkdir(FAST_STATE_PATH, 0755);
++    char path[PATH_MAX], temporary[PATH_MAX];
++    statePath(path, sizeof(path), slot, "");
++    statePath(temporary, sizeof(temporary), slot, ".new");
++    unlink(temporary);
++    int fd = open(temporary, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
++    if (fd < 0) return errno;
++    size_t offset = 0;
++    while (offset < size) {
++        ssize_t written = write(fd, data + offset, size - offset);
++        if (written < 0 && errno == EINTR) continue;
++        if (written <= 0) { int error = errno ? errno : EIO; close(fd); unlink(temporary); return error; }
++        offset += (size_t)written;
++    }
++    if (fsync(fd) != 0 || close(fd) != 0) {
++        int error = errno ? errno : EIO; unlink(temporary); return error;
++    }
++    if (rename(temporary, path) != 0) {
++        int error = errno; unlink(temporary); return error;
++    }
++    return 0;
++}
++
++static int readWholeFile(int slot, uint8_t** data, size_t* size) {
++    char path[PATH_MAX];
++    statePath(path, sizeof(path), slot, "");
++    int fd = open(path, O_RDONLY | O_CLOEXEC);
++    if (fd < 0) return errno;
++    struct stat status = {0};
++    if (fstat(fd, &status) != 0 || status.st_size < (off_t)sizeof(FastStateHeader) ||
++        status.st_size > (off_t)FAST_STATE_MAX_BYTES) {
++        int error = errno ? errno : EBADMSG; close(fd); return error;
++    }
++    *size = (size_t)status.st_size;
++    *data = (uint8_t*)malloc(*size);
++    if (*data == nullptr) { close(fd); return ENOMEM; }
++    size_t offset = 0;
++    while (offset < *size) {
++        ssize_t got = read(fd, *data + offset, *size - offset);
++        if (got < 0 && errno == EINTR) continue;
++        if (got <= 0) { int error = errno ? errno : EIO; close(fd); free(*data); *data = nullptr; return error; }
++        offset += (size_t)got;
++    }
++    close(fd);
++    return 0;
++}
++
++int Am2rFastState_save(Runner* runner, int slot, size_t* bytesWritten) {
++    if (bytesWritten) *bytesWritten = 0;
++    if (runner == nullptr || slot < 0 || slot >= 4 || runner->currentRoom == nullptr)
++        return EINVAL;
++    int audit = auditUnsupportedState(runner);
++    if (audit) return audit;
++    FastWriter writer = {0};
++    bool okay = serializeState(&writer, runner);
++    int error = okay ? writeAtomic(writer.data, writer.size, slot) :
++                       (writer.error ? writer.error : EIO);
++    if (!error && bytesWritten) *bytesWritten = writer.size;
++    arrfree(writer.arrays);
++    free(writer.data);
++    return error;
++}
++
++int Am2rFastState_load(Runner* runner, int slot, size_t* bytesRead) {
++    if (bytesRead) *bytesRead = 0;
++    if (runner == nullptr || slot < 0 || slot >= 4) return EINVAL;
++    uint8_t* data = nullptr;
++    size_t size = 0;
++    int error = readWholeFile(slot, &data, &size);
++    if (error) return error;
++    FastReader reader = { .data = data, .size = size };
++    bool okay = deserializeState(&reader, runner);
++    error = okay ? 0 : (reader.error ? reader.error : EIO);
++    if (!error && bytesRead) *bytesRead = size;
++    arrfree(reader.arrays);
++    free(data);
++    return error;
++}
++
++#endif
+diff --git a/src/am2r_fast_state.h b/src/am2r_fast_state.h
+new file mode 100644
+index 0000000..60064dc
+--- /dev/null
++++ b/src/am2r_fast_state.h
+@@ -0,0 +1,18 @@
++#ifndef AM2R_FAST_STATE_H
++#define AM2R_FAST_STATE_H
++
++#include "common.h"
++#include <stddef.h>
++
++#ifndef RUNNER_DEFINED
++#define RUNNER_DEFINED
++typedef struct Runner Runner;
++#endif
++
++#ifdef USE_MISTER
++// Returns zero on success or a positive errno-style value on failure.
++int Am2rFastState_save(Runner* runner, int slot, size_t* bytesWritten);
++int Am2rFastState_load(Runner* runner, int slot, size_t* bytesRead);
++#endif
++
++#endif
+diff --git a/src/am2r_savestate.h b/src/am2r_savestate.h
+index bf2f45e..6d64e48 100644
+--- a/src/am2r_savestate.h
++++ b/src/am2r_savestate.h
+@@ -16,6 +16,8 @@ typedef enum {
+     AM2R_STATE_RESTORED = 4,
+     AM2R_STATE_LOAD_MISSING = 5,
+     AM2R_STATE_SNAPSHOT_ERROR = 6,
++    AM2R_STATE_FAST_SAVE_COMPLETE = 7,
++    AM2R_STATE_FAST_LOAD_COMPLETE = 8,
+ } Am2rStateMessageType;
+ 
+ typedef struct {
+diff --git a/src/audio/miniaudio/ma_audio_system.c b/src/audio/miniaudio/ma_audio_system.c
+index 109c469..4f12824 100644
+--- a/src/audio/miniaudio/ma_audio_system.c
++++ b/src/audio/miniaudio/ma_audio_system.c
+@@ -539,11 +539,7 @@ static void maResume(AudioSystem* audio) {
+     if (ma->runtimeInitialized) ma_device_start(ma_engine_get_device(&ma->engine));
+ }
+ 
+-bool MaAudioSystem_prepareSaveState(AudioSystem* audio) {
+-    MaAudioSystem* ma = (MaAudioSystem*) audio;
+-    if (ma == nullptr || !ma->runtimeInitialized) return false;
+-
+-    ma_device_stop(ma_engine_get_device(&ma->engine));
++static void maCaptureCheckpoint(MaAudioSystem* ma) {
+     memset(ma->checkpoint, 0, sizeof(ma->checkpoint));
+     repeat(MAX_SOUND_INSTANCES, i) {
+         SoundInstance* inst = &ma->instances[i];
+@@ -562,6 +558,36 @@ bool MaAudioSystem_prepareSaveState(AudioSystem* audio) {
+         saved->startGain = inst->startGain;
+         saved->pitch = ma_sound_get_pitch(&inst->maSound);
+         ma_sound_get_cursor_in_pcm_frames(&inst->maSound, &saved->cursorFrame);
++    }
++    ma->checkpointValid = true;
++}
++
++bool MaAudioSystem_prepareLogicalSave(AudioSystem* audio) {
++    MaAudioSystem* ma = (MaAudioSystem*) audio;
++    if (ma == nullptr || !ma->runtimeInitialized) return false;
++    if (ma_device_stop(ma_engine_get_device(&ma->engine)) != MA_SUCCESS)
++        return false;
++    maCaptureCheckpoint(ma);
++    return true;
++}
++
++bool MaAudioSystem_finishLogicalSave(AudioSystem* audio) {
++    MaAudioSystem* ma = (MaAudioSystem*) audio;
++    if (ma == nullptr || !ma->runtimeInitialized) return false;
++    ma->checkpointValid = false;
++    return ma_device_start(ma_engine_get_device(&ma->engine)) == MA_SUCCESS;
++}
++
++bool MaAudioSystem_prepareSaveState(AudioSystem* audio) {
++    MaAudioSystem* ma = (MaAudioSystem*) audio;
++    if (ma == nullptr || !ma->runtimeInitialized) return false;
++
++    if (ma_device_stop(ma_engine_get_device(&ma->engine)) != MA_SUCCESS)
++        return false;
++    maCaptureCheckpoint(ma);
++    repeat(MAX_SOUND_INSTANCES, i) {
++        SoundInstance* inst = &ma->instances[i];
++        if (!inst->active) continue;
+ 
+         ma_sound_uninit(&inst->maSound);
+         if (inst->ownsDecoder) ma_decoder_uninit(&inst->decoder);
+@@ -573,7 +599,6 @@ bool MaAudioSystem_prepareSaveState(AudioSystem* audio) {
+     ma_engine_uninit(&ma->engine);
+     ma_device_uninit(&ma->device);
+     ma->runtimeInitialized = false;
+-    ma->checkpointValid = true;
+     return true;
+ }
+ 
+diff --git a/src/audio/miniaudio/ma_audio_system.h b/src/audio/miniaudio/ma_audio_system.h
+index 0012df9..17c3505 100644
+--- a/src/audio/miniaudio/ma_audio_system.h
++++ b/src/audio/miniaudio/ma_audio_system.h
+@@ -72,6 +72,11 @@ typedef struct {
+ } MaAudioSystem;
+ 
+ MaAudioSystem* MaAudioSystem_create(DataWin* dataWin);
++// Logical saves only need a stable audio snapshot while the game thread is
++// paused. Keep the engine and decoded sounds alive so saving does not pay the
++// DMTCP endpoint teardown/reconstruction cost.
++bool MaAudioSystem_prepareLogicalSave(AudioSystem* audio);
++bool MaAudioSystem_finishLogicalSave(AudioSystem* audio);
+ bool MaAudioSystem_prepareSaveState(AudioSystem* audio);
+ bool MaAudioSystem_restoreSaveState(AudioSystem* audio);
+ 
+diff --git a/src/loop.c b/src/loop.c
+index bc7d498..4eef9e7 100644
+--- a/src/loop.c
++++ b/src/loop.c
+@@ -66,6 +66,7 @@
+ 
+ #ifdef USE_MISTER
+ #include "am2r_savestate.h"
++#include "am2r_fast_state.h"
+ #include "backends/mister_gpu.h"
+ #include <dlfcn.h>
+ #include <sys/socket.h>
+@@ -558,7 +559,7 @@ static bool am2rStateOpen(void) {
+                         (long)(struct sockaddr*)&runnerAddress,
+                         sizeof(runnerAddress)) != 0) {
+         am2rStateClose();
+-        return false;
++        return true;
+     }
+     int flags = (int)am2rRawSyscall3(SYS_fcntl, am2rStateFd, F_GETFL, 0);
+     if (flags >= 0)
+@@ -764,8 +765,60 @@ static bool am2rStatePoll(Runner* runner) {
+         slot = i;
+     }
+ 
+-    if (action == AM2R_STATE_REQUEST_SAVE) return am2rStateSave(runner, slot);
+-    if (action == AM2R_STATE_REQUEST_LOAD) am2rStateLoad(runner, slot);
++    if (action == AM2R_STATE_REQUEST_SAVE) {
++        uint64_t started = nowNanos();
++        size_t bytes = 0;
++#ifdef USE_MINIAUDIO
++        bool audioPrepared = MaAudioSystem_prepareLogicalSave(runner->audioSystem);
++#else
++        bool audioPrepared = false;
++#endif
++        int error = audioPrepared ? Am2rFastState_save(runner, slot, &bytes) : EIO;
++#ifdef USE_MINIAUDIO
++        if (!MaAudioSystem_finishLogicalSave(runner->audioSystem) && error == 0)
++            error = EIO;
++#endif
++        if (error == 0) {
++            am2rStateSend(AM2R_STATE_FAST_SAVE_COMPLETE, slot,
++                          runner->frameCount, 0);
++            logInfo("AM2R logical state %d saved: %zu bytes in %.1f ms\n",
++                    slot + 1, bytes,
++                    (double)(nowNanos() - started) / 1000000.0);
++        } else {
++            am2rStateSend(AM2R_STATE_SNAPSHOT_ERROR, slot,
++                          runner->frameCount, error);
++            logWarn("AM2R logical state %d save failed: %s\n",
++                    slot + 1, strerror(error));
++        }
++        return false;
++    }
++    if (action == AM2R_STATE_REQUEST_LOAD) {
++        uint64_t started = nowNanos();
++        size_t bytes = 0;
++#ifdef USE_MINIAUDIO
++        bool audioPrepared = MaAudioSystem_prepareSaveState(runner->audioSystem);
++#else
++        bool audioPrepared = false;
++#endif
++        int error = audioPrepared ? Am2rFastState_load(runner, slot, &bytes) : EIO;
++#ifdef USE_MINIAUDIO
++        if (!MaAudioSystem_restoreSaveState(runner->audioSystem) && error == 0)
++            error = EIO;
++#endif
++        if (error == 0) {
++            am2rStateSend(AM2R_STATE_FAST_LOAD_COMPLETE, slot,
++                          runner->frameCount, 0);
++            logInfo("AM2R logical state %d loaded: %zu bytes in %.1f ms\n",
++                    slot + 1, bytes,
++                    (double)(nowNanos() - started) / 1000000.0);
++        } else {
++            am2rStateSend(AM2R_STATE_SNAPSHOT_ERROR, slot,
++                          runner->frameCount, error);
++            logWarn("AM2R logical state %d load failed: %s\n",
++                    slot + 1, strerror(error));
++        }
++        return true;
++    }
+     return false;
+ }
+ #endif
+diff --git a/src/runner.c b/src/runner.c
+index 31a58bc..a4ae8c2 100644
+--- a/src/runner.c
++++ b/src/runner.c
+@@ -20,6 +20,9 @@
+ #include "gettime.h"
+ #include "stb_ds.h"
+ 
++static void replaceRoomTiles(Room* room, const RoomTile* tiles,
++                             uint32_t tileCount);
++
+ // ===[ Runtime Layer Teardown Helpers ]===
+ void Runner_freeRuntimeLayer(RuntimeLayer* runtimeLayer) {
+     free(runtimeLayer->dynamicName);
+@@ -1881,6 +1884,83 @@ static void copyRoomViewToRuntimeView(RoomView* roomView, RuntimeView* runtimeVi
+     runtimeView->portHeight = roomView->portHeight;
+ }
+ 
++bool Runner_beginFastStateRestore(Runner* runner, int32_t roomIndex) {
++    if (runner == nullptr || roomIndex < 0 ||
++        (uint32_t)roomIndex >= runner->dataWin->room.count)
++        return false;
++
++    // Runner_reset is the single audited owner of all VM/game heap teardown.
++    // It leaves immutable parsed resources, input endpoints, the renderer, and
++    // the audio backend allocated, which are exactly the process-local pieces
++    // a logical state must retain.
++    Runner_reset(runner);
++
++    // A logical restore can happen after the player visited and mutated rooms
++    // which had not yet been touched when the snapshot was taken. Reset every
++    // loaded room to its immutable authored tile list first; the serialized
++    // current/persistent-room state is applied on top below.
++    repeat(runner->dataWin->room.count, i) {
++        Room* loadedRoom = &runner->dataWin->room.rooms[i];
++        if (!loadedRoom->payloadLoaded) continue;
++        replaceRoomTiles(loadedRoom, loadedRoom->initialTiles,
++                         loadedRoom->initialTileCount);
++    }
++
++    Room* room = &runner->dataWin->room.rooms[roomIndex];
++    if (!room->payloadLoaded) DataWin_loadRoomPayload(runner->dataWin, roomIndex);
++    runner->currentRoom = room;
++    runner->currentRoomIndex = roomIndex;
++    runner->currentRoomOrderPosition = -1;
++    repeat(runner->dataWin->gen8.roomOrderCount, i) {
++        if (runner->dataWin->gen8.roomOrder[i] == roomIndex) {
++            runner->currentRoomOrderPosition = (int32_t)i;
++            break;
++        }
++    }
++    runner->viewsEnabled = (room->flags & 1) != 0;
++    if (runner->spatialGrid != nullptr) SpatialGrid_free(runner->spatialGrid);
++    runner->spatialGrid = SpatialGrid_create(room->width, room->height);
++    runner->pendingRoom = -1;
++    return true;
++}
++
++Instance* Runner_createFastStateInstance(Runner* runner, uint32_t instanceId,
++                                         int32_t objectIndex, bool currentRoom) {
++    if (runner == nullptr || objectIndex < 0 ||
++        (uint32_t)objectIndex >= runner->dataWin->objt.count ||
++        hmget(runner->instancesById, instanceId) != nullptr)
++        return nullptr;
++    Instance* instance = Instance_create(instanceId, objectIndex, 0.0, 0.0);
++    hmput(runner->instancesById, instanceId, instance);
++    if (currentRoom) arrput(runner->instances, instance);
++    if (runner->nextInstanceId <= instanceId) runner->nextInstanceId = instanceId + 1;
++    return instance;
++}
++
++void Runner_finishFastStateRestore(Runner* runner) {
++    if (runner == nullptr || runner->currentRoom == nullptr) return;
++    Runner_clearAllObjectLists(runner);
++    runner->nextObjectListOrder = 0;
++    if (runner->spatialGrid != nullptr) SpatialGrid_free(runner->spatialGrid);
++    runner->spatialGrid = SpatialGrid_create(runner->currentRoom->width,
++                                             runner->currentRoom->height);
++    repeat((int32_t)arrlen(runner->instances), i) {
++        Instance* instance = runner->instances[i];
++        instance->spatialGridDirty = false;
++        arrfree(instance->collisionCells);
++        instance->collisionCells = nullptr;
++        instance->collisionGridBBoxValid = false;
++        Runner_addInstanceToObjectLists(runner, instance);
++    }
++    SpatialGrid_syncGrid(runner, runner->spatialGrid);
++    arrsetlen(runner->cachedDrawables, 0);
++    runner->drawableListStructureDirty = true;
++    runner->drawableListSortDirty = false;
++    runner->drawableListCursorDirty = false;
++    runner->vmContext->currentInstance = nullptr;
++    runner->vmContext->otherInstance = nullptr;
++}
++
+ static void replaceRoomTiles(Room* room, const RoomTile* tiles, uint32_t tileCount) {
+     free(room->tiles);
+     room->tiles = nullptr;
+diff --git a/src/runner.h b/src/runner.h
+index 29746d8..b3e4341 100644
+--- a/src/runner.h
++++ b/src/runner.h
+@@ -805,6 +805,14 @@ void Runner_setGameArgs(Runner* runner, char** argv, int32_t argc);
+ void Runner_initFirstRoom(Runner* runner);
+ void Runner_step(Runner* runner);
+ void Runner_handlePendingRoomChange(Runner* runner);
++
++// Logical save-state restore helpers. These deliberately do not execute any
++// GameMaker creation, room-start, or room-end code: the serializer restores
++// the exact VM-visible state captured at a frame boundary instead.
++bool Runner_beginFastStateRestore(Runner* runner, int32_t roomIndex);
++Instance* Runner_createFastStateInstance(Runner* runner, uint32_t instanceId,
++                                         int32_t objectIndex, bool currentRoom);
++void Runner_finishFastStateRestore(Runner* runner);
+ void Runner_executeEvent(Runner* runner, Instance* instance, int32_t eventType, int32_t eventSubtype);
+ void Runner_executeEventFromObject(Runner* runner, Instance* instance, int32_t startObjectIndex, int32_t eventType, int32_t eventSubtype);
+ void Runner_executeEventForAll(Runner* runner, int32_t eventType, int32_t eventSubtype);
+diff --git a/src/sw_renderer.c b/src/sw_renderer.c
+index 7e6303d..285a860 100644
+--- a/src/sw_renderer.c
++++ b/src/sw_renderer.c
+@@ -2751,6 +2751,55 @@ bool SWRenderer_misterDrawAm2rWater(
+     sw->gpuHasSkippedDraws = true;
+     return true;
+ }
++
++#ifdef USE_MISTER
++void SWRenderer_fastStateResetSurfaces(Renderer* renderer) {
++    SWRenderer* sw = (SWRenderer*)renderer;
++    if (sw == nullptr) return;
++    swUseHostTarget(sw);
++    for (uint32_t id = 0; id < sw->surfaceCount; ++id) {
++        if (sw->surfacePixels[id] != nullptr)
++            MisterGpu_releaseTexture(sw->surfacePixels[id]);
++        free(sw->surfacePixels[id]);
++        sw->surfacePixels[id] = nullptr;
++        sw->surfaceWidths[id] = 0;
++        sw->surfaceHeights[id] = 0;
++        sw->surfaceExistsFlags[id] = false;
++        sw->surfaceRevisions[id] = 0;
++        swResetSurfaceContentBounds(sw, (int32_t)id, false);
++    }
++    sw->surfaceCount = 1; // ID zero remains GameMaker's invalid sentinel.
++    sw->surfaceWriteSerial = 0;
++    sw->am2rMapSurfaceId = -1;
++    sw->am2rMapSurfaceRetained = false;
++    sw->am2rMapSurfaceReused = false;
++    sw->am2rMapSurfaceCacheValid = false;
++    sw->am2rMapSurfaceTopologyHash = 0;
++    sw->am2rMapSurfaceDiscoveryHash = 0;
++}
++
++bool SWRenderer_fastStateRestoreSurface(Renderer* renderer, uint32_t id,
++                                        int32_t width, int32_t height,
++                                        uint32_t revision,
++                                        const uint8_t* rgba) {
++    SWRenderer* sw = (SWRenderer*)renderer;
++    if (sw == nullptr || id == 0 || width <= 0 || height <= 0 ||
++        width > 4096 || height > 4096 || rgba == nullptr)
++        return false;
++    swEnsureSurfaceCapacity(sw, id + 1);
++    if (sw->surfaceCount <= id) sw->surfaceCount = id + 1;
++    size_t bytes = (size_t)width * (size_t)height * 4u;
++    sw->surfacePixels[id] = (uint8_t*)safeMalloc(bytes);
++    memcpy(sw->surfacePixels[id], rgba, bytes);
++    sw->surfaceWidths[id] = width;
++    sw->surfaceHeights[id] = height;
++    sw->surfaceExistsFlags[id] = true;
++    sw->surfaceRevisions[id] = revision;
++    if (sw->surfaceWriteSerial < revision) sw->surfaceWriteSerial = revision;
++    swResetSurfaceContentBounds(sw, (int32_t)id, true);
++    return true;
++}
++#endif
+ #endif
+ 
+ static void swDrawPixelBuffer(SWRenderer* sw, const uint8_t* pixels, int32_t texW, int32_t texH,
+diff --git a/src/sw_renderer.h b/src/sw_renderer.h
+index 35a75b3..265a1fe 100644
+--- a/src/sw_renderer.h
++++ b/src/sw_renderer.h
+@@ -158,4 +158,12 @@ void SWRenderer_misterCommitAm2rMapSurface(
+ bool SWRenderer_misterDrawAm2rWater(
+     Renderer* renderer, int32_t surfaceId, const GMLReal* xOffsets,
+     GMLReal yTop, GMLReal viewX, GMLReal viewY, int32_t viewWidth);
++
++// Exact-ID dynamic-surface access used by AM2R logical save states. Static
++// texture pages and FPGA-derived caches are intentionally outside the format.
++void SWRenderer_fastStateResetSurfaces(Renderer* renderer);
++bool SWRenderer_fastStateRestoreSurface(Renderer* renderer, uint32_t id,
++                                        int32_t width, int32_t height,
++                                        uint32_t revision,
++                                        const uint8_t* rgba);
+ #endif

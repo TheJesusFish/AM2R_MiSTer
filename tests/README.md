@@ -25,6 +25,15 @@
 - `runtime/audit_savestate_pipeline.py` prevents save-state staging from
   returning to memory-backed `/dev/shm`, and locks the disk-space preflight,
   atomic publication, runner-release, and build-compatibility contracts.
+- `runtime/audit_logical_savestate.py` locks the version-4 logical-state data
+  fingerprint, payload CRC, validation-before-mutation ordering, atomic
+  publication, serialized runner/renderer/audio coverage, and OSD completion
+  handling.
+- `hardware/logical_savestate_hardware_regression.py` backs up one selected
+  `.fast` slot on USB-1, performs two save/load generations, verifies that the
+  runner PID and ordinary saves are unchanged, rejects a corrupt copy, and
+  restores the original slot in a `finally` block. Build
+  `tools/am2r_logical_state_request.c` for ARM before running it.
 - `hardware/run-savestate-hardware-regression.ps1` runs the real DMTCP path on
   USB-1. It temporarily renames one selected slot, then checks save, load,
   low-space refusal when applicable, runner survival, absence of a new kernel

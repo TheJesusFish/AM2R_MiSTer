@@ -51,10 +51,11 @@ git apply ../../patches/butterscotch-lighting-pacing.patch
 git apply ../../patches/butterscotch-lighting-visible-crop.patch
 git apply ../../patches/butterscotch-metroid-lighting-hit.patch
 git apply ../../patches/butterscotch-lighting-native-events.patch
+git apply ../../patches/butterscotch-logical-savestates.patch
 ```
 
-The forty files were generated from the hardware-validated working tree.
-Each clean-applies in the order above, and applying all forty to a fresh
+The forty-one files were generated from the hardware-validated working tree.
+Each clean-applies in the order above, and applying all forty-one to a fresh
 detached clone at the base commit reconstructs the current runner source after
 normalizing checkout line endings. See the final hardware and save-state
 reports under `reports/` for build identities and test results. The first
@@ -243,6 +244,14 @@ Other-11 producer sequence was rejected after an exact-room USB-1 A/B: the
 authored bytecode path advanced at 59.807 FPS with a 21.112 ms p99 and 52.702
 ms maximum, while the native candidate measured 57.265 FPS with a 24.989 ms
 p99 and 259.639 ms maximum. Other 11 therefore remains interpreted.
+The forty-first patch replaces slow whole-process checkpoints with a versioned
+AM2R-specific serializer. It captures the VM object graph, room/tile state,
+data structures, dynamic surfaces, and active audio, validates a game-data
+fingerprint and payload CRC before mutation, and atomically publishes compact
+`.fast` slots. The audio engine remains allocated during saves. Real USB-1
+two-generation testing completed saves in 281–468 ms and loads in 406–453 ms;
+all four slot indices, cross-exit restore, corrupt-state rejection, input,
+audio, and ordinary-save integrity passed.
 
 | Patch | SHA-256 |
 | --- | --- |
@@ -286,9 +295,12 @@ p99 and 259.639 ms maximum. Other 11 therefore remains interpreted.
 | `butterscotch-lighting-visible-crop.patch` | `33af39ca9e3030e4229abd1027c8250d8215dba54ae48175fad1b3f0305e674e` |
 | `butterscotch-metroid-lighting-hit.patch` | `3102a3da64e5b98a0084586bac8b67b8fa6766c26ed693b16e305b23616c7b38` |
 | `butterscotch-lighting-native-events.patch` | `e5649a320b56f98589a87e57b0348bc1775e942f23487f72e3b1f25f7d7f72e3` |
+| `butterscotch-logical-savestates.patch` | `97328613ec428eff567a19cab7e472e28d4e9edae59b4083f2448a55ef363687` |
 
-Persistent checkpoints use DMTCP 3.2.0. Apply the MiSTer ARMv7 portability
-patch to a clean DMTCP checkout at commit
+The retired whole-process checkpoint path used DMTCP 3.2.0 and remains
+reproducible for comparison or rollback. It is not used by the active logical
+save-state path. Apply the MiSTer ARMv7 portability patch to a clean DMTCP
+checkout at commit
 `bc38d1a3bdfca87905f1a3adfada1e63d64042e5`:
 
 ```sh

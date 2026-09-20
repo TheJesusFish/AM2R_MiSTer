@@ -95,23 +95,21 @@ archive's size and modification time are unchanged.
 /media/fat/games/am2r/AM2R.zip
 /media/fat/saves/AM2R/config.ini
 /media/fat/saves/AM2R/
-/media/fat/savestates/AM2R/slot1.dmtcp ... slot4.dmtcp
+/media/fat/savestates/AM2R/slot1.fast ... slot4.fast
 ```
 
-Normal AM2R saves and MiSTer save states are separate. Save states are full
-DMTCP process checkpoints, are tied to the exact frontend/runner build, and
-are intentionally rejected when incompatible. Checkpoints are staged directly
-under `/media/fat/savestates/AM2R`, not in RAM; this prevents the Linux OOM
-killer from terminating the game while DMTCP creates a 150–180 MB image. At
-least 256 MiB must be free before capture begins. If it is not, the request is
-rejected, the previous slot remains valid, and gameplay resumes. The final file
-is published by an atomic same-filesystem rename. Wait for the **Save state
-written** message before loading or copying that slot. Save time depends heavily
-on SD/network storage and measured 49–135 seconds in the latest USB-1 runs;
-hardware-tested loads completed in a few seconds. Capturing a checkpoint after
-loading another checkpoint is not supported: the frontend immediately refuses
-the request, preserves the existing slot, and resumes gameplay. Relaunch the
-core before writing a replacement state.
+Normal AM2R saves and MiSTer save states are separate. Save states use a
+versioned logical snapshot of the GameMaker VM, rooms, instances, data
+structures, surfaces, audio, and runner state. Each slot is validated with a
+payload CRC and an AM2R data fingerprint before live state is changed. The
+final file is published by an atomic same-filesystem rename, so an interrupted
+write cannot replace the previous slot. Wait for the **Save state written**
+message before loading or copying a slot.
+
+On USB-1, ordinary 1.53 MB gameplay states saved in 0.28–0.68 seconds and
+loaded in 0.40–0.49 seconds during the final repeated test. States survive a
+core exit and can be overwritten after loading. Legacy `.dmtcp` files are left
+untouched but are not logical-state slots and cannot be converted to `.fast`.
 
 ## Controls
 
