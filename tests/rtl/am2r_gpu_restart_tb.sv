@@ -23,7 +23,7 @@ module am2r_gpu_restart_tb #(
     am2r_gpu dut(.clk(clk),.reset(reset),.ddram_busy(busy),
         .ddram_burstcnt(burst),.ddram_addr(address),.ddram_dout(dout),
         .ddram_dout_ready(ready),.ddram_rd(rd),.ddram_din(din),.ddram_be(be),
-        .ddram_we(wr),.scan_buffer_valid(1'b0),.scan_buffer(2'b0),
+        .ddram_we(wr),.scan_buffer_valid(1'b0),.scan_buffer(2'b0),.hdmi_protect(4'b0),
         .scan_underflow_toggle(1'b0),.native_frame(frame),.native_buffer(buffer));
     always #5 clk=~clk;
     always @(posedge clk) begin

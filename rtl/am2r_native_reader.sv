@@ -41,6 +41,7 @@ module am2r_native_reader (
 	localparam [28:0] BUF0_ADDR = 29'h07400020; // 0x3a000100 >> 3
 	localparam [28:0] BUF1_ADDR = 29'h07409620; // 0x3a04b100 >> 3
 	localparam [28:0] BUF2_ADDR = 29'h07412c20; // 0x3a096100 >> 3
+	localparam [28:0] BUF3_ADDR = 29'h0741c220; // 0x3a0e1100 >> 3
 	localparam [7:0] LINE_WORDS = 8'd160;
 	// The MiSTer DDRAM top-level contract caps a request at 128 words.
 	// Match 3s-mister-arm's known-good 96-word native-video bursts, then
@@ -120,6 +121,7 @@ module am2r_native_reader (
 			case (buffer_index)
 				2'd1: buffer_address = BUF1_ADDR;
 				2'd2: buffer_address = BUF2_ADDR;
+				2'd3: buffer_address = BUF3_ADDR;
 				default: buffer_address = BUF0_ADDR;
 			endcase
 		end

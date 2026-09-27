@@ -1,0 +1,24 @@
+diff --git a/src/backends/mister.c b/src/backends/mister.c
+index aee0e37..ce8dfaa 100644
+--- a/src/backends/mister.c
++++ b/src/backends/mister.c
+@@ -43,7 +43,9 @@
+ #define GPU_NATIVE_WINDOW_PHYS 0x3a000000u
+ #define GPU_NATIVE_BUFFER_OFFSET 0x100u
+ #define GPU_NATIVE_BUFFER_BYTES MISTER_FB_BYTES
+-#define GPU_NATIVE_BUFFER_COUNT 3u
++// Four buffers let the native scanout reader and the HDMI framebuffer reader
++// each hold a frame while the GPU publishes the next one.
++#define GPU_NATIVE_BUFFER_COUNT 4u
+ #define GPU_NATIVE_WINDOW_BYTES (GPU_NATIVE_BUFFER_OFFSET + GPU_NATIVE_BUFFER_COUNT * GPU_NATIVE_BUFFER_BYTES)
+ #define GPU_CONTROL_MAGIC 0x50473241u
+ #define GPU_CONTROL_BYTES 4096u
+@@ -129,7 +131,7 @@ static MisterGpuCommand *g_gpu_command_buffers[GPU_COMMAND_BUFFER_COUNT] = { NUL
+ static MisterGpuCommand *g_gpu_commands = NULL;
+ static uint8_t *g_gpu_textures = NULL;
+ static uint8_t *g_gpu_native_mapping = NULL;
+-static uint32_t *g_gpu_native_buffers[GPU_NATIVE_BUFFER_COUNT] = { NULL, NULL, NULL };
++static uint32_t *g_gpu_native_buffers[GPU_NATIVE_BUFFER_COUNT] = { NULL };
+ static MisterGpuTexture g_gpu_texture_records[GPU_TEXTURE_RECORDS];
+ static uint32_t g_gpu_texture_record_count = 0;
+ static size_t g_gpu_texture_offset = 0;

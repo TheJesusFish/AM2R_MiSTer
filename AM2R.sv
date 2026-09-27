@@ -177,6 +177,7 @@ wire [1:0] native_frame_buffer;
 wire scan_buffer_valid;
 wire [1:0] scan_buffer_in_use;
 wire scan_underflow_toggle;
+wire [3:0] hdmi_protect;
 
 am2r_gpu gpu
 (
@@ -193,6 +194,7 @@ am2r_gpu gpu
 	.ddram_we(gpu_ddr_we),
 	.scan_buffer_valid(scan_buffer_valid),
 	.scan_buffer(scan_buffer_in_use),
+	.hdmi_protect(hdmi_protect),
 	.scan_underflow_toggle(scan_underflow_toggle),
 	.native_frame(native_frame_number),
 	.native_buffer(native_frame_buffer)
@@ -238,6 +240,25 @@ am2r_native_reader native_reader
 	.b_out(native_b),
 	.underflow_toggle(scan_underflow_toggle)
 );
+
+// HDMI reads the latest published native frame directly from DDR, so the
+// analog-only CRT position and horizontal-scale controls never reach it.
+am2r_hdmi_fb hdmi_fb
+(
+	.clk(clk_gpu),
+	.reset(gpu_reset),
+	.fb_vbl(FB_VBL),
+	.native_frame(native_frame_number),
+	.native_buffer(native_frame_buffer),
+	.fb_base(FB_BASE),
+	.fb_force_blank(FB_FORCE_BLANK),
+	.protect(hdmi_protect)
+);
+assign FB_EN     = 1;
+assign FB_FORMAT = 5'b10110;   // 32bpp, B,G,R,X byte order (XRGB8888 words)
+assign FB_WIDTH  = 12'd320;
+assign FB_HEIGHT = 12'd240;
+assign FB_STRIDE = 14'd1280;
 
 assign DDRAM_CLK = clk_gpu;
 am2r_ddr_arbiter ddr_arbiter
@@ -361,18 +382,22 @@ video_mixer #(.LINE_LENGTH(320), .HALF_DEPTH(0), .GAMMA(1)) video_mixer
 // Scanline effects apply only to the scandoubled 31 kHz output.
 assign VGA_SL = forced_scandoubler ? scanlines[1:0] : 2'd0;
 
-// HDMI aspect ratio and integer scaling.
+assign VGA_DE = vga_de;
+
+// HDMI aspect ratio and integer scaling. HDMI shows the 320x240 native
+// framebuffer, so measure the unadjusted native raster rather than the
+// analog output, whose width the CRT horizontal scaler can change.
 video_freak video_freak
 (
 	.CLK_VIDEO(CLK_VIDEO),
-	.CE_PIXEL(CE_PIXEL),
-	.VGA_VS(VGA_VS),
+	.CE_PIXEL(ce_pix),
+	.VGA_VS(vsync),
 	.HDMI_WIDTH(HDMI_WIDTH),
 	.HDMI_HEIGHT(HDMI_HEIGHT),
-	.VGA_DE(VGA_DE),
+	.VGA_DE(),
 	.VIDEO_ARX(VIDEO_ARX),
 	.VIDEO_ARY(VIDEO_ARY),
-	.VGA_DE_IN(vga_de),
+	.VGA_DE_IN(~(hblank | vblank)),
 	.ARX((!ar) ? 12'd4 : (ar - 1'd1)),
 	.ARY((!ar) ? 12'd3 : 12'd0),
 	.CROP_SIZE(12'd0),

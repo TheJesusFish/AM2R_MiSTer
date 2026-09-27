@@ -111,13 +111,12 @@ artwork are neither scaled nor cropped. Values are the number of whole pixels
 moved toward the center; 6px is the initial approximately-five-percent
 safe-area trial. The option is off by default.
 
-MiSTer's core interface exposes one video stream before the framework splits
-the direct analog path from the HDMI/ascal path. Consequently, enabling a CRT
-adjustment also changes the signal presented to ascal even though the final
-HDMI mode is still produced by the normal framework. Leave the controls off
-when only HDMI is in use. That limitation also applies to the UI inset because
-the runner composes it before the framework split. Horizontal scaling buffers
-one scanline, not a frame; the UI inset adds no video buffering. The
+HDMI reads the GPU's published 320×240 frames directly from DDR through the
+framework framebuffer interface, so the position and horizontal-scale
+controls affect only the analog output. Two configurations still route the
+adjusted analog stream to HDMI: `direct_video=1`, which sends the native raster
+over HDMI, and `vga_scaler=1`, which instead sends the HDMI image to analog.
+Horizontal scaling buffers one scanline, not a frame. The
 horizontal scaler is disabled while `forced_scandoubler` is active because it
 exists only for 15 kHz displays.
 
