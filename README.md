@@ -116,7 +116,9 @@ framework framebuffer interface, so the position and horizontal-scale
 controls affect only the analog output. Two configurations still route the
 adjusted analog stream to HDMI: `direct_video=1`, which sends the native raster
 over HDMI, and `vga_scaler=1`, which instead sends the HDMI image to analog.
-Horizontal scaling buffers one scanline, not a frame. The
+The CRT UI V Inset is the exception: it changes where the runner draws the
+HUD and edge text inside the published frame, so HDMI shows the same small
+shift. Horizontal scaling buffers one scanline, not a frame. The
 horizontal scaler is disabled while `forced_scandoubler` is active because it
 exists only for 15 kHz displays.
 
