@@ -1,64 +1,6 @@
 # AM2R MiSTer
 
-AM2R MiSTer is an experimental hybrid core for the DE10-Nano. The ARM HPS
-runs AM2R 1.1 through a patched Butterscotch GameMaker runtime, while a custom
-FPGA GPU handles the dominant clear, fill, blit, affine, alpha, additive, and
-presentation operations. Native 320×240, 59.94 Hz scanout feeds MiSTer's
-standard HDMI and analog-video paths.
-
-The current engineering build launches as a normal MiSTer core, reaches
-gameplay, supports standard in-game saves and four persistent process-level
-save-state slots, and has been exercised on real MiSTer hardware. It remains a
-tester build rather than a claim of complete-game compatibility.
-
-The current runtime removes full-room collision-grid work from ordinary
-movement and local collision queries, retains exact indexed bounds across
-AM2R's repeated object activation cycle, and phase-locks ordinary 60 Hz game
-steps to a native-vblank heartbeat published by the FPGA. A corrected
-Morph Ball reproduction in the supplied room dropped from five repeated frames
-in 720 moving frames to one; the second affected room likewise had one repeat
-in 600 moving frames. That remaining repeat is expected when a 59.937 Hz source
-is recorded at 60.000 fps; live telemetry stayed near 59.8–60.1 fps. Older RBFs
-retain the compatible raster-period timer fallback.
-
-The in-game subscreen has also been exercised page-by-page on real hardware.
-Map, Equipment, Logs, and Options now stay in one atomic FPGA command stream;
-the Equipment connector-line and Logs gradient fallbacks that produced partial
-flashing frames are removed. The four-way chooser caches its quarter-turned
-art for the paired blitter, keeping repeated page changes at native cadence.
-
-Projectile and destructible-sand churn now use dense live-variable lists,
-ordered nearby collision candidates, and incremental drawable-list updates.
-On USB-1, the two supplied sand-room routes cleared the right wall and floor
-without the previous sustained shooting hitch; the final 28.017-second
-jump/down-shot capture contained 1,681 frames with 23 isolated adjacent
-repeats.
-
-Long-running surface churn can no longer exhaust the FPGA texture-record
-table and strand the core on a black frame. Freed GameMaker surfaces now return
-their records for reuse, the table has additional headroom, and CPU fallback
-presentation owns a separate staging buffer. The supplied first-pit checkpoint
-reproduced the former failure on USB-1; a forced-full-table hardware test of the
-fixed runtime presented every fallback frame without a black interval.
-
-The supplied slot-3 and room-159 regressions were AM2R's subtractive lighting
-engine rebuilding a 512×256 surface every frame. Exact opaque subtract fills,
-FPGA subtract blending, and compact sparse uploads of the visible 320×240
-viewport raised the controlled USB-1 room-159 movement workload to a 59.86 Hz
-sequence rate. The corrected Draw stage stays below 3.7 ms at the 95th
-percentile, and the lossless UGREEN capture has no alternating blank lighting
-frames. The game loop and audio callback also use the established hybrid-core
-real-time priority split, eliminating a recurring five-second Linux
-housekeeping hitch while leaving DMTCP and audio worker threads at normal
-priority after save-state restore.
-
-The supplied slot-1 lava bands were traced to a water optimization sampling the
-previous completed native frame while the camera moved. Batched FPGA water rows
-now retain AM2R's current-frame application-surface export, removing the stale
-vertical bands without returning the effect to the CPU renderer.
-
-This repository contains no AM2R game data. Testers must provide their own
-lawfully obtained AM2R 1.1 files and place the required files into a ZIP.
+This is an AI generated readme. I will do a better one once the core is closer to ready.
 
 ## Install a tester build
 
@@ -138,9 +80,10 @@ is intended for 15 kHz analog displays whose visible raster clips the native
 image. All controls default to zero/off; in that state the RTL is an exact
 clock, RGB, blanking, and sync bypass and adds no buffering.
 
-The **CRT UI V Inset** option moves only UI pixels which enter the
-top or bottom sixteen-line edge band, plus the title screen's separate version
-and URL overlays. It keeps those elements at their original pixel size: the
+The **CRT UI V Inset** option moves the complete in-game HUD as one layer,
+keeping numbers, tanks, weapon icons and minimap aligned. It also adjusts
+edge text and the title screen's separate version and URL overlays.
+It keeps those elements at their original pixel size: the
 320×240 game scene, camera, collision coordinates, title background, and other
 artwork are neither scaled nor cropped. Values are the number of whole pixels
 moved toward the center; 6px is the initial approximately-five-percent
