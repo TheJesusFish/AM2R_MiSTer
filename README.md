@@ -78,11 +78,14 @@ runtime and returns to `menu.rbf`.
 
 | Setting | Raster | Line rate | Refresh | Composite/S-Video subcarrier |
 | --- | --- | --- | --- | --- |
-| NTSC | 398×262 | 15.704 kHz | 59.94 Hz | from `ntsc_mode` in MiSTer.ini |
-| PAL60 | 398×262 | 15.704 kHz | 59.94 Hz | PAL (4.43 MHz) |
-| PAL | 400×312 | 15.625 kHz | 50.08 Hz | PAL (4.43 MHz) |
+| NTSC | 427×262 | 15.704 kHz | 59.94 Hz | from `ntsc_mode` in MiSTer.ini |
+| PAL60 | 427×262 | 15.704 kHz | 59.94 Hz | PAL (4.43 MHz) |
+| PAL | 429×312 | 15.631 kHz | 50.10 Hz | PAL (4.43 MHz) |
 
-NTSC and PAL60 have identical RGB timing; PAL60 only changes the colour
+The 320 active pixels span 47.7 µs per line, the same width as the Mega
+Drive's 320-pixel mode, so the image fits inside the visible area of typical
+15 kHz televisions without the horizontal scaler. NTSC and PAL60 have
+identical RGB timing; PAL60 only changes the colour
 subcarrier for composite and S-Video. PAL centres the 240 active lines in the
 taller 50 Hz frame. The game still runs at full 60 Hz speed in PAL mode, so
 one frame in six is not displayed.
