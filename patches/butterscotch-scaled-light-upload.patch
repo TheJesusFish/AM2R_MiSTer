@@ -1,0 +1,235 @@
+diff --git a/src/sw_renderer.c b/src/sw_renderer.c
+index e9d49aa..bd43b17 100644
+--- a/src/sw_renderer.c
++++ b/src/sw_renderer.c
+@@ -84,14 +84,79 @@ static void blendSubtractSolidSpan(uint32_t* destination, int32_t count,
+     }
+ }
+ 
++#if defined(USE_MISTER) && defined(__ARM_NEON)
++// Keep the unit-step register allocation isolated from the scaled gather path.
++// Combining both loops made unchanged 1:1 spans slower on the Cortex-A9. The
++// separate non-inlined leaf retains the previous packed loop and scalar edge
++// behavior; the dispatcher tail-calls it only for exact +/-1 source steps.
++__attribute__((noinline))
++static void blendSubtractTextureUnitSpan(uint32_t* destination,
++                                         const uint32_t* sourceRow,
++                                         int32_t textureWidth,
++                                         int64_t sourceX,
++                                         int64_t sourceStep,
++                                         int32_t count,
++                                         uint8_t tintR, uint8_t tintG,
++                                         uint8_t tintB, uint8_t tintA) {
++    int32_t output = 0;
++    const bool forward = sourceStep > 0;
++    const uint8x8_t tintRv = vdup_n_u8(tintR);
++    const uint8x8_t tintGv = vdup_n_u8(tintG);
++    const uint8x8_t tintBv = vdup_n_u8(tintB);
++    const uint8x8_t tintAv = vdup_n_u8(tintA);
++    while (output + 8 <= count) {
++        int32_t sourceIndex = (int32_t)(sourceX >> 16);
++        if (sourceIndex < (forward ? 0 : 7) ||
++            sourceIndex > textureWidth - (forward ? 8 : 1))
++            break;
++        const uint8_t* source = (const uint8_t*)(sourceRow +
++            (forward ? sourceIndex : sourceIndex - 7));
++        uint8x8x4_t pixels = vld4_u8(source);
++        if (!forward) {
++            pixels.val[0] = vrev64_u8(pixels.val[0]);
++            pixels.val[1] = vrev64_u8(pixels.val[1]);
++            pixels.val[2] = vrev64_u8(pixels.val[2]);
++            pixels.val[3] = vrev64_u8(pixels.val[3]);
++        }
++        uint8x8_t alpha = divideBy255U16(vmull_u8(pixels.val[3], tintAv));
++        uint8x8_t red = divideBy255U16(vmull_u8(pixels.val[0], tintRv));
++        uint8x8_t green = divideBy255U16(vmull_u8(pixels.val[1], tintGv));
++        uint8x8_t blue = divideBy255U16(vmull_u8(pixels.val[2], tintBv));
++        uint8x8x4_t target = vld4_u8((const uint8_t*)(destination + output));
++        target.val[0] = divideBy255U16(vmull_u8(target.val[0], vmvn_u8(red)));
++        target.val[1] = divideBy255U16(vmull_u8(target.val[1], vmvn_u8(green)));
++        target.val[2] = divideBy255U16(vmull_u8(target.val[2], vmvn_u8(blue)));
++        target.val[3] = divideBy255U16(vmull_u8(target.val[3], vmvn_u8(alpha)));
++        vst4_u8((uint8_t*)(destination + output), target);
++        output += 8;
++        sourceX += sourceStep * 8;
++    }
++    for (; output < count; ++output, sourceX += sourceStep) {
++        int32_t sourceIndex = (int32_t)(sourceX >> 16);
++        if (sourceIndex < 0) sourceIndex = 0;
++        if (sourceIndex >= textureWidth) sourceIndex = textureWidth - 1;
++        uint32_t pixel = sourceRow[sourceIndex];
++        uint32_t alpha = divideBy255U32(((pixel >> 24) & 255u) * tintA);
++        uint32_t red = divideBy255U32((pixel & 255u) * tintR);
++        uint32_t green = divideBy255U32(((pixel >> 8) & 255u) * tintG);
++        uint32_t blue = divideBy255U32(((pixel >> 16) & 255u) * tintB);
++        uint8_t* target = (uint8_t*)&destination[output];
++        target[0] = divideBy255U32(target[0] * (255u - red));
++        target[1] = divideBy255U32(target[1] * (255u - green));
++        target[2] = divideBy255U32(target[2] * (255u - blue));
++        target[3] = divideBy255U32(target[3] * (255u - alpha));
++    }
++}
++#endif
++
+ // GameMaker's bm_subtract is ZERO / INV_SRC_COLOR, not reverse subtraction:
+ // every destination channel is multiplied by one minus its source channel.
+ // In particular source alpha does not scale RGB, and alpha-zero texels can
+ // still darken RGB. AM2R builds its light mask with this blend. Keep the tint
+-// and blend /255 stages, but process the common contiguous atlas spans
+-// eight pixels at a time on the Cortex-A9. Scaled/clipped spans retain
+-// clamped nearest-neighbour sampling and use an exact division-free scalar
+-// /255 operation, so their pixels remain bit-identical to the original path.
++// and blend /255 stages, but process eight pixels at a time on the Cortex-A9.
++// Half-scale light quadrants use packed loads; other scales gather the same
++// signed 16.16, clamped nearest-neighbour samples as the scalar tail. Do not
++// narrow the rendered surface or treat source alpha zero as transparent.
+ static void blendSubtractTextureSpan(uint32_t* destination,
+                                      const uint32_t* sourceRow,
+                                      int32_t textureWidth,
+@@ -104,26 +169,55 @@ static void blendSubtractTextureSpan(uint32_t* destination,
+                                      uint8_t tintA) {
+     int32_t output = 0;
+ #if defined(USE_MISTER) && defined(__ARM_NEON)
+-    const bool contiguous = sourceStep == (1ll << 16) ||
+-                            sourceStep == -(1ll << 16);
++    if (sourceStep == (1ll << 16) || sourceStep == -(1ll << 16)) {
++        blendSubtractTextureUnitSpan(destination, sourceRow, textureWidth,
++            sourceX, sourceStep, count, tintR, tintG, tintB, tintA);
++        return;
++    }
++    const bool halfScale = sourceStep == (2ll << 16) ||
++                           sourceStep == -(2ll << 16);
++    // A scaled self-surface draw must retain the scalar read/write order.
++    const uintptr_t sourceBegin = (uintptr_t)sourceRow;
++    const uintptr_t destinationBegin = (uintptr_t)destination;
++    const bool aliases = sourceBegin < destinationBegin + (size_t)count * 4u &&
++                         destinationBegin < sourceBegin + (size_t)textureWidth * 4u;
+     const uint8x8_t tintRv = vdup_n_u8(tintR);
+     const uint8x8_t tintGv = vdup_n_u8(tintG);
+     const uint8x8_t tintBv = vdup_n_u8(tintB);
+     const uint8x8_t tintAv = vdup_n_u8(tintA);
+-    while (contiguous && output + 8 <= count) {
++    while (!aliases && output + 8 <= count) {
+         int32_t sourceIndex = (int32_t)(sourceX >> 16);
+         const bool forward = sourceStep > 0;
+-        if ((forward && (sourceIndex < 0 || sourceIndex + 7 >= textureWidth)) ||
+-            (!forward && (sourceIndex - 7 < 0 || sourceIndex >= textureWidth)))
+-            break;
+-        const uint8_t* source = (const uint8_t*)(sourceRow +
+-            (forward ? sourceIndex : sourceIndex - 7));
+-        uint8x8x4_t pixels = vld4_u8(source);
+-        if (!forward) {
+-            pixels.val[0] = vrev64_u8(pixels.val[0]);
+-            pixels.val[1] = vrev64_u8(pixels.val[1]);
+-            pixels.val[2] = vrev64_u8(pixels.val[2]);
+-            pixels.val[3] = vrev64_u8(pixels.val[3]);
++        uint8x8x4_t pixels;
++        if (halfScale && sourceIndex >= (forward ? 0 : 15) &&
++                   sourceIndex <= textureWidth - (forward ? 16 : 1)) {
++            // Fetch sixteen texels without crossing the source-row boundary.
++            // Forward uses even lanes; reverse loads through sourceIndex and
++            // uses reversed odd lanes. The unused extra texel must also fit,
++            // including on odd-width atlases and at either clipped edge.
++            const uint8_t* source = (const uint8_t*)(sourceRow +
++                (forward ? sourceIndex : sourceIndex - 15));
++            uint8x16x4_t packed = vld4q_u8(source);
++            for (int channel = 0; channel < 4; ++channel) {
++                uint8x8x2_t separated = vuzp_u8(vget_low_u8(packed.val[channel]),
++                                                vget_high_u8(packed.val[channel]));
++                pixels.val[channel] = separated.val[forward ? 0 : 1];
++                if (!forward) pixels.val[channel] = vrev64_u8(pixels.val[channel]);
++            }
++        } else {
++            // ARMv7 NEON has no gather instruction. Gather only the eight
++            // sampled words, then deinterleave their RGBA bytes for the same
++            // exact vector tint/blend arithmetic. This also covers repeated
++            // edge texels, fractional scales, quarter scale, and either sign.
++            uint32_t gathered[8];
++            int64_t sampleX = sourceX;
++            for (int lane = 0; lane < 8; ++lane, sampleX += sourceStep) {
++                int32_t index = (int32_t)(sampleX >> 16);
++                if (index < 0) index = 0;
++                if (index >= textureWidth) index = textureWidth - 1;
++                gathered[lane] = sourceRow[index];
++            }
++            pixels = vld4_u8((const uint8_t*)gathered);
+         }
+         uint8x8_t alpha = divideBy255U16(vmull_u8(pixels.val[3], tintAv));
+         uint8x8_t red = divideBy255U16(vmull_u8(pixels.val[0], tintRv));
+diff --git a/src/backends/mister.c b/src/backends/mister.c
+index 3493b92..21cdc88 100644
+--- a/src/backends/mister.c
++++ b/src/backends/mister.c
+@@ -1139,6 +1139,54 @@ static void copyCroppedTextureRows(void* destination, const void* source,
+                sourcePixels + row * sourceRowBytes, cropRowBytes);
+ }
+ 
++static inline uint32_t gpuCropReadWord(const uint8_t* pixels) {
++    uint32_t word;
++    memcpy(&word, pixels, sizeof(word));
++    return word;
++}
++
++static inline bool gpuCropBlockEqual32(const uint8_t* a, const uint8_t* b) {
++#if defined(__ARM_NEON)
++    uint8x16_t difference = vorrq_u8(veorq_u8(vld1q_u8(a), vld1q_u8(b)),
++                                    veorq_u8(vld1q_u8(a + 16), vld1q_u8(b + 16)));
++    uint32x2_t folded = vreinterpret_u32_u8(vorr_u8(vget_low_u8(difference),
++                                                  vget_high_u8(difference)));
++    return (vget_lane_u32(folded, 0) | vget_lane_u32(folded, 1)) == 0;
++#else
++    uint32_t difference = 0;
++    for (unsigned i = 0; i < 8; ++i)
++        difference |= gpuCropReadWord(a + 4 * i) ^ gpuCropReadWord(b + 4 * i);
++    return difference == 0;
++#endif
++}
++
++// Find exactly the old first-to-last differing-byte span rounded outward to
++// four-byte pixels. Comparing whole rows and then rescanning their unchanged
++// prefixes/suffixes bytewise is costly for the recreated lighting surface.
++// Scan each end in blocks instead, retaining identical upload spans and bytes.
++// Unaligned sources and partial final words remain valid; no load crosses a row.
++static bool gpuCropChangedBounds(const uint8_t* a, const uint8_t* b, size_t bytes,
++                                  size_t* firstOut, size_t* lastOut) {
++    size_t first = 0;
++    while (bytes - first >= 32 && gpuCropBlockEqual32(a + first, b + first)) first += 32;
++    while (bytes - first >= 4 && gpuCropReadWord(a + first) == gpuCropReadWord(b + first)) first += 4;
++    if (bytes - first < 4) {
++        while (first < bytes && a[first] == b[first]) ++first;
++    }
++    if (first == bytes) return false;
++    first &= ~(size_t)3u;
++    size_t last = bytes;
++    while ((last & 3u) && a[last - 1] == b[last - 1]) --last;
++    if (!(last & 3u)) {
++        while (last - first >= 32 && gpuCropBlockEqual32(a + last - 32, b + last - 32)) last -= 32;
++        while (last - first >= 4 && gpuCropReadWord(a + last - 4) == gpuCropReadWord(b + last - 4)) last -= 4;
++    }
++    *firstOut = first;
++    last = (last + 3u) & ~(size_t)3u;
++    *lastOut = last > bytes ? bytes : last;
++    return true;
++}
++
+ static bool updateCroppedTextureChangedRows(uint8_t* shadowPixels,
+                                             uint8_t* targetPixels,
+                                             const uint8_t* sourcePixels,
+@@ -1149,15 +1197,8 @@ static bool updateCroppedTextureChangedRows(uint8_t* shadowPixels,
+     for (size_t row = 0; row < rowCount; ++row) {
+         const uint8_t* sourceRow = sourcePixels + row * sourceRowBytes;
+         uint8_t* shadowRow = shadowPixels + row * cropRowBytes;
+-        if (gpuBuffersEqual(shadowRow, sourceRow, cropRowBytes)) continue;
+-
+-        size_t first = 0;
+-        while (first < cropRowBytes && shadowRow[first] == sourceRow[first]) first++;
+-        size_t last = cropRowBytes;
+-        while (last > first && shadowRow[last - 1] == sourceRow[last - 1]) last--;
+-        first &= ~(size_t)3u;
+-        last = (last + 3u) & ~(size_t)3u;
+-        if (last > cropRowBytes) last = cropRowBytes;
++        size_t first, last;
++        if (!gpuCropChangedBounds(shadowRow, sourceRow, cropRowBytes, &first, &last)) continue;
+         memcpy(shadowRow + first, sourceRow + first, last - first);
+         GPU_TEXTURE_COPY(targetPixels + row * cropRowBytes + first,
+                sourceRow + first, last - first);

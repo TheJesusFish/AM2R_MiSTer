@@ -42,7 +42,10 @@ echo 0 > "$trace/tracing_on"
 echo 4096 > "$trace/buffer_size_kb"
 echo > "$trace/trace"
 echo > "$trace/uprobe_events"
-if [ "$probe_mode" = "wait-only" ]; then
+if [ "$probe_mode" = "step-only" ]; then
+    # One entry probe per frame: measure cadence without paired-stage overhead.
+    echo "p:am2r_step $exe:$step_offset" > "$trace/uprobe_events"
+elif [ "$probe_mode" = "wait-only" ]; then
     echo "p:am2r_wait $exe:$wait_offset" > "$trace/uprobe_events"
 else
     echo "p:am2r_step $exe:$step_offset" > "$trace/uprobe_events"

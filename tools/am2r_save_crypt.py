@@ -16,19 +16,25 @@ def gml_round(value: float) -> int:
     return math.floor(value + 0.5)
 
 
-def transform(data: bytearray, rate_argument: int = 2) -> None:
-    gmid = GAME_ID
+def transform(data: bytearray, rate_argument: int = 2, *, game_id: str = GAME_ID,
+              native_char_at_zero: bool = False) -> None:
+    if not game_id:
+        raise ValueError("game_id must not be empty")
+    gmid = game_id
     for _ in range(5):
         gmid += gmid
 
     keys = []
     key_pos = 0
-    for encrypted_pos in range(len(GAME_ID) * 5):
-        # GameMaker strings are one-based. string_copy clamps position zero to
-        # the first character, while string_char_at(0) returns an empty string.
+    for encrypted_pos in range(len(game_id) * 5):
+        # Both runtimes clamp string_copy(0), but only the old native Windows
+        # runner clamps string_char_at(0). Butterscotch returns an empty string.
+        # This difference affects key[0], used only at the first file byte.
         gmid_index = max(encrypted_pos - 1, 0)
         gmid_ord = ord(gmid[gmid_index])
         key_ord = 0 if key_pos == 0 else ord(KEY[key_pos - 1])
+        if key_pos == 0 and native_char_at_zero:
+            key_ord = ord(KEY[0])
         keys.append(gmid_ord ^ (key_ord - math.floor(encrypted_pos / 3)))
         key_pos += 1
         if key_pos > len(KEY):

@@ -39,7 +39,7 @@ file(READ "${USER_IO}" USER_IO_SOURCE)
 set(USER_IO_SET_SIGNATURE
     "void user_io_status_set(const char *opt, uint32_t value, int ex)\n{")
 set(USER_IO_SET_HOOK
-    "extern \"C\" void am2r_user_io_status_event(const char *opt, uint32_t value, int ex);\n\nvoid user_io_status_set(const char *opt, uint32_t value, int ex)\n{\n\tam2r_user_io_status_event(opt, value, ex);")
+    "extern \"C\" bool am2r_user_io_status_event(const char *opt, uint32_t value, int ex);\n\nvoid user_io_status_set(const char *opt, uint32_t value, int ex)\n{\n\tif (am2r_user_io_status_event(opt, value, ex)) return;")
 string(FIND "${USER_IO_SOURCE}" "${USER_IO_SET_SIGNATURE}" USER_IO_SET_OFFSET)
 if(USER_IO_SET_OFFSET EQUAL -1)
     message(FATAL_ERROR "Pinned Main_MiSTer user_io_status_set signature changed")
@@ -48,6 +48,35 @@ string(REPLACE "${USER_IO_SET_SIGNATURE}" "${USER_IO_SET_HOOK}"
     USER_IO_SOURCE "${USER_IO_SOURCE}")
 set(PATCHED_USER_IO "${CMAKE_CURRENT_BINARY_DIR}/user_io.cpp")
 file(WRITE "${PATCHED_USER_IO}" "${USER_IO_SOURCE}")
+
+# All normal OSD/file-selection/MiSTer_cmd core changes converge here. The
+# companion must stop submitting and finish its GPU work BEFORE upstream
+# asserts reset or disables bridges, not after app_restart kills its parent.
+# Modify only this generated copy; the pinned upstream checkout stays pristine.
+set(FPGA_IO "${MAIN_MISTER_SOURCE}/fpga_io.cpp")
+list(REMOVE_ITEM MAIN_CXX "${FPGA_IO}")
+file(READ "${FPGA_IO}" FPGA_IO_SOURCE)
+foreach(FUNCTION IN ITEMS
+    "int fpga_load_rbf(const char *name, const char *cfg, const char *xml)"
+    "void app_restart(const char *path, const char *xml, const char *exe)"
+    "void reboot(int cold)")
+    set(SIGNATURE "${FUNCTION}\n{")
+    string(FIND "${FPGA_IO_SOURCE}" "${SIGNATURE}" OFFSET)
+    if(OFFSET EQUAL -1)
+        message(FATAL_ERROR "Pinned Main_MiSTer shutdown signature changed: ${FUNCTION}")
+    endif()
+    if(FUNCTION MATCHES "^int ")
+        set(FAILURE_RETURN "return -1;")
+    else()
+        set(FAILURE_RETURN "return;")
+    endif()
+    string(REPLACE "${SIGNATURE}"
+        "${SIGNATURE}\n\tif (!am2r_before_fpga_reconfigure()) ${FAILURE_RETURN}"
+        FPGA_IO_SOURCE "${FPGA_IO_SOURCE}")
+endforeach()
+set(PATCHED_FPGA_IO "${CMAKE_CURRENT_BINARY_DIR}/fpga_io.cpp")
+file(WRITE "${PATCHED_FPGA_IO}"
+    "extern \"C\" bool am2r_before_fpga_reconfigure();\n${FPGA_IO_SOURCE}")
 
 # The pinned current-upstream Main_MiSTer source is normally compiled with GCC, whose libstdc++
 # accepts hypotf() in this C++14 constant initializer.  Zig's Clang frontend
@@ -73,6 +102,7 @@ add_executable(MiSTer_AM2R
     ${MAIN_CXX}
     "${PATCHED_N64_JOY_EMU}"
     "${PATCHED_USER_IO}"
+    "${PATCHED_FPGA_IO}"
     am2r_main.cpp
     am2r_wrapper.cpp
     "${CMAKE_CURRENT_BINARY_DIR}/logo_blob.S"

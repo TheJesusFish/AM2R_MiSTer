@@ -1,0 +1,26 @@
+--- a/src/sw_renderer.c
++++ b/src/sw_renderer.c
+@@ -198,11 +198,18 @@
+             const uint8_t* source = (const uint8_t*)(sourceRow +
+                 (forward ? sourceIndex : sourceIndex - 15));
+             uint8x16x4_t packed = vld4q_u8(source);
+-            for (int channel = 0; channel < 4; ++channel) {
+-                uint8x8x2_t separated = vuzp_u8(vget_low_u8(packed.val[channel]),
+-                                                vget_high_u8(packed.val[channel]));
+-                pixels.val[channel] = separated.val[forward ? 0 : 1];
+-                if (!forward) pixels.val[channel] = vrev64_u8(pixels.val[channel]);
++            // Fixed channel indices keep packed selection in NEON registers.
++            // The sign branch is outside the four-channel selection sequence.
++            if (forward) {
++                pixels.val[0] = vuzp_u8(vget_low_u8(packed.val[0]), vget_high_u8(packed.val[0])).val[0];
++                pixels.val[1] = vuzp_u8(vget_low_u8(packed.val[1]), vget_high_u8(packed.val[1])).val[0];
++                pixels.val[2] = vuzp_u8(vget_low_u8(packed.val[2]), vget_high_u8(packed.val[2])).val[0];
++                pixels.val[3] = vuzp_u8(vget_low_u8(packed.val[3]), vget_high_u8(packed.val[3])).val[0];
++            } else {
++                pixels.val[0] = vrev64_u8(vuzp_u8(vget_low_u8(packed.val[0]), vget_high_u8(packed.val[0])).val[1]);
++                pixels.val[1] = vrev64_u8(vuzp_u8(vget_low_u8(packed.val[1]), vget_high_u8(packed.val[1])).val[1]);
++                pixels.val[2] = vrev64_u8(vuzp_u8(vget_low_u8(packed.val[2]), vget_high_u8(packed.val[2])).val[1]);
++                pixels.val[3] = vrev64_u8(vuzp_u8(vget_low_u8(packed.val[3]), vget_high_u8(packed.val[3])).val[1]);
+             }
+         } else {
+             // ARMv7 NEON has no gather instruction. Gather only the eight

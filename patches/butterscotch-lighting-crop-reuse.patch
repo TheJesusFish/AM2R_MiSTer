@@ -1,0 +1,123 @@
+diff --git a/src/backends/mister.c b/src/backends/mister.c
+index 8685792..b494a1b 100644
+--- a/src/backends/mister.c
++++ b/src/backends/mister.c
+@@ -835,6 +835,33 @@ static void copyCroppedTextureRows(void* destination, const void* source,
+                sourcePixels + row * sourceRowBytes, cropRowBytes);
+ }
+ 
++static bool updateCroppedTextureChangedRows(uint8_t* shadowPixels,
++                                            uint8_t* targetPixels,
++                                            const uint8_t* sourcePixels,
++                                            size_t sourceRowBytes,
++                                            size_t cropRowBytes,
++                                            size_t rowCount) {
++    bool wrotePixels = false;
++    for (size_t row = 0; row < rowCount; ++row) {
++        const uint8_t* sourceRow = sourcePixels + row * sourceRowBytes;
++        uint8_t* shadowRow = shadowPixels + row * cropRowBytes;
++        if (gpuBuffersEqual(shadowRow, sourceRow, cropRowBytes)) continue;
++
++        size_t first = 0;
++        while (first < cropRowBytes && shadowRow[first] == sourceRow[first]) first++;
++        size_t last = cropRowBytes;
++        while (last > first && shadowRow[last - 1] == sourceRow[last - 1]) last--;
++        first &= ~(size_t)3u;
++        last = (last + 3u) & ~(size_t)3u;
++        if (last > cropRowBytes) last = cropRowBytes;
++        memcpy(shadowRow + first, sourceRow + first, last - first);
++        memcpy(targetPixels + row * cropRowBytes + first,
++               sourceRow + first, last - first);
++        wrotePixels = true;
++    }
++    return wrotePixels;
++}
++
+ static MisterGpuTexture* reuseReleasedCroppedTexture(
+         const void* rgbaPixels, size_t bytes, size_t sourceRowBytes,
+         size_t cropRowBytes, size_t rowCount, uint32_t sourceRevision) {
+@@ -854,8 +881,37 @@ static MisterGpuTexture* reuseReleasedCroppedTexture(
+         if (best->shadow_alt == NULL) return NULL;
+     }
+ 
++    // AM2R frees and recreates its light surface each frame. The allocator may
++    // return the same CPU pointer, but releaseTexture correctly invalidates its
++    // identity. Once the preceding GPU job is complete, the retained shadows
++    // can still be compared with the new surface contents. Recopying both full
++    // 320x240 textures here costs about 8 ms on strongly ordered FPGA DDR.
++    const bool reusableShadow = best->sparse && best->shadow_valid &&
++                                best->shadow_alt != NULL;
++    if (reusableShadow) {
++        const uint8_t active = best->active;
++        uint8_t* targetPixels = g_gpu_textures +
++            (best->physical[active] - GPU_TEXTURE_PHYS);
++        if (updateCroppedTextureChangedRows(
++                (uint8_t*)best->shadow, targetPixels,
++                (const uint8_t*)rgbaPixels, sourceRowBytes,
++                cropRowBytes, rowCount))
++            __sync_synchronize();
++    } else {
++        best->active = 0;
++        copyCroppedTextureRows(best->shadow, rgbaPixels, sourceRowBytes,
++                               cropRowBytes, rowCount);
++        copyCroppedTextureRows(best->shadow_alt, rgbaPixels, sourceRowBytes,
++                               cropRowBytes, rowCount);
++        copyCroppedTextureRows(
++            g_gpu_textures + (best->physical[0] - GPU_TEXTURE_PHYS), rgbaPixels,
++            sourceRowBytes, cropRowBytes, rowCount);
++        copyCroppedTextureRows(
++            g_gpu_textures + (best->physical[1] - GPU_TEXTURE_PHYS), rgbaPixels,
++            sourceRowBytes, cropRowBytes, rowCount);
++        __sync_synchronize();
++    }
+     best->source = rgbaPixels;
+-    best->active = 0;
+     best->dynamic = true;
+     best->source_revision = sourceRevision;
+     best->source_revision_valid = true;
+@@ -866,17 +922,6 @@ static MisterGpuTexture* reuseReleasedCroppedTexture(
+     best->last_upload_frame = g_gpu_frame_serial;
+     best->generation = nextTextureGeneration();
+     best->opaque_generation = 0;
+-    copyCroppedTextureRows(best->shadow, rgbaPixels, sourceRowBytes,
+-                           cropRowBytes, rowCount);
+-    copyCroppedTextureRows(best->shadow_alt, rgbaPixels, sourceRowBytes,
+-                           cropRowBytes, rowCount);
+-    copyCroppedTextureRows(
+-        g_gpu_textures + (best->physical[0] - GPU_TEXTURE_PHYS), rgbaPixels,
+-        sourceRowBytes, cropRowBytes, rowCount);
+-    copyCroppedTextureRows(
+-        g_gpu_textures + (best->physical[1] - GPU_TEXTURE_PHYS), rgbaPixels,
+-        sourceRowBytes, cropRowBytes, rowCount);
+-    __sync_synchronize();
+     return best;
+ }
+ 
+@@ -922,24 +967,9 @@ uint32_t MisterGpu_uploadSparseDynamicTextureCropRevision(const void* rgbaPixels
+             (uint8_t*)record->shadow_alt : (uint8_t*)record->shadow;
+         uint8_t* targetPixels = g_gpu_textures +
+             (record->physical[target] - GPU_TEXTURE_PHYS);
+-        bool wrotePixels = false;
+-        for (size_t row = 0; row < rowCount; ++row) {
+-            const uint8_t* sourceRow = sourcePixels + row * sourceRowBytes;
+-            uint8_t* shadowRow = targetShadow + row * cropRowBytes;
+-            if (gpuBuffersEqual(shadowRow, sourceRow, cropRowBytes)) continue;
+-
+-            size_t first = 0;
+-            while (first < cropRowBytes && shadowRow[first] == sourceRow[first]) first++;
+-            size_t last = cropRowBytes;
+-            while (last > first && shadowRow[last - 1] == sourceRow[last - 1]) last--;
+-            first &= ~(size_t)3u;
+-            last = (last + 3u) & ~(size_t)3u;
+-            if (last > cropRowBytes) last = cropRowBytes;
+-            memcpy(shadowRow + first, sourceRow + first, last - first);
+-            memcpy(targetPixels + row * cropRowBytes + first,
+-                   sourceRow + first, last - first);
+-            wrotePixels = true;
+-        }
++        bool wrotePixels = updateCroppedTextureChangedRows(
++            targetShadow, targetPixels, sourcePixels, sourceRowBytes,
++            cropRowBytes, rowCount);
+         if (wrotePixels) __sync_synchronize();
+         if (switchBuffer) {
+             void* previousShadow = record->shadow;

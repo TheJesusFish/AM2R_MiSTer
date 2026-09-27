@@ -1,0 +1,209 @@
+diff --git a/src/runner.c b/src/runner.c
+index a4ae8c2..9d9fe39 100644
+--- a/src/runner.c
++++ b/src/runner.c
+@@ -547,65 +547,128 @@ static bool Runner_tryExecuteAm2rWaterDraw(Runner* runner, Instance* instance,
+     return true;
+ }
+ 
+-// AM2R's sand rooms can have hundreds of visible oBlockSand instances. Their
+-// custom Draw event is intentionally simple, but interpreting the same four
+-// flag checks and draw_sprite calls for every 16x16 cell consumes several
+-// milliseconds per frame on the Cortex-A9. Execute that exact event natively
+-// while retaining the ordinary interpreter for every other code entry and for
+-// any AM2R data revision whose object/code/variables do not match.
+-static bool Runner_tryExecuteAm2rSandDraw(Runner* runner, Instance* instance,
+-                                          int32_t eventType, int32_t eventSubtype,
+-                                          int32_t codeId, int32_t ownerObjectIndex) {
++// Resolve and validate AM2R 1.1's exact oBlockSand Draw contract once. The
++// cache is deliberately opt-in: any missing/mismatched object, code, sprite or
++// variable name permanently selects the ordinary interpreter for this Runner.
++static bool Runner_initializeAm2rSandDrawCache(Runner* runner) {
+     static const char objectName[] = "oBlockSand";
+     static const char codeName[] = "gml_Object_oBlockSand_Draw_0";
+     static const char cornerSpriteName[] = "sSandCorner";
+     static const char* const cornerVariableNames[] = {
+         "sandcrn0", "sandcrn1", "sandcrn2", "sandcrn3"
+     };
+-    int32_t cornerVariableIds[sizeof(cornerVariableNames) /
+-                              sizeof(cornerVariableNames[0])];
+ 
+-    if (eventType != EVENT_DRAW || eventSubtype != DRAW_NORMAL ||
+-        instance == nullptr || runner->renderer == nullptr ||
+-        codeId < 0 || (uint32_t)codeId >= runner->dataWin->code.count ||
+-        ownerObjectIndex < 0 ||
+-        (uint32_t)ownerObjectIndex >= runner->dataWin->objt.count)
+-        return false;
++    if (runner->am2rSandDrawCacheStatus != 0)
++        return runner->am2rSandDrawCacheStatus > 0;
++
++    // Mark unsupported first so every early return remains a safe fallback.
++    runner->am2rSandDrawCacheStatus = -1;
++    int32_t objectIndex = -1;
++    for (uint32_t i = 0; i < runner->dataWin->objt.count; ++i) {
++        const GameObject* object = &runner->dataWin->objt.objects[i];
++        if (object->present && object->name != nullptr &&
++            strcmp(object->name, objectName) == 0) {
++            objectIndex = (int32_t)i;
++            break;
++        }
++    }
++    if (objectIndex < 0) return false;
+ 
++    int32_t ownerObjectIndex = -1;
++    int32_t codeId = findEventCodeIdAndOwner(
++        runner, objectIndex, EVENT_DRAW, DRAW_NORMAL, &ownerObjectIndex);
++    if (codeId < 0 || (uint32_t)codeId >= runner->dataWin->code.count ||
++        ownerObjectIndex != objectIndex)
++        return false;
+     const CodeEntry* code = &runner->dataWin->code.entries[codeId];
+-    const GameObject* owner = &runner->dataWin->objt.objects[ownerObjectIndex];
+-    if (code->name == nullptr || owner->name == nullptr ||
+-        strcmp(code->name, codeName) != 0 ||
+-        strcmp(owner->name, objectName) != 0)
++    if (code->name == nullptr || strcmp(code->name, codeName) != 0)
+         return false;
+ 
+-    VMContext* vm = runner->vmContext;
+-    for (size_t i = 0;
+-         i < sizeof(cornerVariableNames) / sizeof(cornerVariableNames[0]); ++i) {
+-        ptrdiff_t slot = shgeti(vm->varNameMap, (char*)cornerVariableNames[i]);
++    int32_t cornerSprite = -1;
++    for (uint32_t i = 0; i < runner->dataWin->sprt.count; ++i) {
++        const Sprite* sprite = &runner->dataWin->sprt.sprites[i];
++        if (sprite->present && sprite->name != nullptr &&
++            strcmp(sprite->name, cornerSpriteName) == 0) {
++            cornerSprite = (int32_t)i;
++            break;
++        }
++    }
++    if (cornerSprite < 0) return false;
++
++    int32_t cornerVariableIds[4];
++    for (size_t i = 0; i < 4; ++i) {
++        ptrdiff_t slot = shgeti(runner->vmContext->varNameMap,
++                                (char*)cornerVariableNames[i]);
+         if (slot < 0) return false;
+-        cornerVariableIds[i] = vm->varNameMap[slot].value;
+-        if (!IntRValueHashMap_contains(&instance->selfVars,
+-                                       cornerVariableIds[i]))
+-            return false;
++        cornerVariableIds[i] = runner->vmContext->varNameMap[slot].value;
+     }
+ 
+-    int32_t cornerSprite = shget(runner->assetsByName,
+-                                 (char*)cornerSpriteName);
+-    if (cornerSprite < 0 ||
+-        (uint32_t)cornerSprite >= runner->dataWin->sprt.count ||
+-        runner->dataWin->sprt.sprites[cornerSprite].name == nullptr ||
+-        strcmp(runner->dataWin->sprt.sprites[cornerSprite].name,
+-               cornerSpriteName) != 0)
++    runner->am2rSandObjectIndex = objectIndex;
++    runner->am2rSandDrawCodeId = codeId;
++    runner->am2rSandDrawOwnerObjectIndex = ownerObjectIndex;
++    runner->am2rSandCornerSpriteIndex = cornerSprite;
++    memcpy(runner->am2rSandCornerVariableIds, cornerVariableIds,
++           sizeof(cornerVariableIds));
++    runner->am2rSandDrawCacheStatus = 1;
++    return true;
++}
++
++static bool Runner_drawCachedAm2rSandInstance(Runner* runner,
++                                               Instance* instance) {
++    if (instance == nullptr || runner->renderer == nullptr ||
++        !Runner_initializeAm2rSandDrawCache(runner) ||
++        instance->objectIndex != runner->am2rSandObjectIndex)
++        return false;
++
++    RValue* cornerValues[4];
++    for (size_t i = 0; i < 4; ++i) {
++        cornerValues[i] = IntRValueHashMap_findSlot(
++            &instance->selfVars, runner->am2rSandCornerVariableIds[i]);
++        if (cornerValues[i] == nullptr) return false;
++    }
++
++    Renderer_drawSprite(runner->renderer, instance->spriteIndex,
++                        (int32_t)instance->imageIndex,
++                        instance->x, instance->y);
++    for (int32_t corner = 0; corner < 4; ++corner) {
++        if (RValue_toBool(*cornerValues[corner])) {
++            Renderer_drawSprite(runner->renderer,
++                                runner->am2rSandCornerSpriteIndex, corner,
++                                instance->x, instance->y);
++        }
++    }
++    return true;
++}
++
++// AM2R's sand rooms can have hundreds of visible oBlockSand instances. Their
++// custom Draw event is intentionally simple, but interpreting it for every
++// 16x16 cell is expensive on the Cortex-A9. Keep this resolved-event hook for
++// inherited instances and callers outside Runner_draw; the common exact-object
++// draw loop bypasses event resolution entirely below.
++static bool Runner_tryExecuteAm2rSandDraw(Runner* runner, Instance* instance,
++                                          int32_t eventType, int32_t eventSubtype,
++                                          int32_t codeId, int32_t ownerObjectIndex) {
++    if (eventType != EVENT_DRAW || eventSubtype != DRAW_NORMAL ||
++        instance == nullptr || runner->renderer == nullptr ||
++        !Runner_initializeAm2rSandDrawCache(runner) ||
++        codeId != runner->am2rSandDrawCodeId ||
++        ownerObjectIndex != runner->am2rSandDrawOwnerObjectIndex)
+         return false;
+ 
++    RValue* cornerValues[4];
++    for (size_t i = 0; i < 4; ++i) {
++        cornerValues[i] = IntRValueHashMap_findSlot(
++            &instance->selfVars, runner->am2rSandCornerVariableIds[i]);
++        if (cornerValues[i] == nullptr) return false;
++    }
++
+     Renderer_drawSprite(runner->renderer, instance->spriteIndex,
+                         (int32_t)instance->imageIndex,
+                         instance->x, instance->y);
+     for (int32_t corner = 0; corner < 4; ++corner) {
+-        if (RValue_toBool(Instance_getSelfVar(
+-                instance, cornerVariableIds[corner]))) {
+-            Renderer_drawSprite(runner->renderer, cornerSprite, corner,
++        if (RValue_toBool(*cornerValues[corner])) {
++            Renderer_drawSprite(runner->renderer,
++                                runner->am2rSandCornerSpriteIndex, corner,
+                                 instance->x, instance->y);
+         }
+     }
+@@ -1365,6 +1428,13 @@ void Runner_draw(Runner* runner) {
+             // Filter inactive/invisible instances at draw time so the cache doesn't need invalidation when those flags toggle.
+             if (!inst->active || !inst->visible) continue;
+ 
++#ifdef USE_MISTER
++            // Hundreds of exact oBlockSand instances can be visible at once.
++            // Their validated native Draw implementation needs no event-table
++            // lookup or VM event-context save/restore on this hot path.
++            if (Runner_drawCachedAm2rSandInstance(runner, inst)) continue;
++#endif
++
+             int32_t ownerObjectIndex = -1;
+             int32_t codeId = findEventCodeIdAndOwner(runner, inst->objectIndex, EVENT_DRAW, DRAW_NORMAL, &ownerObjectIndex);
+             if (codeId >= 0) {
+diff --git a/src/runner.h b/src/runner.h
+index b3e4341..525e794 100644
+--- a/src/runner.h
++++ b/src/runner.h
+@@ -590,6 +590,18 @@ struct Runner {
+     ResolvedEventTable eventTable;
+     // Precomputed assets map.
+     AssetsByNameEntry* assetsByName;
++#ifdef USE_MISTER
++    // Lazily validated AM2R-specific sand Draw contract. Room 122 can put
++    // hundreds of these instances on screen at once, so resolving the same
++    // event and four variable names for every cell costs meaningful ARM time.
++    // status: 0 = unresolved, 1 = exact supported contract, -1 = fallback.
++    int8_t am2rSandDrawCacheStatus;
++    int32_t am2rSandObjectIndex;
++    int32_t am2rSandDrawCodeId;
++    int32_t am2rSandDrawOwnerObjectIndex;
++    int32_t am2rSandCornerSpriteIndex;
++    int32_t am2rSandCornerVariableIds[4];
++#endif
+     // For each event type, the deduplicated list of object indices that respond to ANY subtype of that event (including via inheritance). Derived from the event table; used by collision dispatch to skip non-collision objects in the outer loop.
+     // Length = OBJT_EVENT_TYPE_COUNT.
+     int32_t** objectsWithAnyEventOfType;

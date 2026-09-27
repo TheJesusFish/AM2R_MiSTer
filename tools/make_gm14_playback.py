@@ -36,6 +36,8 @@ def main() -> int:
     parser.add_argument("idle_recording", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--frames", type=int, default=1800)
+    parser.add_argument("--confirm-frames", type=int, nargs="+", default=[1920, 2040],
+                        help="Frames at which to pulse Z / Menu OK")
     args = parser.parse_args()
 
     raw = args.idle_recording.read_bytes()
@@ -47,8 +49,10 @@ def main() -> int:
     # Old GameMaker records the current 256-entry virtual-key array first. The
     # unskippable native intro reaches the title at roughly 27 seconds.
     pulse(frames, 13, 1800)  # Return / configured Start
-    pulse(frames, 90, 1920)  # Z / configured menu OK
-    pulse(frames, 90, 2040)  # confirm a possible continue prompt
+    for frame in args.confirm_frames:
+        if frame < 0:
+            parser.error("confirmation frames must be nonnegative")
+        pulse(frames, 90, frame)  # Z / configured menu OK
 
     # Walk left and right after room loading has had ample time to finish.
     hold(frames, 37, 2700, 2850)

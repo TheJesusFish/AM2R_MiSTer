@@ -18,12 +18,18 @@ $cCompiler = (Resolve-Path -LiteralPath (Join-Path $projectRoot 'scripts\zig-cc-
 $cxxCompiler = (Resolve-Path -LiteralPath (Join-Path $projectRoot 'scripts\zig-cxx-arm-linux.cmd')).Path
 $archiver = (Resolve-Path -LiteralPath (Join-Path $projectRoot 'scripts\zig-ar.cmd')).Path
 $ranlib = (Resolve-Path -LiteralPath (Join-Path $projectRoot 'scripts\zig-ranlib.cmd')).Path
+$provenance = Join-Path $PSScriptRoot 'artifact_provenance.py'
+$output = Join-Path $BuildDirectory 'MiSTer_AM2R'
+$token = "$output.provenance.pending.json"
 
 $actualCommit = (& git -c "safe.directory=$($mainMiSTer.Replace('\', '/'))" -C $mainMiSTer rev-parse HEAD).Trim()
 $expectedCommit = '915ca3395aa5a26322007974faa757299a56b856'
 if ($actualCommit -ne $expectedCommit) {
     throw "Main_MiSTer checkout is $actualCommit; expected $expectedCommit."
 }
+
+& python $provenance begin frontend $output $token
+if ($LASTEXITCODE -ne 0) { throw 'Frontend pre-build provenance capture failed.' }
 
 $env:ZIG_GLOBAL_CACHE_DIR = Join-Path $projectRoot 'data\build\zig-global-cache'
 $env:ZIG_LOCAL_CACHE_DIR = Join-Path $projectRoot 'data\build\zig-local-cache'
@@ -46,10 +52,12 @@ if ($LASTEXITCODE -ne 0) { throw "HPS wrapper configure failed with exit code $L
 & $cmake --build $BuildDirectory --parallel 4
 if ($LASTEXITCODE -ne 0) { throw "HPS wrapper build failed with exit code $LASTEXITCODE." }
 
-$output = Join-Path $BuildDirectory 'MiSTer_AM2R'
 if (-not (Test-Path -LiteralPath $output -PathType Leaf)) {
     throw 'HPS wrapper build returned success but MiSTer_AM2R is missing.'
 }
+
+& python $provenance seal $token $output "$output.provenance.json"
+if ($LASTEXITCODE -ne 0) { throw 'Frontend artifact provenance could not be sealed.' }
 
 [pscustomobject]@{
     path = (Resolve-Path -LiteralPath $output).Path

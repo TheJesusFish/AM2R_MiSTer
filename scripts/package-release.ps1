@@ -4,7 +4,8 @@ param(
     [string]$FrontendPath = (Join-Path $PSScriptRoot '..\data\build\hps-wrapper\MiSTer_AM2R'),
     [string]$RunnerPath = (Join-Path $PSScriptRoot '..\data\build\butterscotch-mister-pipeline-final\butterscotch'),
     [string]$DmtcpDirectory = (Join-Path $PSScriptRoot '..\data\build\dmtcp-package\dmtcp'),
-    [string]$ReleaseDirectory = (Join-Path $PSScriptRoot '..\releases')
+    [string]$ReleaseDirectory = (Join-Path $PSScriptRoot '..\releases'),
+    [switch]$AllowUnattestedArtifacts
 )
 
 $ErrorActionPreference = 'Stop'
@@ -30,7 +31,6 @@ if (-not $release.StartsWith($projectRoot + [IO.Path]::DirectorySeparatorChar,
 
 New-Item -ItemType Directory -Force -Path $release | Out-Null
 $standaloneRbf = Join-Path $release 'AM2R.rbf'
-Copy-Item -LiteralPath $rbf -Destination $standaloneRbf -Force
 
 $stage = Join-Path (Join-Path $projectRoot 'build') ('release-stage-' + [guid]::NewGuid().ToString('N'))
 $archivePath = Join-Path $release 'AM2R_MiSTer_runtime.zip'
@@ -41,6 +41,14 @@ try {
     $stageBin = Join-Path $stageGame 'bin'
     $stageLicenses = Join-Path $stage 'LICENSES'
     New-Item -ItemType Directory -Force -Path $stageOther, $stageBin, $stageLicenses | Out-Null
+
+    $provenanceMode = if ($AllowUnattestedArtifacts) { 'observe' } else { 'bundle' }
+    & python (Join-Path $PSScriptRoot 'artifact_provenance.py') $provenanceMode `
+        (Join-Path $stage 'AM2R_BUILDSET.json') `
+        --fpga $rbf --frontend $frontend --runner $runner
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Build-set provenance failed. Rebuild the stale component, or explicitly use -AllowUnattestedArtifacts for a hash-only diagnostic package.'
+    }
 
     Copy-Item -LiteralPath $rbf -Destination (Join-Path $stageOther 'AM2R.rbf')
     Copy-Item -LiteralPath $frontend -Destination (Join-Path $stage 'MiSTer_AM2R')
@@ -84,11 +92,13 @@ Windows copy of AM2R 1.1 extracted into a folder.
 The first launch validates and extracts AM2R.zip into a generated
 /media/fat/games/am2r/.runtime-cache and can take longer than a warm relaunch.
 Later launches reuse that cache while the archive is unchanged. Save states
-contain executable memory and only load with the exact runtime build which
-created them. Keep at least 256 MiB free for a checkpoint; low-space requests
-are refused without replacing the previous slot. After loading a state, relaunch
-the core before saving another one; an unsafe nested save is refused and the
-previous slot is preserved. Weapon Select+Start exits to the MiSTer menu.
+are four logical .fast snapshots under /media/fat/savestates/AM2R. The core
+validates their format and game-data fingerprint before loading. Older .dmtcp
+process checkpoints are left untouched but are not loaded by this build.
+Weapon Select+Start exits to the MiSTer menu.
+
+AM2R_BUILDSET.json records the exact RBF, frontend, and runner hashes in this
+package. These files must be deployed as a matched set.
 
 AM2R.zip and all other proprietary game files are intentionally excluded.
 '@
@@ -133,9 +143,14 @@ AM2R.zip and all other proprietary game files are intentionally excluded.
         if ($zip.Entries.FullName -notcontains 'AM2R_GAME_DATA.txt') {
             throw 'Game-data file list is missing from the release bundle.'
         }
+        if ($zip.Entries.FullName -notcontains 'AM2R_BUILDSET.json') {
+            throw 'Build-set provenance is missing from the release bundle.'
+        }
     } finally {
         $zip.Dispose()
     }
+
+    Copy-Item -LiteralPath $rbf -Destination $standaloneRbf -Force
 
     $releaseManifest = @(
         ('{0}  AM2R.rbf' -f (Get-FileHash -Algorithm SHA256 -LiteralPath $standaloneRbf).Hash.ToLowerInvariant())

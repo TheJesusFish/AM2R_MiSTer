@@ -2,7 +2,8 @@
 param(
     [string]$SourceDirectory = (Join-Path $PSScriptRoot '..\third_party\Butterscotch'),
     [string]$BuildDirectory = (Join-Path $PSScriptRoot '..\data\build\butterscotch-mister-pipeline-final'),
-    [switch]$KeepSymbols
+    [switch]$KeepSymbols,
+    [switch]$RenderDiagnostics
 )
 
 $ErrorActionPreference = 'Stop'
@@ -14,10 +15,17 @@ $compiler = (Resolve-Path -LiteralPath (Join-Path $projectRoot 'scripts\zig-cc-a
 $archiver = (Resolve-Path -LiteralPath (Join-Path $projectRoot 'scripts\zig-ar.cmd')).Path
 $ranlib = (Resolve-Path -LiteralPath (Join-Path $projectRoot 'scripts\zig-ranlib.cmd')).Path
 $linkerFlags = if ($KeepSymbols) { '' } else { '-s' }
+$diagnostics = if ($RenderDiagnostics) { 'ON' } else { 'OFF' }
+$provenance = Join-Path $PSScriptRoot 'artifact_provenance.py'
+$runnerPath = Join-Path $BuildDirectory 'butterscotch'
+$token = "$runnerPath.provenance.pending.json"
 
 if (-not (Test-Path -LiteralPath (Join-Path $source 'src\backends\mister.c'))) {
     throw 'Butterscotch MiSTer patches are not applied. See patches\README.md.'
 }
+
+& python $provenance begin runner $runnerPath $token
+if ($LASTEXITCODE -ne 0) { throw 'Runner pre-build provenance capture failed.' }
 
 $env:ZIG_GLOBAL_CACHE_DIR = Join-Path $projectRoot 'data\build\zig-global-cache'
 $env:ZIG_LOCAL_CACHE_DIR = Join-Path $projectRoot 'data\build\zig-local-cache'
@@ -36,6 +44,7 @@ $env:ZIG_LOCAL_CACHE_DIR = Join-Path $projectRoot 'data\build\zig-local-cache'
     '-DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON' `
     '-DPLATFORM=cli' `
     '-DBACKEND=mister' `
+    "-DMISTER_RENDER_DIAGNOSTICS=$diagnostics" `
     '-DAUDIO_BACKEND=miniaudio' `
     '-DENABLE_WAD14=ON' `
     '-DENABLE_WAD16=OFF' `
@@ -49,10 +58,12 @@ if ($LASTEXITCODE -ne 0) { throw "CMake configure failed with exit code $LASTEXI
 & $cmake --build $BuildDirectory --parallel 4
 if ($LASTEXITCODE -ne 0) { throw "ARM build failed with exit code $LASTEXITCODE." }
 
-$runnerPath = Join-Path $BuildDirectory 'butterscotch'
 if (-not (Test-Path -LiteralPath $runnerPath -PathType Leaf)) {
     throw 'Build returned success but the butterscotch executable is missing.'
 }
+
+& python $provenance seal $token $runnerPath "$runnerPath.provenance.json"
+if ($LASTEXITCODE -ne 0) { throw 'Runner artifact provenance could not be sealed.' }
 
 $runner = Get-Item -LiteralPath $runnerPath
 [pscustomobject]@{

@@ -1,0 +1,61 @@
+diff --git a/src/backends/mister.c b/src/backends/mister.c
+index 9d680f9..3ae196c 100644
+--- a/src/backends/mister.c
++++ b/src/backends/mister.c
+@@ -1187,6 +1187,44 @@ static bool gpuCropChangedBounds(const uint8_t* a, const uint8_t* b, size_t byte
+     return true;
+ }
+ 
++// Skip unchanged interior runs of at least 64 bytes without a per-pixel scan
++// of dense regions. Every such run contains one full 32-byte probe; refine
++// only the boundaries of equal probes with words. Keep at most eight copies
++// per row, coalescing the remainder after that cap. The caller retains the old
++// shadow until all decisions are complete. Never inspect shared target DDR.
++static void copyCroppedTextureSplitSpan(uint8_t* targetRow,
++                                       const uint8_t* shadowRow,
++                                       const uint8_t* sourceRow,
++                                       size_t first, size_t last) {
++    size_t segment = first, scan = first;
++    unsigned copies = 0;
++    while (last - scan >= 32u && copies < 7u) {
++        if (!gpuCropBlockEqual32(shadowRow + scan, sourceRow + scan)) {
++            scan += 32u;
++            continue;
++        }
++        size_t gapStart = scan, gapEnd = scan + 32u;
++        while (gapStart - segment >= 4u &&
++               gpuCropReadWord(shadowRow + gapStart - 4u) ==
++               gpuCropReadWord(sourceRow + gapStart - 4u)) gapStart -= 4u;
++        while (last - gapEnd >= 32u &&
++               gpuCropBlockEqual32(shadowRow + gapEnd, sourceRow + gapEnd)) gapEnd += 32u;
++        while (last - gapEnd >= 4u &&
++               gpuCropReadWord(shadowRow + gapEnd) ==
++               gpuCropReadWord(sourceRow + gapEnd)) gapEnd += 4u;
++        if (gapEnd - gapStart >= 64u) {
++            if (gapStart != segment) {
++                GPU_TEXTURE_COPY(targetRow + segment, sourceRow + segment, gapStart - segment);
++                ++copies;
++            }
++            segment = gapEnd;
++        }
++        scan = gapEnd;
++    }
++    if (last != segment)
++        GPU_TEXTURE_COPY(targetRow + segment, sourceRow + segment, last - segment);
++}
++
+ static bool updateCroppedTextureChangedRows(uint8_t* shadowPixels,
+                                             uint8_t* targetPixels,
+                                             const uint8_t* sourcePixels,
+@@ -1204,9 +1242,9 @@ static bool updateCroppedTextureChangedRows(uint8_t* shadowPixels,
+         uint8_t* shadowRow = shadowPixels + row * cropRowBytes;
+         size_t first, last;
+         if (!gpuCropChangedBounds(shadowRow, sourceRow, cropRowBytes, &first, &last)) continue;
++        copyCroppedTextureSplitSpan(targetPixels + row * cropRowBytes,
++                                   shadowRow, sourceRow, first, last);
+         memcpy(shadowRow + first, sourceRow + first, last - first);
+-        GPU_TEXTURE_COPY(targetPixels + row * cropRowBytes + first,
+-               sourceRow + first, last - first);
+         wrotePixels = true;
+     }
+     return wrotePixels;

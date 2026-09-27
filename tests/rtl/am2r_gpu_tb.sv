@@ -28,7 +28,7 @@ module am2r_gpu_tb;
 	reg [1:0] scan_buffer = 0;
 	reg scan_underflow_toggle = 0;
 
-	reg [63:0] control [0:3];
+	reg [63:0] control [0:10];
 	reg [63:0] commands [0:119];
 	reg [63:0] textures [0:319];
 	reg [63:0] water_table [0:2];
@@ -46,6 +46,7 @@ module am2r_gpu_tb;
 	integer streamed_pairs = 0;
 	integer prefetched_solid_pairs = 0;
 	integer alpha_white_pairs = 0;
+	integer noncontiguous_pairs = 0;
 	reg [5:0] previous_gpu_state = 0;
 
 	am2r_gpu dut
@@ -67,7 +68,7 @@ module am2r_gpu_tb;
 		integer index;
 		begin
 			read_memory = 64'h0;
-			if (address >= CONTROL_WORD && address < CONTROL_WORD + 4)
+			if ((address >= CONTROL_WORD && address < CONTROL_WORD + 4) || address == CONTROL_WORD + 10)
 				read_memory = control[address - CONTROL_WORD];
 			else if (address >= COMMAND_WORD && address < COMMAND_WORD + 120)
 				read_memory = commands[address - COMMAND_WORD];
@@ -90,7 +91,9 @@ module am2r_gpu_tb;
 		input [7:0] byte_enable;
 		integer index;
 		begin
-			if (address >= CONTROL_WORD && address < CONTROL_WORD + 4) begin
+			if ((address >= CONTROL_WORD && address < CONTROL_WORD + 4) || address == CONTROL_WORD + 10) begin
+				if (address == CONTROL_WORD + 3 && control[10] !== 64'h0000001f_43473241)
+					$fatal(1, "Completion before capability publication");
 				index = address - CONTROL_WORD;
 				if (byte_enable[0]) control[index][7:0] = data[7:0];
 				if (byte_enable[1]) control[index][15:8] = data[15:8];
@@ -162,6 +165,26 @@ module am2r_gpu_tb;
 
 	// Avalon DDR model: two-cycle read latency and periodic back-pressure.
 	always @(posedge clk) begin
+		if (dut.state == dut.ST_TEX_READY && dut.pair_mode) begin
+			if (dut.affine_mode || !dut.texture_cache_valid ||
+			    dut.source_byte_addr[31:7] != dut.source_byte_addr_1[31:7] ||
+			    dut.texture_cache_addr != (dut.source_byte_addr >> 3 & 29'h1fff_fff0))
+				$fatal(1, "Paired texture samples do not belong to the loaded cache line");
+			if (dut.contiguous_pair_mode && (dut.u_step != 32'h00010000 ||
+			    dut.source_byte_addr[2] || dut.source_byte_addr_1 != dut.source_byte_addr + 32'd4))
+				$fatal(1, "Contiguous texture shortcut has invalid source metadata");
+		end
+		if ((dut.state == dut.ST_PAIR_TINT_READY && !dut.contiguous_pair_mode) ||
+		    (dut.state == dut.ST_WATER_SOURCE_DATA && dut.axis_gather_mode &&
+		     !dut.gather_refilling && !dut.gather_lookup && dut.gather_pending == 3))
+			noncontiguous_pairs <= noncontiguous_pairs + 1;
+		if (dut.state == dut.ST_WATER_SOURCE_DATA && dut.axis_gather_mode &&
+		    !dut.gather_refilling && dut.gather_lookup &&
+		    (dut.source_byte_addr != dut.axis_source_addr0 || dut.source_byte_addr_1 != dut.axis_source_addr1))
+			$fatal(1,"Gather source addresses diverged from signed U accumulators");
+		if (dut.state == dut.ST_TEX_READY && previous_gpu_state == dut.ST_TEX_READY &&
+		    dut.axis_source_addr0 != dut.source_byte_addr)
+			$fatal(1, "Opaque stream address diverged from signed U accumulator");
 		cycles <= cycles + 1;
 		if (dut.state == 6'd24 && previous_gpu_state == 6'd24)
 			streamed_pairs <= streamed_pairs + 1;
@@ -236,9 +259,20 @@ module am2r_gpu_tb;
 		end
 	endtask
 
-	integer n;
+	integer n, blend_src, blend_dst;
+	reg [31:0] blend_actual, blend_expected;
 	reg [7:0] expected_r, expected_g, expected_b;
 	initial begin
+		// Independent oracle for all 8-bit factor pairs. GM1.x bm_subtract
+		// is ZERO / INVSRCCOLOR on RGBA, irrespective of source alpha.
+		for (blend_src = 0; blend_src < 256; blend_src = blend_src + 1) begin
+			for (blend_dst = 0; blend_dst < 256; blend_dst = blend_dst + 1) begin
+				blend_expected = (blend_dst * (255 - blend_src)) / 255;
+				blend_actual = dut.subtract_blend({4{blend_src[7:0]}}, {4{blend_dst[7:0]}});
+				if (blend_actual !== {4{blend_expected[7:0]}})
+					$fatal(1, "Inverse-source blend mismatch src=%0d dst=%0d", blend_src, blend_dst);
+			end
+		end
 		for (n = 0; n < 4; n = n + 1) control[n] = 0;
 		for (n = 0; n < 120; n = n + 1) commands[n] = 0;
 		for (n = 0; n < 320; n = n + 1) textures[n] = 0;
@@ -354,8 +388,8 @@ module am2r_gpu_tb;
 		commands[90] = (64'd10 << 32) | 64'h26000010;
 		commands[94] = 64'h0000000033ffffff;
 		// Subtractively blend the first red/green texture pair over the earlier
-		// 50%-tinted pair. Bit 9 selects GameMaker bm_subtract. With a 50%
-		// colour/alpha tint, each channel contribution is 64, leaving 64.
+		// 50%-tinted pair. Bit 9 selects GameMaker bm_subtract, whose RGB
+		// result is 128*(255-128)/255=63 regardless of the 50% alpha tint.
 		commands[96] = (64'd2) | (64'd1 << 9) | (64'd2 << 16) | (64'd1 << 32);
 		commands[97] = (64'd16 << 32) | 64'h24000000;
 		commands[98] = (64'd1 << 16) | 64'd30;
@@ -418,8 +452,8 @@ module am2r_gpu_tb;
 		expect_pixel(20, 2, 32'h00089020);
 		expect_pixel(21, 2, 32'h00081020);
 		expect_pixel(22, 2, 32'h00081020);
-		expect_pixel(30, 1, 32'h00400000);
-		expect_pixel(31, 1, 32'h00004000);
+		expect_pixel(30, 1, 32'h003f0000);
+		expect_pixel(31, 1, 32'h00003f00);
 		expect_pixel(40, 1, 32'h00ff0000);
 		expected_r = blend_component(127, 8, 191);
 		expected_g = blend_component(64, 16, 191);
@@ -622,6 +656,89 @@ module am2r_gpu_tb;
 		expect_pixel(32, 20, 32'h002a140a);
 		expect_pixel(0, 21, 32'h001e200a);
 		expect_pixel(64, 20, 32'h001e140a);
+
+		// Real command-stream lighting regression: dark background values must
+		// survive a gray mask instead of being crushed by reverse subtraction.
+		// Exercise axis paired + tail, alpha-zero solid paired + tail, affine,
+		// and alpha in the RGBA export under the existing DDR stall model.
+		for (n = 0; n < 120; n = n + 1) commands[n] = 0;
+		textures[0] = {32'h00808080, 32'hff808080};
+		textures[1] = {32'h00000000, 32'h80808080};
+		commands[0] = 64'd1;
+		commands[1] = 64'hff64503c;
+		commands[8] = 64'd2 | (64'd1 << 9) | (64'd3 << 16) | (64'd1 << 32);
+		commands[9] = (64'd16 << 32) | 64'h24000000;
+		commands[10] = (64'd1 << 16) | 64'd1;
+		commands[13] = (64'h10000 << 32) | 64'h10000;
+		commands[14] = 64'hffffffff;
+		commands[16] = 64'd3 | (64'd1 << 9) | (64'd3 << 16) | (64'd1 << 32);
+		commands[17] = 64'h00808080;
+		commands[18] = (64'd2 << 16) | 64'd1;
+		commands[24] = 64'd5 | (64'd1 << 9);
+		commands[25] = 64'hffffffff;
+		commands[32] = 64'd4 | (64'd2 << 16) | (64'd1 << 32);
+		commands[33] = (64'd16 << 32) | 64'h24000000;
+		commands[34] = (64'd3 << 16) | 64'd1;
+		commands[35] = 64'd4 << 48;
+		commands[36] = 64'd1 << 48;
+		commands[38] = 64'h10000;
+		commands[39] = 64'h10000 << 32;
+		commands[40] = 64'd6;
+		commands[41] = 64'h25000000;
+		commands[48] = 0;
+		control[1] = (64'd7 << 32) | 64'h23fe0000;
+		control[0] = (64'd10 << 32) | 64'h50473241;
+		wait (control[3][31:0] == 10);
+		expect_pixel(0, 0, 32'h003c5064);
+		expect_pixel(1, 1, 32'h001d2731);
+		expect_pixel(2, 1, 32'h001d2731);
+		expect_pixel(3, 1, 32'h001d2731);
+		expect_pixel(1, 2, 32'h001d2731);
+		expect_pixel(2, 2, 32'h001d2731);
+		expect_pixel(3, 2, 32'h001d2731);
+		expect_pixel(1, 3, 32'h001d2731);
+		expect_pixel(2, 3, 32'h001d2731);
+		expect_export_pixel(1, 1, 32'h0031271d);
+		expect_export_pixel(2, 1, 32'hff31271d);
+		expect_export_pixel(3, 1, 32'h7f31271d);
+		expect_export_pixel(3, 2, 32'hff31271d);
+
+		// General axis pairs sample two independent cached texels. Repetition
+		// must not enter the +8-byte opaque streaming shortcut; reversed samples
+		// must select their own high/low lanes. A scaled pair crossing the
+		// 128-byte cache boundary falls back to one pixel before pairing again.
+		for (n = 0; n < 32; n = n + 1)
+			textures[n] = {32'hff000000 | (2*n+1), 32'hff000000 | (2*n)};
+		for (n = 0; n < 120; n = n + 1) commands[n] = 0;
+		commands[0] = 64'd1;
+		commands[1] = 64'hff000000;
+		commands[8] = 64'd2 | (64'd5 << 16) | (64'd1 << 32);
+		commands[9] = (64'd256 << 32) | 64'h24000000;
+		commands[10] = 64'd1;
+		commands[12] = 64'h10000;
+		commands[14] = 64'hffffffff;
+		commands[16] = 64'd2 | (64'd7 << 16) | (64'd1 << 32);
+		commands[17] = (64'd256 << 32) | 64'h24000000;
+		commands[18] = (64'd1 << 16) | 64'd1;
+		commands[20] = 64'h60000;
+		commands[21] = 64'hffff0000;
+		commands[22] = 64'hffffffff;
+		commands[24] = 64'd2 | (64'd7 << 16) | (64'd1 << 32);
+		commands[25] = (64'd256 << 32) | 64'h24000000;
+		commands[26] = (64'd2 << 16) | 64'd313;
+		commands[28] = 64'h1f0000;
+		commands[29] = 64'h18000;
+		commands[30] = 64'hffffffff;
+		commands[32] = 0;
+		control[1] = (64'd5 << 32) | 64'h23fe0000;
+		control[0] = (64'd11 << 32) | 64'h50473241;
+		wait (control[3][31:0] == 11);
+		for (n = 0; n < 5; n = n + 1) expect_pixel(1+n, 0, 32'h00010000);
+		for (n = 0; n < 7; n = n + 1) begin
+			expect_pixel(1+n, 1, (6-n) << 16);
+			expect_pixel(313+n, 2, (31 + (3*n)/2) << 16);
+		end
+		if (noncontiguous_pairs < 6) $fatal(1, "General axis pairing was not exercised");
 
 		if (errors == 0) begin
 			$display("PASS: GPU rendering, fast overlays, native-frame water, and tear-free DDR publication");

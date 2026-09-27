@@ -12,6 +12,9 @@ try {
     & python tests\renderer\audit_sw_renderer.py
     if ($LASTEXITCODE -ne 0) { throw "renderer operation audit failed with exit code $LASTEXITCODE." }
 
+    & python tests\renderer\test_subtractive_blend.py
+    if ($LASTEXITCODE -ne 0) { throw "native blend regression failed with exit code $LASTEXITCODE." }
+
     & vlib $library
     if ($LASTEXITCODE -ne 0) { throw "vlib failed with exit code $LASTEXITCODE." }
 
@@ -72,6 +75,8 @@ try {
 	if ($LASTEXITCODE -ne 0) { throw "CRT UI inset compile failed with exit code $LASTEXITCODE." }
 	& $crtUiTest
 	if ($LASTEXITCODE -ne 0) { throw "CRT UI inset test failed with exit code $LASTEXITCODE." }
+	& python tests\renderer\test_crt_ui_composition.py
+	if ($LASTEXITCODE -ne 0) { throw "CRT UI composition regression failed with exit code $LASTEXITCODE." }
 
     $alsaSource = Get-Content -Raw -LiteralPath (Join-Path $projectRoot 'sys\alsa.sv')
 	if (-not $alsaSource.Contains('if(len[18:14] && (hurryup < 1)) hurryup <= 1;') -or
@@ -160,8 +165,41 @@ try {
     & vlog -sv -work $library rtl\am2r_gpu.sv tests\rtl\am2r_gpu_tb.sv
     if ($LASTEXITCODE -ne 0) { throw "GPU vlog failed with exit code $LASTEXITCODE." }
 
-    & vsim -c -lib $library am2r_gpu_tb -do 'onerror {quit -code 1}; run -all; quit -code 0'
-    if ($LASTEXITCODE -ne 0) { throw "GPU vsim failed with exit code $LASTEXITCODE." }
+    $gpuOutput = & vsim -c -lib $library am2r_gpu_tb -do 'run -all; quit -code 0' 2>&1
+    $gpuExitCode = $LASTEXITCODE
+    $gpuOutput | Write-Output
+    $gpuText = $gpuOutput -join "`n"
+    if ($gpuExitCode -ne 0 -or $gpuText -notmatch 'PASS: GPU rendering' -or
+        $gpuText -match '\*\*\s+(Fatal|Error):|Errors:\s*[1-9]') {
+        throw "GPU simulation failed (exit $gpuExitCode)."
+    }
+
+    & vlog -sv -work $library rtl\am2r_gpu.sv tests\rtl\am2r_gpu_surface_tb.sv
+    if ($LASTEXITCODE -ne 0) { throw "GPU surface/generic vlog failed with exit code $LASTEXITCODE." }
+
+    $surfaceOutput = & vsim -c -lib $library am2r_gpu_surface_tb -do 'run -all; quit -code 0' 2>&1
+    $surfaceExitCode = $LASTEXITCODE
+    $surfaceOutput | Write-Output
+    # ModelSim can return0 after a Verilog $fatal when a trailing quit command
+    # runs. Require both the positive completion marker and an error-free log.
+    $surfaceText = $surfaceOutput -join "`n"
+    if ($surfaceExitCode -ne 0 -or $surfaceText -notmatch 'PASS surface DMA:' -or
+        $surfaceText -match '\*\*\s+(Fatal|Error):|Errors:\s*[1-9]') {
+        throw "GPU surface/generic simulation failed (exit $surfaceExitCode)."
+    }
+
+    & vlog -sv -work $library rtl\am2r_gpu.sv tests\rtl\am2r_gpu_restart_tb.sv
+    if ($LASTEXITCODE -ne 0) { throw "GPU restart vlog failed with exit code $LASTEXITCODE." }
+    foreach ($restartSchedule in @(@('-gREAD_LATENCY=2', '-gSTALL_PERIOD=0'), @('-gREAD_LATENCY=5', '-gSTALL_PERIOD=7'))) {
+        $restartOutput = & vsim -c -lib $library am2r_gpu_restart_tb @restartSchedule -do 'run -all; quit -code 0' 2>&1
+        $restartExitCode = $LASTEXITCODE
+        $restartOutput | Write-Output
+        $restartText = $restartOutput -join "`n"
+        if ($restartExitCode -ne 0 -or $restartText -notmatch 'PASS GPU restart:' -or
+            $restartText -match '\*\*\s+(Fatal|Error):|Errors:\s*[1-9]') {
+            throw "GPU restart simulation failed (exit $restartExitCode)."
+        }
+    }
 } finally {
     Pop-Location
 }

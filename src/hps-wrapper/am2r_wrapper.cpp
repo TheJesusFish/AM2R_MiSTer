@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "am2r_wrapper.h"
+#include "am2r_shutdown.h"
 
 #include <errno.h>
 #include <dirent.h>
@@ -50,22 +51,26 @@ static volatile sig_atomic_t gOsdSaveSlot = -1;
 static volatile sig_atomic_t gOsdLoadSlot = -1;
 static volatile sig_atomic_t gOsdResetRequested = 0;
 
-extern "C" void am2r_user_io_status_event(const char *opt, uint32_t value, int ex)
+extern "C" bool am2r_user_io_status_event(const char *opt, uint32_t value, int ex)
 {
-    if (ex || value != 1 || !opt) return;
+    if (ex || !opt) return false;
     // Menu-originated reset options include the label after the bit range.
     // Internal Main_MiSTer initialization writes use the literal "[0]" and
     // must not restart the game process.
     if (!strncmp(opt, "[0],", 4)) {
-        gOsdResetRequested = 1;
-        return;
+        if (value == 1) gOsdResetRequested = 1;
+        // Consume BOTH edges. A normal menu Reset restarts the HPS companion
+        // after its GPU drain, never pulses HDL reset in the middle of DDR.
+        return true;
     }
+    if (value != 1) return false;
     int slot = (int)user_io_status_get("[7:6]");
     // Menu entries pass p + 1, so opt continues with ",Save state;..."
     // rather than ending after the bracket. Literal programmatic calls may
     // still end there; the closing bracket keeps this prefix match exact.
     if (!strncmp(opt, "[8]", 3)) gOsdSaveSlot = slot;
     if (!strncmp(opt, "[9]", 3)) gOsdLoadSlot = slot;
+    return false;
 }
 
 namespace {
@@ -149,6 +154,9 @@ constexpr const char *kRequiredArchiveFiles[] = {
 
 volatile sig_atomic_t gSignal = 0;
 volatile sig_atomic_t gChild = -1;
+bool gRuntimeSessionActive = false;
+bool gCoreChangeDrained = false;
+bool gCoreChangeDenied = false;
 Am2rJoyShm *gJoyShm = nullptr;
 uint32_t gPreviousJoyMask[AM2R_JOY_MAX_PLAYERS] = {};
 
@@ -244,6 +252,7 @@ enum StateSlotStatus {
 
 StateSlotStatus state_slot_status(int slot);
 bool stop_dmtcp(StateControl &state, FILE *log);
+bool prepare_core_change(FILE *log);
 
 void handle_state_events(StateControl &state, pid_t active, FILE *log)
 {
@@ -382,7 +391,11 @@ void handle_state_osd(StateControl &state, pid_t active, FILE *log)
             state.freshRestartRequested = true;
             log_line(log, "reset_osd_requested pid=%d", active);
             InfoMessage("Resetting AM2R", 900, "AM2R");
-            if (active > 0) kill(active, SIGTERM);
+            if (!prepare_core_change(log)) {
+                gCoreChangeDenied = true;
+                state.freshRestartRequested = false;
+                InfoMessage("AM2R has not stopped safely; reset cancelled", 4500, "AM2R");
+            }
         }
     }
     state.previousSaveTrigger = save;
@@ -1247,7 +1260,6 @@ void copy_session_log()
 void signal_handler(int signal)
 {
     gSignal = signal;
-    if (gChild > 0) kill((pid_t)gChild, signal);
 }
 
 void install_signal_handlers()
@@ -1258,6 +1270,52 @@ void install_signal_handlers()
     sigaction(SIGINT, &action, nullptr);
     sigaction(SIGHUP, &action, nullptr);
     sigaction(SIGTERM, &action, nullptr);
+}
+
+bool prepare_core_change(FILE *log)
+{
+    // During initial Main handoff no AM2R child has run. Do not interpret a
+    // mailbox left by a different core as this session's outstanding work.
+    if (!gRuntimeSessionActive || gCoreChangeDrained) return true;
+    int error = 0;
+    const pid_t child = (pid_t)gChild;
+    if (!am2r_wait_child_stopped(child, 5000, &error)) {
+        log_line(log, "shutdown_rejected reason=child pid=%d errno=%d", child, error);
+        return false;
+    }
+    const int fd = open("/dev/mem", O_RDWR | O_SYNC | O_CLOEXEC);
+    if (fd < 0) {
+        log_line(log, "shutdown_rejected reason=devmem errno=%d", errno);
+        return false;
+    }
+    void *mapping = mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0x23ff0000u);
+    close(fd);
+    if (mapping == MAP_FAILED) {
+        log_line(log, "shutdown_rejected reason=mailbox_map errno=%d", errno);
+        return false;
+    }
+    uint32_t submitted = 0, completed = 0;
+    bool idle = false;
+    for (unsigned attempt = 0; attempt < 1000; ++attempt) {
+        idle = am2r_gpu_mailbox_idle((volatile const uint32_t *)mapping,
+                                    &submitted, &completed);
+        if (idle) break;
+        usleep(1000);
+    }
+    if (idle) {
+        idle = am2r_gpu_mailbox_disarm((volatile uint32_t *)mapping,
+                                      &submitted, &completed);
+        if (!idle) log_line(log, "shutdown_rejected reason=mailbox_disarm");
+    }
+    munmap(mapping, 4096);
+    log_line(log, "shutdown_%s pid=%d submitted=%u completed=%u",
+             idle ? "drained" : "rejected_gpu", child, submitted, completed);
+    if (!idle) return false;
+    // Native scanout remains active until the normal core reset. This proves
+    // the command producer/job are stopped, not a new native-DDR drain ABI.
+    gCoreChangeDrained = true;
+    gCoreChangeDenied = false;
+    return true;
 }
 
 void show_error(const char *message)
@@ -1280,8 +1338,19 @@ void show_error(const char *message)
     // programming the requested core.  That gives this wrapper one short
     // second invocation with argv[1] == "menu.rbf"; the startup path below
     // immediately hands that already-loaded core to the stock MiSTer binary.
-    fpga_load_rbf("menu.rbf");
-    _exit(1);
+    if (!gCoreChangeDenied) fpga_load_rbf("menu.rbf");
+    // A failed shutdown gate must leave the current core and OSD accessible,
+    // not destroy its parent or retry reconfiguration behind the user's back.
+    for (;;) {
+        if (is_fpga_ready(1)) {
+            user_io_poll();
+            frame_timer();
+            input_poll(0);
+            HandleUI();
+            OsdUpdate();
+        }
+        usleep(1000);
+    }
 }
 
 pid_t spawn_runtime(StateControl &state, int session, const char *testPlayback,
@@ -1472,6 +1541,8 @@ int run_child(FILE *wrapperLog)
         return 126;
     }
     gChild = child;
+    gRuntimeSessionActive = true;
+    gCoreChangeDrained = false;
     log_line(wrapperLog, "child_pid=%d runtime=%s dmtcp_port=%d",
              child, kRuntimeBinary, state.coordinatorPort);
 
@@ -1481,7 +1552,14 @@ int run_child(FILE *wrapperLog)
     sched_setaffinity(0, sizeof(wrapperCpu), &wrapperCpu);
 
     int status = 0;
+    bool terminationForwarded = false;
     for (;;) {
+        if (gSignal && !terminationForwarded) {
+            // Cover a signal received between fork and gChild publication.
+            // Repeated signals must not repeatedly interrupt a pending save.
+            if (child > 0) kill(child, SIGTERM);
+            terminationForwarded = true;
+        }
         handle_state_events(state, child, wrapperLog);
         if (state.loadRequested) {
             state.loadRequested = false;
@@ -1504,7 +1582,7 @@ int run_child(FILE *wrapperLog)
             else if (WIFEXITED(status))
                 log_line(wrapperLog, "active_exit pid=%d code=%d", child, WEXITSTATUS(status));
 
-            if (state.freshRestartRequested) {
+            if (state.freshRestartRequested && !gSignal) {
                 state.freshRestartRequested = false;
                 state.activeTimelineRestored = false;
                 stop_dmtcp(state, wrapperLog);
@@ -1520,11 +1598,12 @@ int run_child(FILE *wrapperLog)
                     break;
                 }
                 gChild = child;
+                gCoreChangeDrained = false;
                 log_line(wrapperLog, "reset_restarted pid=%d port=%d",
                          child, state.coordinatorPort);
                 continue;
             }
-            if (state.loadSlot >= 0) {
+            if (state.loadSlot >= 0 && !gSignal) {
                 int restoreSlot = state.loadSlot;
                 state.loadSlot = -1;
                 unlink(AM2R_STATE_RESUME_PATH);
@@ -1539,13 +1618,14 @@ int run_child(FILE *wrapperLog)
                     break;
                 }
                 gChild = child;
+                gCoreChangeDrained = false;
                 state.activeRestoreSlot = restoreSlot;
                 release_quiesced_runner(0, wrapperLog);
                 log_line(wrapperLog, "savestate_restart slot=%d pid=%d port=%d",
                          restoreSlot + 1, child, state.coordinatorPort);
                 continue;
             }
-            if (state.activeRestoreSlot >= 0) {
+            if (state.activeRestoreSlot >= 0 && !gSignal) {
                 int failedSlot = state.activeRestoreSlot;
                 state.activeRestoreSlot = -1;
                 state.activeTimelineRestored = false;
@@ -1561,6 +1641,7 @@ int run_child(FILE *wrapperLog)
                     break;
                 }
                 gChild = child;
+                gCoreChangeDrained = false;
                 log_line(wrapperLog, "savestate_recovery_new_game pid=%d port=%d",
                          child, state.coordinatorPort);
                 continue;
@@ -1606,6 +1687,18 @@ int run_child(FILE *wrapperLog)
 }
 
 } // namespace
+
+extern "C" bool am2r_before_fpga_reconfigure()
+{
+    FILE *log = fopen("/tmp/am2r-wrapper.log", "a");
+    const bool safe = prepare_core_change(log);
+    if (log) fclose(log);
+    if (!safe) {
+        gCoreChangeDenied = true;
+        InfoMessage("AM2R has not stopped safely; core change cancelled", 4500, "AM2R");
+    }
+    return safe;
+}
 
 int am2r_wrapper_run(int argc, char *argv[])
 {

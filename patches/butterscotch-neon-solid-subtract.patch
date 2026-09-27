@@ -1,0 +1,83 @@
+--- a/src/sw_renderer.c
++++ b/src/sw_renderer.c
+@@ -46,6 +46,42 @@
+     return vmovn_u16(vshrq_n_u16(quotient, 8));
+ }
+ #endif
++
++// Solid inverse-source spans have no sampling or tint stage. Keep the
++// 8x8-bit products in 16-bit NEON lanes instead of relying on auto-vectorized
++// uint32_t division identities. AM2R's mask rectangle covers 331x251 pixels
++// every Step, so this is substantial work even though it is a simple draw.
++// Each RGBA factor remains independent, including an alpha-zero source.
++static void blendSubtractSolidSpan(uint32_t* destination, int32_t count,
++                                   uint8_t sourceR, uint8_t sourceG,
++                                   uint8_t sourceB, uint8_t sourceA) {
++    const uint8_t inverseR = 255u - sourceR;
++    const uint8_t inverseG = 255u - sourceG;
++    const uint8_t inverseB = 255u - sourceB;
++    const uint8_t inverseA = 255u - sourceA;
++    int32_t output = 0;
++#if defined(USE_MISTER) && defined(__ARM_NEON)
++    const uint8x8_t factorR = vdup_n_u8(inverseR);
++    const uint8x8_t factorG = vdup_n_u8(inverseG);
++    const uint8x8_t factorB = vdup_n_u8(inverseB);
++    const uint8x8_t factorA = vdup_n_u8(inverseA);
++    for (; output + 8 <= count; output += 8) {
++        uint8x8x4_t target = vld4_u8((const uint8_t*)(destination + output));
++        target.val[0] = divideBy255U16(vmull_u8(target.val[0], factorR));
++        target.val[1] = divideBy255U16(vmull_u8(target.val[1], factorG));
++        target.val[2] = divideBy255U16(vmull_u8(target.val[2], factorB));
++        target.val[3] = divideBy255U16(vmull_u8(target.val[3], factorA));
++        vst4_u8((uint8_t*)(destination + output), target);
++    }
++#endif
++    for (; output < count; ++output) {
++        uint8_t* target = (uint8_t*)&destination[output];
++        target[0] = divideBy255U32(target[0] * inverseR);
++        target[1] = divideBy255U32(target[1] * inverseG);
++        target[2] = divideBy255U32(target[2] * inverseB);
++        target[3] = divideBy255U32(target[3] * inverseA);
++    }
++}
+ 
+ // GameMaker's bm_subtract is ZERO / INV_SRC_COLOR, not reverse subtraction:
+ // every destination channel is multiplied by one minus its source channel.
+@@ -968,22 +1004,24 @@
+ #endif
+             return true;
+         }
+-        if(sw->blendMode==bm_subtract||sw->blendMode==bm_add){
+-            const bool subtract=sw->blendMode==bm_subtract;
++        if(sw->blendMode==bm_subtract){
++            for(int32_t y=minY;y<maxY;++y){
++                uint32_t* row=(uint32_t*)(sw->framebuffer+((size_t)y*sw->fbWidth+minX)*4u);
++                blendSubtractSolidSpan(row,width,tintR,tintG,tintB,tintA);
++            }
++#ifdef USE_MISTER
++            swExtendSurfaceContentBounds(sw,minX,minY,maxX,maxY);
++#endif
++            return true;
++        }
++        if(sw->blendMode==bm_add){
+             for(int32_t y=minY;y<maxY;++y){
+                 uint8_t* pixel=sw->framebuffer+((size_t)y*sw->fbWidth+minX)*4u;
+                 for(int32_t x=0;x<width;++x,pixel+=4){
+-                    if(subtract){
+-                        pixel[0]=divideBy255U32(pixel[0]*(255u-tintR));
+-                        pixel[1]=divideBy255U32(pixel[1]*(255u-tintG));
+-                        pixel[2]=divideBy255U32(pixel[2]*(255u-tintB));
+-                        pixel[3]=0;
+-                    }else{
+-                        pixel[0]=clampByte((int32_t)pixel[0]+tintR);
+-                        pixel[1]=clampByte((int32_t)pixel[1]+tintG);
+-                        pixel[2]=clampByte((int32_t)pixel[2]+tintB);
+-                        pixel[3]=255;
+-                    }
++                    pixel[0]=clampByte((int32_t)pixel[0]+tintR);
++                    pixel[1]=clampByte((int32_t)pixel[1]+tintG);
++                    pixel[2]=clampByte((int32_t)pixel[2]+tintB);
++                    pixel[3]=255;
+                 }
+             }
+ #ifdef USE_MISTER

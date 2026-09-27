@@ -1,0 +1,83 @@
+diff --git a/src/runner.c b/src/runner.c
+index 9d9fe39..6260f9d 100644
+--- a/src/runner.c
++++ b/src/runner.c
+@@ -675,64 +675,9 @@ static bool Runner_tryExecuteAm2rSandDraw(Runner* runner, Instance* instance,
+     return true;
+ }
+ 
+-// AM2R 1.1 requests the same complete light-mask rebuild from both Normal Step
+-// and End Step.  Nothing presents or samples that surface between those two
+-// phases; End Step runs after movement, collisions, and every ordinary Step
+-// handler and therefore produces the mask that Draw actually consumes.  Keep
+-// the Normal Step fade-out state change but defer its redundant rebuild to the
+-// authored End Step event.  Fall back unless that exact companion handler is
+-// present, so other games/data revisions retain interpreted semantics.
+-static bool Runner_tryExecuteAm2rLightStep(Runner* runner,
+-                                           Instance* instance,
+-                                           int32_t eventType,
+-                                           int32_t eventSubtype,
+-                                           int32_t codeId,
+-                                           int32_t ownerObjectIndex) {
+-    static const char objectName[] = "oLightEngine";
+-    static const char codeName[] = "gml_Object_oLightEngine_Step_0";
+-    static const char endStepCodeName[] = "gml_Object_oLightEngine_Step_2";
+-
+-    if (eventType != EVENT_STEP || eventSubtype != STEP_NORMAL ||
+-        instance == nullptr || codeId < 0 ||
+-        (uint32_t)codeId >= runner->dataWin->code.count ||
+-        ownerObjectIndex < 0 ||
+-        (uint32_t)ownerObjectIndex >= runner->dataWin->objt.count)
+-        return false;
+-
+-    const CodeEntry* code = &runner->dataWin->code.entries[codeId];
+-    const GameObject* owner = &runner->dataWin->objt.objects[ownerObjectIndex];
+-    if (code->name == nullptr || owner->name == nullptr ||
+-        strcmp(code->name, codeName) != 0 ||
+-        strcmp(owner->name, objectName) != 0)
+-        return false;
+-
+-    int32_t endOwner = -1;
+-    int32_t endCodeId = findEventCodeIdAndOwner(
+-        runner, instance->objectIndex, EVENT_STEP, STEP_END, &endOwner);
+-    if (endCodeId < 0 || (uint32_t)endCodeId >= runner->dataWin->code.count ||
+-        endOwner != ownerObjectIndex ||
+-        runner->dataWin->code.entries[endCodeId].name == nullptr ||
+-        strcmp(runner->dataWin->code.entries[endCodeId].name,
+-               endStepCodeName) != 0)
+-        return false;
+-
+-    ptrdiff_t fadeoutSlot = shgeti(runner->vmContext->varNameMap, "fadeout");
+-    if (fadeoutSlot < 0) return false;
+-    int32_t fadeoutVariable =
+-        runner->vmContext->varNameMap[fadeoutSlot].value;
+-    if (!IntRValueHashMap_contains(&instance->selfVars, fadeoutVariable))
+-        return false;
+-
+-    if (!RValue_toBool(Instance_getSelfVar(instance, fadeoutVariable)))
+-        return true;
+-    if (instance->imageAlpha > 0.0f) {
+-        instance->imageAlpha =
+-            (float)((GMLReal)instance->imageAlpha - (GMLReal)0.01);
+-    } else {
+-        Runner_destroyInstance(runner, instance, true);
+-    }
+-    return true;
+-}
++// Keep AM2R's lighting events on their authored bytecode. Normal Step rebuilds
++// the moving light mask every frame; End Step only repairs a missing surface.
++// Those calls are not redundant while the surface remains valid.
+ 
+ #endif
+ 
+@@ -777,10 +722,6 @@ static void Runner_executeResolvedEvent(Runner* runner, Instance* instance, int3
+             runner, instance, eventType, eventSubtype, codeId,
+             ownerObjectIndex);
+     if (!handledNatively)
+-        handledNatively = Runner_tryExecuteAm2rLightStep(
+-            runner, instance, eventType, eventSubtype, codeId,
+-            ownerObjectIndex);
+-    if (!handledNatively)
+ #endif
+         executeCode(runner, instance, codeId);
+ 

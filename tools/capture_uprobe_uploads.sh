@@ -5,6 +5,9 @@ pid="${1:?runner pid is required}"
 seconds="${2:-10}"
 output="${3:-/tmp/am2r-upload-args.trace}"
 offset="${4:-0x188014}"
+static_offset="${5:-}"
+sparse_offset="${6:-}"
+crop_offset="${7:-}"
 trace=/sys/kernel/tracing
 mounted=0
 exe="$(awk '$6 ~ /\/butterscotch$/ { print $6; exit }' "/proc/$pid/maps")"
@@ -30,6 +33,18 @@ echo > "$trace/trace"
 echo > "$trace/uprobe_events"
 echo "p:am2r_upload $exe:$offset source=%r0:x32 bytes=%r1:u32 valid=%r2:u32 revision=%r3:u32" > "$trace/uprobe_events"
 echo "r:am2r_upload_ret $exe:$offset" >> "$trace/uprobe_events"
+if [ -n "$static_offset" ]; then
+    echo "p:am2r_upload_static $exe:$static_offset source=%r0:x32 bytes=%r1:u32" >> "$trace/uprobe_events"
+    echo "r:am2r_upload_static_ret $exe:$static_offset" >> "$trace/uprobe_events"
+fi
+if [ -n "$sparse_offset" ]; then
+    echo "p:am2r_upload_sparse $exe:$sparse_offset source=%r0:x32 bytes=%r1:u32" >> "$trace/uprobe_events"
+    echo "r:am2r_upload_sparse_ret $exe:$sparse_offset" >> "$trace/uprobe_events"
+fi
+if [ -n "$crop_offset" ]; then
+    echo "p:am2r_upload_crop $exe:$crop_offset source=%r0:x32 source_row_bytes=%r1:u32 crop_row_bytes=%r2:u32 rows=%r3:u32" >> "$trace/uprobe_events"
+    echo "r:am2r_upload_crop_ret $exe:$crop_offset" >> "$trace/uprobe_events"
+fi
 echo 1 > "$trace/events/uprobes/enable"
 echo 1 > "$trace/tracing_on"
 sleep "$seconds"

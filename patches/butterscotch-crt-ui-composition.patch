@@ -1,0 +1,141 @@
+diff --git a/src/sw_renderer.c b/src/sw_renderer.c
+index 39b82f1..d15bc86 100644
+--- a/src/sw_renderer.c
++++ b/src/sw_renderer.c
+@@ -381,7 +381,77 @@ typedef struct {
+ } SWVertex;
+ 
+ #ifdef USE_MISTER
++// This is a presentation adjustment for the supported AM2R 1.1 HUD, not a
++// rule for arbitrary shallow surfaces. Reuse the parser's whole-file proof,
++// then resolve the live owner field on every call: IDs can change on room
++// transitions or logical-state restore, and restored content bounds are
++// deliberately conservative/full-frame. No cached ID or alpha scan is used.
++static int32_t swCrtUiHudSurface(const SWRenderer* sw) {
++    Runner* runner = sw->base.runner;
++    if (runner == nullptr || runner->dataWin == nullptr || runner->vmContext == nullptr ||
++        !runner->dataWin->am2rLightSurfaceOwnershipVerified ||
++        runner->dataWin->objt.count != 737u || runner->dataWin->code.count != 8667u ||
++        runner->dataWin->objt.objects == nullptr) return -1;
++    const GameObject* object = &runner->dataWin->objt.objects[425];
++    VMContext* ctx = runner->vmContext;
++    Instance* owner = ctx->currentInstance;
++    if (object->name == nullptr || strcmp(object->name, "oControl") != 0 ||
++        owner == nullptr || owner->objectIndex != 425 || owner->destroyed) return -1;
++    ptrdiff_t field = shgeti(ctx->varNameMap, "gui_surface");
++    if (field < 0) return -1;
++    RValue value = Instance_getSelfVar(owner, ctx->varNameMap[field].value);
++    int32_t id;
++    switch (value.type) {
++        case RVALUE_INT32: id = value.int32; break;
++        case RVALUE_REAL:
++            if (!isfinite(value.real) || value.real <= 0 || value.real > INT32_MAX ||
++                value.real != (GMLReal)(int32_t)value.real) return -1;
++            id = (int32_t)value.real; break;
++#ifndef NO_RVALUE_INT64
++        case RVALUE_INT64:
++            if (value.int64 <= 0 || value.int64 > INT32_MAX) return -1;
++            id = (int32_t)value.int64; break;
++#endif
++        default: return -1;
++    }
++    if (id <= 0 || (uint32_t)id >= sw->surfaceCount || id == runner->applicationSurfaceId ||
++        !sw->surfaceExistsFlags[id] || sw->surfacePixels[id] == nullptr ||
++        sw->surfaceWidths[id] != 320 || sw->surfaceHeights[id] != 240) return -1;
++    return id;
++}
++
++static int32_t swCrtUiHudCompositeOffset(const SWRenderer* sw, int32_t id,
++        int32_t srcLeft, int32_t srcTop, int32_t srcWidth, int32_t srcHeight,
++        float x, float y, float xscale, float yscale, float angleDeg,
++        uint32_t c1, uint32_t c2, uint32_t c3, uint32_t c4, float alpha) {
++    uint32_t inset = MisterGpu_getCrtUiInset();
++    if (!inset || sw->currentSurface != RENDER_TARGET_HOST_FRAMEBUFFER ||
++        sw->hostWidth != 320 || sw->hostHeight != 240 ||
++        sw->fbWidth != 320 || sw->fbHeight != 240 ||
++        srcLeft != 0 || srcTop != 0 || srcWidth != 320 || srcHeight != 240 ||
++        x != 0.0f || y != 0.0f || xscale != 1.0f || yscale != 1.0f ||
++        angleDeg != 0.0f || alpha != 1.0f ||
++        (c1 & 0xffffffu) != 0xffffffu || (c2 & 0xffffffu) != 0xffffffu ||
++        (c3 & 0xffffffu) != 0xffffffu || (c4 & 0xffffffu) != 0xffffffu ||
++        sw->worldToScreen.m[1] != 0.0f || sw->worldToScreen.m[4] != 0.0f ||
++        sw->worldToScreen.m[5] != 1.0f || swCrtUiHudSurface(sw) != id) return 0;
++    const Runner* runner = sw->base.runner;
++    const VMContext* ctx = runner->vmContext;
++    if (!runner->inGuiPass || ctx->currentEventType != EVENT_DRAW ||
++        ctx->currentEventSubtype != DRAW_GUI || ctx->currentCodeName == nullptr ||
++        strcmp(ctx->currentCodeName, "gml_Object_oControl_Draw_64") != 0) return 0;
++    // The exact authored GUI surface holds the complete top HUD (including
++    // minimap/tanks/icons/counts). Move its final composite once, independent
++    // of legacy/unified raster dispatch and without modifying its pixels.
++    return CrtUi_verticalOffset(240, 0, 32, inset);
++}
++
+ static void swApplyCrtUiTextOffset(SWRenderer* sw, SWVertex vertices[4]) {
++    if (!MisterGpu_getCrtUiInset()) return;
++    // HUD text must stay aligned with the native-sized sprites in the same
++    // surface. Applying this here and again at composition double-insets only
++    // the numbers. Other edge text retains the existing direct-text behavior.
++    if (sw->currentSurface > 0 && swCrtUiHudSurface(sw) == sw->currentSurface) return;
+     int32_t minY = (int32_t)floorf(vertices[0].y);
+     int32_t maxY = (int32_t)ceilf(vertices[0].y);
+     for (int i = 1; i < 4; ++i) {
+@@ -446,6 +516,24 @@ static void swExtendSurfaceContentBounds(SWRenderer* sw, int32_t minX, int32_t m
+     if (maxY > sw->surfaceContentMaxY[id]) sw->surfaceContentMaxY[id] = maxY;
+ }
+ 
++// Intersect a full 1:1 surface draw with its translated non-transparent box.
++// The incoming rectangle is already clipped to the target/scissor. Subtracting
++// transparent margins from that clipped rectangle instead loses real HUD rows
++// when an inset moves the original full-height quad beyond the screen bottom.
++static bool swGpuIntersectSurfaceContentBounds(float x, float y,
++        int32_t sourceMinX, int32_t sourceMinY, int32_t sourceMaxX, int32_t sourceMaxY,
++        int32_t* minX, int32_t* minY, int32_t* maxX, int32_t* maxY) {
++    int32_t left = swPixelCoverageEdge(x + (float)sourceMinX);
++    int32_t top = swPixelCoverageEdge(y + (float)sourceMinY);
++    int32_t right = swPixelCoverageEdge(x + (float)sourceMaxX);
++    int32_t bottom = swPixelCoverageEdge(y + (float)sourceMaxY);
++    if (*minX < left) *minX = left;
++    if (*minY < top) *minY = top;
++    if (*maxX > right) *maxX = right;
++    if (*maxY > bottom) *maxY = bottom;
++    return *minX < *maxX && *minY < *maxY;
++}
++
+ #include "sw_unified_renderer.h"
+ 
+ static void swGpuFallback(SWRenderer* sw, const char* reason) {
+@@ -1657,21 +1745,15 @@ static bool rasterizeAxisAlignedQuad(SWRenderer* sw, SWVertex v[4], const uint8_
+                 int32_t maxSourceY = sw->surfaceContentMaxY[sourceSurface];
+                 int32_t cropHeight = maxSourceY - minSourceY;
+                 if (minSourceX < maxSourceX && cropHeight > 0 && cropHeight <= 64) {
+-                    int32_t hudOffset = CrtUi_verticalOffset(240,
+-                        minSourceY, maxSourceY, MisterGpu_getCrtUiInset());
++                    if (!swGpuIntersectSurfaceContentBounds(v[0].x, v[0].y,
++                        minSourceX, minSourceY, maxSourceX, maxSourceY,
++                        &minX, &minY, &maxX, &maxY)) return true;
+                     texPixels += (size_t)minSourceY * 320u * 4u;
+                     texH = cropHeight;
+                     sparseSurface = sourceSurface;
+                     v[0].v = v[1].v = -(float)minSourceY / (float)cropHeight;
+                     v[2].v = v[3].v =
+                         (240.0f - (float)minSourceY) / (float)cropHeight;
+-                    for (int i = 0; i < 4; ++i) v[i].y += (float)hudOffset;
+-                    minY += hudOffset;
+-                    maxY += hudOffset;
+-                    minX += minSourceX;
+-                    maxX -= 320 - maxSourceX;
+-                    minY += minSourceY;
+-                    maxY -= 240 - maxSourceY;
+ #if defined(MISTER_GPU_DIAGNOSTICS)
+                     if (sw->gpuHudCropLogs < 8) {
+                         logInfo("MiSTer AM2R HUD crop: bounds=%d,%d..%d,%d view=320x%d\n",
+@@ -3509,6 +3591,8 @@ static void swDrawSurfaceColor(Renderer* renderer, int32_t id, int32_t srcLeft,
+     if (!swSurfaceExists(renderer,id)) return;
+     if (srcWidth < 0) {srcLeft=srcTop=0;srcWidth=sw->surfaceWidths[id];srcHeight=sw->surfaceHeights[id];}
+ #ifdef USE_MISTER
++    y += (float)swCrtUiHudCompositeOffset(sw, id, srcLeft, srcTop, srcWidth, srcHeight,
++        x, y, xscale, yscale, angleDeg, c1, c2, c3, c4, alpha);
+     // Unified host/application targets are independent. An explicit surface
+     // draw retains ordinary alpha/blend/scissor/transform semantics through
+     // the common GPU path; only automatic presentation is a raw handoff.

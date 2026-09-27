@@ -6,6 +6,7 @@ import gdb
 
 
 TARGET_NAMES = (
+    "oLightEngine", "oFlashlight64",
     "oLight", "oBeam", "oMissile", "oBomb", "oBomb2", "oPickup",
     "oMGammaElec", "oGlowPlant1", "oSpikePlant", "oPincherFly",
     "oA3LabLight", "oA3LabDoor", "oFXAnimSpark", "oLightBug",
@@ -13,6 +14,8 @@ TARGET_NAMES = (
     "oMOmegaFlame", "oMOmega_Projectile", "oA8Lamp", "oA8RedLight",
     "oA6Dust", "oA8RedLightFX", "oGenesisAcid", "oGenesisSlashProj",
 )
+
+RVALUE_REAL = 5
 
 
 def array_length(pointer):
@@ -55,6 +58,36 @@ for index in range(object_count):
             name_to_index[pointer.string()] = index
         except (gdb.MemoryError, UnicodeError):
             pass
+
+
+def hash_map_length(pointer):
+    header = gdb.lookup_type("stbds_array_header").pointer()
+    return int(((pointer - 1).cast(header) - 1).dereference()["length"] - 1)
+
+
+vm = runner["vmContext"].dereference()
+variable_names = {}
+name_map = vm["varNameMap"]
+for index in range(hash_map_length(name_map)):
+    entry = name_map[index]
+    if not int(entry["key"]):
+        continue
+    try:
+        variable_names[int(entry["value"])] = entry["key"].string()
+    except (gdb.MemoryError, UnicodeError):
+        pass
+
+globals_instance = vm["globalScopeInstance"].dereference()
+for index in range(int(globals_instance["selfVars"]["capacity"])):
+    entry = globals_instance["selfVars"]["entries"][index]
+    if variable_names.get(int(entry["key"])) != "darkness":
+        continue
+    value = entry["value"]
+    if int(value["type"]) == RVALUE_REAL:
+        print("LIGHT_GLOBAL darkness=%.6f" % float(value["real"]))
+    else:
+        print("LIGHT_GLOBAL darkness_type=%d" % int(value["type"]))
+    break
 
 
 def is_descendant(object_index, target_index):

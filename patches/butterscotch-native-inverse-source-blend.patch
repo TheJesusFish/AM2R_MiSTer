@@ -1,0 +1,105 @@
+diff --git a/src/sw_renderer.c b/src/sw_renderer.c
+index 285a860..d4288c8 100644
+--- a/src/sw_renderer.c
++++ b/src/sw_renderer.c
+@@ -47,10 +47,11 @@ static inline uint8x8_t divideBy255U16(uint16x8_t value) {
+ }
+ #endif
+ 
+-// AM2R builds its lighting mask by subtractively blending large, axis-aligned
+-// light sprites into a CPU surface. The generic per-pixel path re-evaluates
+-// render state and performs six scalar colour divisions for every texel. Keep
+-// the same two /255 stages, but process the common contiguous atlas spans
++// GameMaker's bm_subtract is ZERO / INV_SRC_COLOR, not reverse subtraction:
++// every destination channel is multiplied by one minus its source channel.
++// In particular source alpha does not scale RGB, and alpha-zero texels can
++// still darken RGB. AM2R builds its light mask with this blend. Keep the tint
++// and blend /255 stages, but process the common contiguous atlas spans
+ // eight pixels at a time on the Cortex-A9. Scaled/clipped spans retain
+ // clamped nearest-neighbour sampling and use an exact division-free scalar
+ // /255 operation, so their pixels remain bit-identical to the original path.
+@@ -91,13 +92,11 @@ static void blendSubtractTextureSpan(uint32_t* destination,
+         uint8x8_t red = divideBy255U16(vmull_u8(pixels.val[0], tintRv));
+         uint8x8_t green = divideBy255U16(vmull_u8(pixels.val[1], tintGv));
+         uint8x8_t blue = divideBy255U16(vmull_u8(pixels.val[2], tintBv));
+-        red = divideBy255U16(vmull_u8(red, alpha));
+-        green = divideBy255U16(vmull_u8(green, alpha));
+-        blue = divideBy255U16(vmull_u8(blue, alpha));
+         uint8x8x4_t target = vld4_u8((const uint8_t*)(destination + output));
+-        target.val[0] = vqsub_u8(target.val[0], red);
+-        target.val[1] = vqsub_u8(target.val[1], green);
+-        target.val[2] = vqsub_u8(target.val[2], blue);
++        target.val[0] = divideBy255U16(vmull_u8(target.val[0], vmvn_u8(red)));
++        target.val[1] = divideBy255U16(vmull_u8(target.val[1], vmvn_u8(green)));
++        target.val[2] = divideBy255U16(vmull_u8(target.val[2], vmvn_u8(blue)));
++        target.val[3] = divideBy255U16(vmull_u8(target.val[3], vmvn_u8(alpha)));
+         vst4_u8((uint8_t*)(destination + output), target);
+         output += 8;
+         sourceX += sourceStep * 8;
+@@ -112,19 +111,17 @@ static void blendSubtractTextureSpan(uint32_t* destination,
+         uint32_t red = divideBy255U32((pixel & 255u) * tintR);
+         uint32_t green = divideBy255U32(((pixel >> 8) & 255u) * tintG);
+         uint32_t blue = divideBy255U32(((pixel >> 16) & 255u) * tintB);
+-        red = divideBy255U32(red * alpha);
+-        green = divideBy255U32(green * alpha);
+-        blue = divideBy255U32(blue * alpha);
+         uint8_t* target = (uint8_t*)&destination[output];
+-        target[0] = target[0] > red ? (uint8_t)(target[0] - red) : 0;
+-        target[1] = target[1] > green ? (uint8_t)(target[1] - green) : 0;
+-        target[2] = target[2] > blue ? (uint8_t)(target[2] - blue) : 0;
++        target[0] = divideBy255U32(target[0] * (255u - red));
++        target[1] = divideBy255U32(target[1] * (255u - green));
++        target[2] = divideBy255U32(target[2] * (255u - blue));
++        target[3] = divideBy255U32(target[3] * (255u - alpha));
+     }
+ }
+ 
+ static inline void blendPixel(SWRenderer* sw, uint8_t* dst, uint8_t sr, uint8_t sg, uint8_t sb, uint8_t sa) {
+     if (sw->alphaTestEnable && sa < sw->alphaTestRef) return;
+-    if (sa == 0) return;
++    if (sa == 0 && !(sw->blendEnable && sw->blendMode == bm_subtract)) return;
+ 
+     if (sw->fogEnable) {
+         sr = BGR_R(sw->fogColor);
+@@ -143,10 +140,11 @@ static inline void blendPixel(SWRenderer* sw, uint8_t* dst, uint8_t sr, uint8_t
+                 ra = clampByte((int32_t)dst[3] + sa);
+                 break;
+             case bm_subtract:
+-                rr = clampByte((int32_t)dst[0] - (int32_t)sr * sa / 255);
+-                rg = clampByte((int32_t)dst[1] - (int32_t)sg * sa / 255);
+-                rb = clampByte((int32_t)dst[2] - (int32_t)sb * sa / 255);
+-                ra = dst[3];
++                // Native GM 1.1 uses ZERO / INV_SRC_COLOR for RGBA.
++                rr = divideBy255U32((uint32_t)dst[0] * (255u - sr));
++                rg = divideBy255U32((uint32_t)dst[1] * (255u - sg));
++                rb = divideBy255U32((uint32_t)dst[2] * (255u - sb));
++                ra = divideBy255U32((uint32_t)dst[3] * invA);
+                 break;
+             case bm_max:
+                 rr = sr > dst[0] ? sr : dst[0];
+@@ -955,9 +953,8 @@ static bool rasterizeAxisAlignedQuad(SWRenderer* sw, SWVertex v[4], const uint8_
+     // GameMaker effects.  In particular, AM2R's lighting engine subtracts a
+     // one-level grey rectangle over 331x251 pixels every step.  Sending that
+     // through the generic float/interpolation loop below performs four state
+-    // branches and three integer divisions for every pixel.  At full alpha the
+-    // supported blend equations reduce exactly to packed fill or saturated
+-    // byte add/subtract, so use that integer form for software surfaces.
++    // branches and three integer divisions for every pixel. Use exact integer
++    // fill, saturated addition, or inverse-source modulation as appropriate.
+     if(!texPixels&&compatibleState&&tintA==255u){
+         const int32_t width=maxX-minX;
+         if(!sw->blendEnable||sw->blendMode==bm_normal){
+@@ -977,9 +974,10 @@ static bool rasterizeAxisAlignedQuad(SWRenderer* sw, SWVertex v[4], const uint8_
+                 uint8_t* pixel=sw->framebuffer+((size_t)y*sw->fbWidth+minX)*4u;
+                 for(int32_t x=0;x<width;++x,pixel+=4){
+                     if(subtract){
+-                        pixel[0]=pixel[0]>tintR?(uint8_t)(pixel[0]-tintR):0;
+-                        pixel[1]=pixel[1]>tintG?(uint8_t)(pixel[1]-tintG):0;
+-                        pixel[2]=pixel[2]>tintB?(uint8_t)(pixel[2]-tintB):0;
++                        pixel[0]=divideBy255U32(pixel[0]*(255u-tintR));
++                        pixel[1]=divideBy255U32(pixel[1]*(255u-tintG));
++                        pixel[2]=divideBy255U32(pixel[2]*(255u-tintB));
++                        pixel[3]=0;
+                     }else{
+                         pixel[0]=clampByte((int32_t)pixel[0]+tintR);
+                         pixel[1]=clampByte((int32_t)pixel[1]+tintG);

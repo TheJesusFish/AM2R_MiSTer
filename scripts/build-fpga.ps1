@@ -6,6 +6,11 @@ param(
 $ErrorActionPreference = 'Stop'
 $projectRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 $quartusPath = (Resolve-Path -LiteralPath $QuartusSh).Path
+$provenance = Join-Path $PSScriptRoot 'artifact_provenance.py'
+$rbfPath = Join-Path $projectRoot 'output_files\AM2R.rbf'
+$token = "$rbfPath.provenance.pending.json"
+& python $provenance begin fpga $rbfPath $token
+if ($LASTEXITCODE -ne 0) { throw 'FPGA pre-build provenance capture failed.' }
 
 Push-Location $projectRoot
 try {
@@ -14,7 +19,6 @@ try {
         throw "Quartus compilation failed with exit code $LASTEXITCODE."
     }
 
-    $rbfPath = Join-Path $projectRoot 'output_files\AM2R.rbf'
     if (-not (Test-Path -LiteralPath $rbfPath -PathType Leaf)) {
         throw 'Quartus returned success but output_files\AM2R.rbf is missing.'
     }
@@ -23,6 +27,9 @@ try {
     if ($timingReport.Contains('Timing requirements not met')) {
         throw 'Quartus produced an RBF, but TimeQuest reports unmet timing requirements.'
     }
+
+    & python $provenance seal $token $rbfPath "$rbfPath.provenance.json"
+    if ($LASTEXITCODE -ne 0) { throw 'FPGA artifact provenance could not be sealed.' }
 
     $rbf = Get-Item -LiteralPath $rbfPath
     [pscustomobject]@{

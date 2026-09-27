@@ -36,6 +36,15 @@ discovery entries unless an exact revision is stated.
   a normal core selecting an ARM frontend through `MiSTer.ini`, inspected at
   `e37d62083bca8421f4c83eebf4d34a37e82f9992`. AM2R adopts that launch shape,
   while using its own runner, ZIP loader, DDR ABI, and FPGA GPU.
+- [Maldita Castilla MiSTer](https://github.com/gmcnaught/maldita.castilla-mister)
+  (`2e76ce80ec4f7b2e81f0c8630f6fef4e10c57ab6`, GPL-3.0),
+  [MiSTer FPGA blitter](https://github.com/gmcnaught/mister-fpga-blitter)
+  (`c4407e41e8566fe094adac4da71448db7b1ef5f6`, GPL-3.0), and
+  [gmloader-next fork](https://github.com/gmcnaught/gmloader-next)
+  (`2cea25b79d6fc3a4c11f32cef84214aef4c5e51e`, GPL-2.0) were reviewed
+  for build provenance, DDR upload behavior, and graphics verification.
+  AM2R adapted methods only, not their RTL, kernel module, runtime, or
+  physical memory map. See the 2026-09-24 upstream follow-up report.
 
 These examples support investigating the architecture. They do not establish that AM2R works or reaches 60 FPS on the DE10.
 

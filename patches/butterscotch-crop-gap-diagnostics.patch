@@ -1,0 +1,229 @@
+diff --git a/src/render_diagnostics.h b/src/render_diagnostics.h
+index 7fc9b18..c7c9596 100644
+--- a/src/render_diagnostics.h
++++ b/src/render_diagnostics.h
+@@ -2,6 +2,7 @@
+ // Opt-in main-thread measurements. No timers, storage or I/O in release builds.
+ #ifndef AM2R_RENDER_DIAGNOSTICS_H
+ #define AM2R_RENDER_DIAGNOSTICS_H
++#include <stddef.h>
+ #include <stdint.h>
+ 
+ enum RD_Operation {
+@@ -18,15 +19,20 @@ RD_Scope RD_scopeBegin(int operation, int32_t surface, uint64_t pixels);
+ void RD_scopeEnd(RD_Scope* scope);
+ void RD_uploadBytes(uint64_t bytes);
+ void RD_capturePerturbation(void);
++void RD_cropUpload(const uint8_t* shadow, const uint8_t* source,
++                   size_t sourceStride, size_t cropRowBytes, size_t rows);
+ #define RD_SCOPE(op, surface, pixels) \
+     RD_Scope rdScope __attribute__((cleanup(RD_scopeEnd))) = \
+         RD_scopeBegin((op), (surface), (pixels))
+ #define RD_UPLOAD_BYTES(bytes) RD_uploadBytes(bytes)
++#define RD_CROP_UPLOAD(shadow, source, stride, width, rows) \
++    RD_cropUpload((shadow), (source), (stride), (width), (rows))
+ #else
+ #define RD_beginFrame(frame, room, inputMask) ((void)0)
+ #define RD_endFrame() ((void)0)
+ #define RD_SCOPE(op, surface, pixels) ((void)0)
+ #define RD_UPLOAD_BYTES(bytes) ((void)0)
+ #define RD_capturePerturbation() ((void)0)
++#define RD_CROP_UPLOAD(shadow, source, stride, width, rows) ((void)0)
+ #endif
+ #endif
+diff --git a/src/render_diagnostics.c b/src/render_diagnostics.c
+index 7ae9240..468b75d 100644
+--- a/src/render_diagnostics.c
++++ b/src/render_diagnostics.c
+@@ -16,6 +16,11 @@
+ #endif
+ #define RD_MAX_FRAMES 1800u
+ #define RD_BUCKETS 64u
++#define RD_CROP_RECORDS 4u
++#define RD_CROP_THRESHOLDS 5u
++#define RD_CROP_MAX_ROW_BYTES 4096u
++#define RD_CROP_MAX_ROWS 512u
++#define RD_CROP_MAX_BYTES (1024u * 1024u)
+ 
+ typedef struct {
+     uint64_t nanos, pixels, bytes;
+@@ -40,6 +45,23 @@ static uint32_t depths[RD_OPERATION_COUNT];
+ static uint64_t origin;
+ static FILE* output;
+ 
++// This separately requested experiment reads CPU source/shadow pixels, never
++// shared FPGA DDR. It predicts split-span traffic without changing uploads.
++// Keep the extra storage and scans absent unless AM2R_CROP_GAPS is exactly 1.
++typedef struct {
++    uint64_t singleBytes, changedBytes, gapBytes, nanos;
++    uint64_t predictedBytes[RD_CROP_THRESHOLDS];
++    uint32_t predictedCalls[RD_CROP_THRESHOLDS];
++    uint32_t ordinal, stride, width, rows, singleCalls;
++} RD_CropRecord;
++typedef struct {
++    uint32_t seen, count, dropped;
++    RD_CropRecord records[RD_CROP_RECORDS];
++} RD_CropFrame;
++static const uint32_t cropThresholds[RD_CROP_THRESHOLDS] = {0, 16, 32, 64, 128};
++static RD_CropFrame* cropFrames;
++static FILE* cropOutput;
++
+ static uint64_t rdNow(void) {
+     struct timespec ts;
+     clock_gettime(CLOCK_MONOTONIC, &ts);
+@@ -60,6 +82,62 @@ static int bucketFor(int operation, int32_t surface) {
+     return index;
+ }
+ 
++static void flushCropFrames(void) {
++    if (!cropFrames || !cropOutput) return;
++    fputs("elapsed_ns,frame,room,input_mask,record_kind,upload_ordinal,seen_uploads,recorded_uploads,dropped_uploads,source_stride,crop_row_bytes,rows,single_span_bytes,single_span_calls,changed_pixel_bytes,interior_gap_bytes,measurement_ns,timing_perturbed", cropOutput);
++    for (uint32_t t = 0; t < RD_CROP_THRESHOLDS; ++t)
++        fprintf(cropOutput, ",predicted_bytes_gap%u,predicted_calls_gap%u", cropThresholds[t], cropThresholds[t]);
++    fputc('\n', cropOutput);
++    for (uint32_t i = 0; i < used; ++i) {
++        RD_Frame* frame = &frames[i];
++        RD_CropFrame* crop = &cropFrames[i];
++        // A summary row establishes coverage even for zero observations or all
++        // rejected/overflowed calls. Zero-valued summary metrics are not samples.
++        for (uint32_t j = 0; j <= crop->count; ++j) {
++            RD_CropRecord empty = {0};
++            RD_CropRecord* record = j == 0 ? &empty : &crop->records[j - 1];
++            fprintf(cropOutput, "%" PRIu64 ",%d,%d,%u,%s,%d,%u,%u,%u,%u,%u,%u,%" PRIu64 ",%u,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",1",
++                frame->start - origin, frame->frame, frame->room, frame->input,
++                j == 0 ? "summary" : "upload", j == 0 ? -1 : (int)record->ordinal,
++                crop->seen, crop->count, crop->dropped,
++                record->stride, record->width, record->rows, record->singleBytes,
++                record->singleCalls, record->changedBytes, record->gapBytes, record->nanos);
++            for (uint32_t t = 0; t < RD_CROP_THRESHOLDS; ++t)
++                fprintf(cropOutput, ",%" PRIu64 ",%u", record->predictedBytes[t], record->predictedCalls[t]);
++            fputc('\n', cropOutput);
++        }
++    }
++    int failed = ferror(cropOutput);
++    if (fclose(cropOutput) != 0) failed = 1;
++    fprintf(stderr, "AM2R crop gaps: %u frames, output %s (predictions only; timings perturbed)\n",
++            used, failed ? "FAILED (discard incomplete CSV)" : "complete");
++    cropOutput = NULL;
++    free(cropFrames);
++    cropFrames = NULL;
++}
++
++static void openCropFrames(const char* path, uint32_t wanted) {
++    const char* requested = getenv("AM2R_CROP_GAPS");
++    if (!requested || strcmp(requested, "1") != 0) return;
++    char name[1024];
++    if (snprintf(name, sizeof(name), "%s/render-crop.csv", path) >= (int)sizeof(name)) return;
++    RD_CropFrame* allocation = calloc(wanted, sizeof(*allocation));
++    if (!allocation) {
++        fputs("AM2R crop gaps: unavailable (allocation failed)\n", stderr);
++        return;
++    }
++    int fd = open(name, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
++    if (fd < 0) {
++        free(allocation);
++        fputs("AM2R crop gaps: unavailable (exclusive output creation failed)\n", stderr);
++        return;
++    }
++    cropOutput = fdopen(fd, "w");
++    if (!cropOutput) { close(fd); free(allocation); return; }
++    cropFrames = allocation;
++    fprintf(stderr, "AM2R crop gaps: enabled, at most %u uploads/frame; timings perturbed\n", RD_CROP_RECORDS);
++}
++
+ static void flushFrames(void) {
+     // Deliberately outside measured work. This finite diagnostic pass pauses
+     // here; never use its flush/capture boundary to measure gameplay cadence.
+@@ -79,6 +157,7 @@ static void flushFrames(void) {
+     fprintf(stderr, "AM2R render diagnostics: %u frames, output %s\n",
+             used, failed ? "FAILED (discard incomplete CSV)" : "complete");
+     output = NULL;
++    flushCropFrames();
+     free(frames);
+     frames = current = NULL;
+ }
+@@ -113,6 +192,7 @@ static void pollRequest(void) {
+     output = fdopen(fd, "w");
+     if (!output) { close(fd); free(allocation); return; }
+     frames = allocation;
++    openCropFrames(path, (uint32_t)wanted);
+     limit = (uint32_t)wanted;
+     used = 0;
+     origin = rdNow();
+@@ -126,6 +206,7 @@ void RD_beginFrame(int32_t frame, int32_t room, uint32_t inputMask) {
+     if (!frames) return;
+     current = &frames[used];
+     memset(current, 0, sizeof(*current));
++    if (cropFrames) memset(&cropFrames[used], 0, sizeof(*cropFrames));
+     current->frame = frame;
+     current->room = room;
+     current->input = inputMask;
+@@ -180,4 +261,52 @@ void RD_capturePerturbation(void) {
+     int index = bucketFor(RD_CAPTURE, -1);
+     if (index >= 0) current->buckets[index].calls++;
+ }
++
++void RD_cropUpload(const uint8_t* shadow, const uint8_t* source,
++                   size_t sourceStride, size_t cropRowBytes, size_t rows) {
++    if (!cropFrames || !current) return;
++    RD_CropFrame* frame = &cropFrames[used];
++    uint32_t ordinal = frame->seen++;
++    if (frame->count == RD_CROP_RECORDS || !shadow || !source || !cropRowBytes ||
++        cropRowBytes > RD_CROP_MAX_ROW_BYTES || !rows || rows > RD_CROP_MAX_ROWS ||
++        sourceStride < cropRowBytes || sourceStride > UINT32_MAX ||
++        sourceStride > SIZE_MAX / rows || cropRowBytes > RD_CROP_MAX_BYTES / rows) {
++        ++frame->dropped;
++        return;
++    }
++    RD_CropRecord* record = &frame->records[frame->count++];
++    record->ordinal = ordinal;
++    record->stride = (uint32_t)sourceStride;
++    record->width = (uint32_t)cropRowBytes;
++    record->rows = (uint32_t)rows;
++    const uint64_t begin = rdNow();
++    for (size_t y = 0; y < rows; ++y) {
++        const uint8_t* a = shadow + y * cropRowBytes;
++        const uint8_t* b = source + y * sourceStride;
++        size_t first = cropRowBytes, previousEnd = 0;
++        for (size_t p = 0; p < cropRowBytes; p += 4) {
++            size_t bytes = cropRowBytes - p < 4 ? cropRowBytes - p : 4;
++            if (memcmp(a + p, b + p, bytes) == 0) continue;
++            record->changedBytes += bytes;
++            if (first == cropRowBytes) {
++                first = p;
++                ++record->singleCalls;
++                for (uint32_t t = 0; t < RD_CROP_THRESHOLDS; ++t)
++                    ++record->predictedCalls[t];
++            } else {
++                size_t gap = p - previousEnd;
++                record->gapBytes += gap;
++                for (uint32_t t = 0; t < RD_CROP_THRESHOLDS; ++t) {
++                    if (gap <= cropThresholds[t]) record->predictedBytes[t] += gap;
++                    else ++record->predictedCalls[t];
++                }
++            }
++            for (uint32_t t = 0; t < RD_CROP_THRESHOLDS; ++t)
++                record->predictedBytes[t] += bytes;
++            previousEnd = p + bytes;
++        }
++        if (first != cropRowBytes) record->singleBytes += previousEnd - first;
++    }
++    record->nanos = rdNow() - begin;
++}
+ #endif
+diff --git a/src/backends/mister.c b/src/backends/mister.c
+index 21cdc88..9d680f9 100644
+--- a/src/backends/mister.c
++++ b/src/backends/mister.c
+@@ -1193,6 +1193,11 @@ static bool updateCroppedTextureChangedRows(uint8_t* shadowPixels,
+                                             size_t sourceRowBytes,
+                                             size_t cropRowBytes,
+                                             size_t rowCount) {
++    // Opt-in gap measurement observes the selected buffer's CPU shadow before
++    // it changes. It never reads targetPixels or changes GPU ownership/writes.
++#if defined(MISTER_RENDER_DIAGNOSTICS)
++    RD_CROP_UPLOAD(shadowPixels, sourcePixels, sourceRowBytes, cropRowBytes, rowCount);
++#endif
+     bool wrotePixels = false;
+     for (size_t row = 0; row < rowCount; ++row) {
+         const uint8_t* sourceRow = sourcePixels + row * sourceRowBytes;

@@ -52,10 +52,23 @@ git apply ../../patches/butterscotch-lighting-visible-crop.patch
 git apply ../../patches/butterscotch-metroid-lighting-hit.patch
 git apply ../../patches/butterscotch-lighting-native-events.patch
 git apply ../../patches/butterscotch-logical-savestates.patch
+git apply ../../patches/butterscotch-sand-draw-cache.patch
+git apply ../../patches/butterscotch-lighting-crop-reuse.patch
+git apply ../../patches/butterscotch-native-inverse-source-blend.patch
+git apply ../../patches/butterscotch-authored-light-step.patch
+git apply ../../patches/butterscotch-neon-solid-subtract.patch
+git apply ../../patches/butterscotch-render-diagnostics.patch
+git apply ../../patches/butterscotch-scaled-light-upload.patch
+git apply ../../patches/butterscotch-packed-mask-unroll.patch
+git apply ../../patches/butterscotch-crop-gap-diagnostics.patch
+git apply ../../patches/butterscotch-crop-split-upload.patch
+git apply ../../patches/butterscotch-offscreen-rendering.patch
+git apply ../../patches/butterscotch-unified-renderer.patch
+git apply ../../patches/butterscotch-crt-ui-composition.patch
 ```
 
-The forty-one files were generated from the hardware-validated working tree.
-Each clean-applies in the order above, and applying all forty-one to a fresh
+The fifty-four files preserve the working tree, including the native-lighting
+correction described below. Each applies in the order above; applying them to a fresh
 detached clone at the base commit reconstructs the current runner source after
 normalizing checkout line endings. See the final hardware and save-state
 reports under `reports/` for build identities and test results. The first
@@ -252,6 +265,20 @@ fingerprint and payload CRC before mutation, and atomically publishes compact
 two-generation testing completed saves in 281–468 ms and loads in 406–453 ms;
 all four slot indices, cross-exit restore, corrupt-state rejection, input,
 audio, and ordinary-save integrity passed.
+The forty-second patch resolves and validates AM2R 1.1's exact `oBlockSand`
+Draw contract once, then renders exact sand instances before generic event
+resolution. It also combines each corner-variable existence check and read
+into one hash lookup. Every mismatch retains the interpreted path. In the
+user-supplied room-122 checkpoint on USB-1, the 24 alternating diagonal jumps
+completed 2,039 measured game cycles with no cycle over 20 ms; peak work before
+vblank fell from 17.576 ms to 15.977 ms, and the 2,041-frame UGREEN capture had
+no repeated-frame cluster or rendering corruption.
+The forty-third patch retains the CPU shadows of a cropped lighting texture
+when AM2R frees and recreates its surface. After waiting for the prior FPGA
+job, it updates only changed rows instead of copying both complete 320x240
+textures into strongly ordered DDR every frame. In the same room-159 USB-1
+scene, median cropped-upload cost fell from 8.25 to 1.15 ms; steady-state
+stage tracing found no frame longer than 20 ms across 603 cycles.
 
 | Patch | SHA-256 |
 | --- | --- |
@@ -296,6 +323,216 @@ audio, and ordinary-save integrity passed.
 | `butterscotch-metroid-lighting-hit.patch` | `3102a3da64e5b98a0084586bac8b67b8fa6766c26ed693b16e305b23616c7b38` |
 | `butterscotch-lighting-native-events.patch` | `e5649a320b56f98589a87e57b0348bc1775e942f23487f72e3b1f25f7d7f72e3` |
 | `butterscotch-logical-savestates.patch` | `97328613ec428eff567a19cab7e472e28d4e9edae59b4083f2448a55ef363687` |
+| `butterscotch-sand-draw-cache.patch` | `df02df579c6bae64b5f2692c37b8b4a7b78480c6a96abf64121a8be76aa3f191` |
+| `butterscotch-lighting-crop-reuse.patch` | `257031c7337aad28a9ad5af5cbdebdc3824b02988f16762abf1e80dec05258e7` |
+| `butterscotch-native-inverse-source-blend.patch` | `648209c90f90a4fafaf5885bfddc5c44af5cb494a623f281a44d25bca8e9ab81` |
+| `butterscotch-authored-light-step.patch` | `478df572b0813f72999dc1d978b0f9d9dd81b6e0505bc6d7227abb490f51c8a1` |
+| `butterscotch-neon-solid-subtract.patch` | `2bc3e94b068c13fa66d2cfa399c24098c7c53ff3cb32a865720b6cf765bd5479` |
+| `butterscotch-render-diagnostics.patch` | `1f54de1ff4270914337d01bf239b6ce255504fcd35dc309cc55f4c2ba82f313f` |
+| `butterscotch-scaled-light-upload.patch` | `7c99d3eb60a5cbdf68b8fffe81ca743ebf69fb1ac925d72ecb3fc52628d42546` |
+| `butterscotch-packed-mask-unroll.patch` | `22b71cd49fd2eb08479e0ce8b9d2b863f65e772bd8d468a01dff4f2f388e967d` |
+| `butterscotch-crop-gap-diagnostics.patch` | `de988f63dfc26923de65dd3d6cfe9d8e53883764357c1b8740729d954fd36574` |
+| `butterscotch-crop-split-upload.patch` | `1b239e06741857f37c1ef955d19ed308f4a1e2f79371ffa45475b2de184a9925` |
+| `butterscotch-offscreen-rendering.patch` | `c4bfb6e853ae572eda91ab4f683e5fbbc245f51e7e555ab0d4a845c2eb0f3781` |
+| `butterscotch-unified-renderer.patch` | `1d26a90fde435b34161c18dec55b249839d82e738711388c74910e21bc24dea6` |
+| `butterscotch-crt-ui-composition.patch` | `ebf4b31b16fa44b4152300b397b127ffa9928688d6fe1de594a4a850973a03d2` |
+
+## General FPGA rendering experiment
+
+Patch 53, `butterscotch-unified-renderer.patch`, replaces screen/effect-specific
+ownership with persistent full-size RGBA targets, tiled framebuffer transfers,
+ordered copies and snapshots, and explicit no-present synchronization. It adds
+constant-size setup for FPGA triangles, four-corner gradients, clamped texture
+sampling, separate blend factors, channel masks, alpha testing and constant fog.
+The software custom-factor reference is corrected rather than treating custom
+blending as ordinary source-alpha blending. Shader support is not claimed.
+Triangle coverage uses single-owner top/left edges in both packet setup and
+the software reference, preventing double blending at shared quad/fan edges.
+
+This branch is still under validation. `AM2R_GPU_UNIFIED=1` opts in on a capable
+RBF; `AM2R_GPU_UNIFIED_STRICT=1` makes unexpected software rendering a QA failure.
+Default builds retain the legacy path until hardware acceptance. Diagnostic
+builds can capture bounded referenced DDR regions and raw before/after BRAM
+using two intrusive no-present observer jobs. These captures are correctness
+evidence, never frame-rate measurements. Release builds omit capture code.
+
+See [the architecture and acceptance gates](../docs/unified-fpga-renderer.md)
+and [operation coverage](../docs/unified-renderer-coverage.md). Tests distinguish
+defined Q31.32 arithmetic from arbitrary floating-point/native equivalence;
+neither source inventory nor an FPGA-only command count proves complete-game
+correctness or speed. No game data or MiSTer framework files are included.
+
+## Capability-gated offscreen lighting rendering
+
+Patch 52, `butterscotch-offscreen-rendering.patch`, enables offscreen rendering
+by default only when initialization has probed the companion FPGA floor-tint
+capability. `AM2R_GPU_OFFSCREEN=0` forces it off; `AM2R_GPU_OFFSCREEN=1` explicitly
+enables it, including on older RBFs for fallback testing. Other explicit values
+disable it. With the setting absent, older RBFs keep the CPU path without
+recording journals. Non-MiSTer initialization is unchanged.
+
+It records bounded operations on 512x256
+lighting surfaces and can generate their proved 320x240 visible crop as an
+FPGA prepass. The complete logical surface remains available through exact
+CPU replay before unsupported drawing, copies, pixel reads, and logical
+save-state serialization. Surface replacement and restore discard stale
+journals; static atlas sources retain immutable ownership when reusing a
+previously dynamic allocation.
+
+Prepasses run after deferred prior-frame exports and before the ordinary
+application clear. Their exports have separate double-buffered storage,
+revision checks, transactional failure, and a protected command prefix that
+screen optimizers cannot discard. A constant solid prefix is folded into the
+prepass clear with the original channel arithmetic. Texture sampling proves
+every CPU-selected Y row fits a fixed-point interval, with exact row runs as
+the fallback; it does not approximate endpoint rounding.
+
+Arbitrary tint requires the companion core-local FPGA floor-tint capability.
+The runtime probes that capability before setting the descriptor flag, while
+explicitly opted-in older RBFs retain binary-tint eligibility and exact CPU
+fallback. The matching
+RTL is tracked separately in `rtl/am2r_gpu.sv`; this runtime patch does not
+modify the MiSTer framework. Diagnostics builds can capture an independently
+materialized CPU lighting crop beside the hardware export so command replay
+does not substitute for CPU/GPU pixel comparison. Those captures perturb
+timing and are not performance measurements.
+
+Focused regressions are `tests/renderer/test_offscreen_contract.py`,
+`tests/renderer/offscreen_backend_test.py`,
+`tests/renderer/test_offscreen_journal.py`, and
+`tests/runtime/audit_offscreen_lifecycle.py`. Hardware performance, matching
+RBF identity, captured pixels, and save/load acceptance must be checked
+separately for every distributed build. The journal regression also checks the
+default selector and verifies that old-RBF defaults and forced-off settings
+allocate no journal and emit no export.
+All 52 patches were clean-applied to a fresh checkout of the pinned base on
+2026-09-25; all 418 reconstructed files matched the working source after line
+ending normalization, with no missing or extra implementation files.
+
+## Cropped-upload gap measurement and bounded split experiment
+
+Patch 50, `butterscotch-crop-gap-diagnostics.patch`, adds separately requested
+read-only measurements of each selected CPU shadow/source pair before upload.
+It requires a diagnostics build, `AM2R_CROP_GAPS=1`, and the existing finite
+timing request. Bounded records are flushed to `render-crop.csv`, with explicit
+overflow counts, existing one-span geometry, true changed-pixel bytes, and
+hypothetical split-byte/call totals. It does not change uploads, GPU memory
+ownership, or barriers. Normal release builds contain no hook. See
+[the diagnostic workflow](../docs/render-diagnostics.md) for timing caveats.
+
+Patch 51, `butterscotch-crop-split-upload.patch`, is the subsequent upload
+experiment. It retains the existing exact first/last row bounds, but skips
+interior pixel-aligned unchanged runs of at least 64 bytes. Equal 32-byte
+probes use the existing NEON helper; only candidate gap edges are refined
+wordwise. At most eight target copies per row are emitted; the final copy
+coalesces any remaining spans. The old CPU shadow remains intact until all
+segment decisions are finished, then receives the original complete span.
+No FPGA DDR reads, texture allocation changes, command reordering, ownership
+changes, or barrier changes are introduced.
+
+The extracted-production regression verifies exact full shadow/target pixels,
+guards, source immutability, ordered pixel-aligned writes, partial tails,
+threshold boundaries, copy caps, and repeated/alternating buffer contents.
+Uploaded bytes must not exceed the original one-span algorithm; they need
+not equal it. Cached-RAM microbenchmarks are not MiSTer DDR performance
+evidence. Hardware A/B and captured pixel validation determine whether the
+candidate is acceptable; this patch description does not itself claim a
+frame-rate improvement. The diagnostic `gap64` prediction merges gaps of
+exactly 64 bytes whereas this candidate skips them, and its eight-copy cap
+may coalesce later gaps, so prediction and actual copy totals can differ.
+
+## Complete HUD CRT inset
+
+Patch 54, `butterscotch-crt-ui-composition.patch`, moves the exact verified
+AM2R 1.1 `oControl.gui_surface` once at final composition, before unified or
+legacy raster dispatch. Its text remains at native coordinates inside the
+surface, so numbers, tanks, icons and minimap stay aligned. Live owner lookup
+handles recreated and restored surface IDs without relying on alpha bounds.
+The old legacy-only inset is removed; sparse upload cropping now intersects
+translated content bounds with the existing clip rather than subtracting from
+an already-clipped full-frame rectangle. Separate title overlays retain their
+existing behavior. Game data, save formats, FPGA and framework are unchanged.
+
+Run `python tests/renderer/test_crt_ui_composition.py`. Production-hook tests
+cover both dispatch paths, restored/full bounds, live option changes, identity
+refusals and translated sparse clipping; a mutation witness rejects the old
+bottom-edge truncation. Hardware acceptance is separate. This remains a
+shared-image adjustment, not analog-only output; see
+[the unimplemented isolation proposal](../docs/crt-ui-analog-isolation.md).
+
+## Exact packed-mask channel selection
+
+`butterscotch-packed-mask-unroll.patch` explicitly selects all four channels
+from each bounded half-scale packed load, with one direction branch. This
+removes the Cortex-A9 build's inner channel loop and packed-channel stack
+roundtrip while preserving the selected texels, all four tint/blend channels,
+clamps, scalar tails, unit-step helper and scaled self-surface ordering.
+It does not include the separately investigated neutral-tint specialization.
+
+Run `python tests/renderer/test_subtractive_blend.py`. Supplying
+`--baseline-source path/to/preserved/sw_renderer.c` also compares the host
+scalar and NEON-model paths against the previous implementation. Add
+`--arm-output path/to/arm-test` to build the static ARM differential harness;
+its `--regression-only` and `--benchmark-only` modes separate correctness and
+span timing. Actual gameplay remains a separate hardware validation.
+
+## Exact scaled-light and upload acceleration
+
+`butterscotch-scaled-light-upload.patch` vectorizes scaled inverse-source-color
+mask spans without changing signed 16.16 sampling, edge clamping, separate tint
+and blend rounding, or alpha-zero RGB behavior. Half-scale spans use bounded
+packed loads; other scales gather the same samples. Scaled self-surface draws
+retain scalar ordering. Unit-scale spans keep a separate packed implementation.
+The cropped upload path finds the same first/last changed pixel using block/word
+comparisons instead of redundant bytewise scans. Upload bytes, buffer ownership,
+completion waits and publication barriers are unchanged. No game data, shader
+semantics, GPU commands, FPGA clock, or framework files are altered.
+
+Run `python tests/renderer/test_subtractive_blend.py` and
+`python tests/renderer/crop_upload_test.py`. Both can build standalone ARM tests;
+their ordinary-memory benchmarks do not replace real gameplay frame-pacing tests.
+
+## Opt-in rendering diagnostics
+
+`butterscotch-render-diagnostics.patch` adds a bounded, buffered main-thread
+timing recorder and synchronized single-GPU-job capture. Build with
+`-RenderDiagnostics` only for QA; the default build compiles out the timers,
+request-file polling, capture I/O and storage. No GPU opcodes, game logic,
+blending arithmetic, `sys/` files or kernel behavior change. Captured pixels
+stay outside the public repository. See [the diagnostics workflow](../docs/render-diagnostics.md)
+for activation, identity binding, completeness checks and independent
+reference/RTL replay. Pixel capture deliberately pauses gameplay and cannot
+serve as a frame-rate benchmark.
+
+## Native GameMaker lighting blend
+
+`butterscotch-native-inverse-source-blend.patch` corrects the software
+`bm_subtract` implementation to GameMaker 1.x's ZERO / INV_SRC_COLOR factors:
+each RGBA channel is `destination * (255 - source) / 255`. RGB is not weighted
+by source alpha. The generic, solid-fill, scalar-span, and NEON-span paths use
+that operation, including colored pixels with zero alpha when alpha testing is
+disabled. The matching core-local FPGA correction is in `rtl/am2r_gpu.sv`;
+the runner and RBF should be updated together. No framework or game data is
+changed. Run `python tests/renderer/test_subtractive_blend.py` and the GPU RTL
+test for the arithmetic and command-path regressions. Native comparison and
+hardware evidence are recorded in the September 25 lighting reports.
+
+`butterscotch-authored-light-step.patch` removes the incorrect assumption that
+End Step always rebuilds AM2R's light surface. The authored End Step only
+initializes a missing surface; Normal Step updates an existing one. All light
+events now run through the original bytecode. Water and sand optimizations
+are unchanged. `tests/runtime/audit_am2r_native_lighting.py` prevents this
+interception from returning.
+
+`butterscotch-neon-solid-subtract.patch` accelerates the authored lighting
+rectangle with eight-pixel NEON spans and exact 16-bit product/divide-by-255
+arithmetic. It changes only the software solid-subtract implementation, not
+the lighting event sequence, target size, rectangle bounds, or other blends.
+The scalar fallback and every RGBA factor retain the same formula, including
+alpha-zero sources. The compiled renderer regression covers all 65,536
+channel pairs, 20,000 randomized solid spans with alignment/tail canaries,
+and the full 331x251 mask rectangle inside its 512x256 surface. Hardware
+performance acceptance is separate from these arithmetic checks.
 
 The retired whole-process checkpoint path used DMTCP 3.2.0 and remains
 reproducible for comparison or rollback. It is not used by the active logical

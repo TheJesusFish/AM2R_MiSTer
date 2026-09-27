@@ -1,0 +1,855 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 0aad226..5cafc4a 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -127,6 +127,13 @@ endif()
+ option(ENABLE_MODERN_GL "Enable the modern OpenGL renderer" ON)
+ option(ENABLE_SW_RENDERER "Enable the portable software renderer" OFF)
+ option(ENABLE_NOOP_RENDERER "Enable the no-op renderer (headless stub, no drawing)" OFF)
++option(MISTER_RENDER_DIAGNOSTICS "Include opt-in AM2R rendering measurements and frame capture (QA only)" OFF)
++if(MISTER_RENDER_DIAGNOSTICS)
++    if(NOT BACKEND STREQUAL "mister")
++        message(FATAL_ERROR "MISTER_RENDER_DIAGNOSTICS requires BACKEND=mister")
++    endif()
++    add_compile_definitions(MISTER_RENDER_DIAGNOSTICS)
++endif()
+ # Noop renderer is exclusive to the noop desktop backend (no window, no GL).
+ # Auto-enable for BACKEND=noop and reject otherwise.
+ if(BACKEND STREQUAL "noop")
+diff --git a/src/loop.c b/src/loop.c
+index 4eef9e7..8b55299 100644
+--- a/src/loop.c
++++ b/src/loop.c
+@@ -63,6 +63,7 @@
+ #include "utils.h"
+ #include "profiler.h"
+ #include "gettime.h"
++#include "render_diagnostics.h"
+ 
+ #ifdef USE_MISTER
+ #include "am2r_savestate.h"
+@@ -1514,7 +1515,16 @@ int loop(CommandLineArgs args, const char *argv0) {
+                 }
+ 
+                 // Run one game step (Begin Step, Keyboard, Alarms, Step, End Step, room transitions)
+-                Runner_step(runner);
++#ifdef MISTER_RENDER_DIAGNOSTICS
++                uint32_t rdInputMask = 0;
++                for (int button = 0; button < GP_BUTTON_COUNT; ++button)
++                    if (runner->gamepads->slots[0].buttonDown[button]) rdInputMask |= 1u << button;
++                RD_beginFrame(runner->frameCount, runner->currentRoomIndex, rdInputMask);
++#endif
++                {
++                    RD_SCOPE(RD_STEP, -1, 0);
++                    Runner_step(runner);
++                }
+ 
+                 if (freeCamActive) {
+                     memcpy(runner->keyboard->keyDown, currentKeyDown, sizeof(runner->keyboard->keyDown));
+@@ -1630,11 +1640,14 @@ int loop(CommandLineArgs args, const char *argv0) {
+                 platformGetMousePos(&mx, &my);
+                 Runner_updateMousePosition(runner, winW, winH, mx, my);
+ 
+-                Runner_drawViews(runner, gameW, gameH, debugShowCollisionMasks);
+-                renderer->vtable->endFrameInit(renderer);
+-                Runner_drawPost(runner, fbWidth, fbHeight);
+-                renderer->vtable->endFrameEnd(renderer);
+-                Runner_drawGUI(runner, fbWidth, fbHeight, gameW, gameH);
++                {
++                    RD_SCOPE(RD_DRAW, -1, 0);
++                    Runner_drawViews(runner, gameW, gameH, debugShowCollisionMasks);
++                    renderer->vtable->endFrameInit(renderer);
++                    Runner_drawPost(runner, fbWidth, fbHeight);
++                    renderer->vtable->endFrameEnd(renderer);
++                    Runner_drawGUI(runner, fbWidth, fbHeight, gameW, gameH);
++                }
+ 
+ #ifdef ENABLE_SCREENSHOTS
+                 // Capture screenshot if this frame matches a requested frame
+@@ -1669,6 +1682,7 @@ int loop(CommandLineArgs args, const char *argv0) {
+                 if (runner->pendingRoom == -1)
+                     platformSwapBuffers();
+                 Runner_handlePendingRoomChange(runner);
++                RD_endFrame();
+             }
+ 
+             if (RunnerKeyboard_checkPressed(runner->keyboard, VK_BACKSPACE)) {
+diff --git a/src/sw_renderer.c b/src/sw_renderer.c
+index 7350899..e9d49aa 100644
+--- a/src/sw_renderer.c
++++ b/src/sw_renderer.c
+@@ -6,6 +6,7 @@
+ #include "runner.h"
+ #include "image_decoder.h"
+ #include "log.h"
++#include "render_diagnostics.h"
+ #ifdef USE_MISTER
+ #include "backends/mister_gpu.h"
+ #include "crt_ui_inset.h"
+@@ -769,6 +770,9 @@ static bool swGpuTryAffineQuad(SWRenderer* sw, SWVertex v[4],
+ #endif
+ 
+ static void rasterizeTriangle(SWRenderer* sw, SWVertex v0, SWVertex v1, SWVertex v2, const uint8_t* texPixels, int32_t texW, int32_t texH) {
++#ifdef MISTER_RENDER_DIAGNOSTICS
++    RD_SCOPE(swGpuIsOutputTarget(sw) ? RD_OUTPUT_AXIS : RD_USER_TRIANGLE, sw->currentSurface, 0);
++#endif
+     // Compute bounding box
+     float fminX = v0.x;
+     if (v1.x < fminX) fminX = v1.x;
+@@ -951,6 +955,10 @@ static bool rasterizeAxisAlignedQuad(SWRenderer* sw, SWVertex v[4], const uint8_
+     if(maxY>sw->scissorY+sw->scissorH)maxY=sw->scissorY+sw->scissorH;
+     if(minX<0)minX=0;if(minY<0)minY=0;if(maxX>sw->fbWidth)maxX=sw->fbWidth;if(maxY>sw->fbHeight)maxY=sw->fbHeight;
+     if(minX>=maxX||minY>=maxY)return true;
++#ifdef MISTER_RENDER_DIAGNOSTICS
++    RD_SCOPE(swGpuIsOutputTarget(sw) ? RD_OUTPUT_AXIS : RD_USER_AXIS,
++             sw->currentSurface, (uint64_t)(maxX-minX)*(uint64_t)(maxY-minY));
++#endif
+     sw->frameAxisQuads++;
+     sw->frameAxisPixels+=(uint64_t)(maxX-minX)*(uint64_t)(maxY-minY);
+     const bool uniform=v[0].r==v[1].r&&v[0].r==v[2].r&&v[0].r==v[3].r&&
+@@ -1271,6 +1279,8 @@ static bool rasterizeAxisAlignedQuad(SWRenderer* sw, SWVertex v[4], const uint8_
+ #ifdef USE_MISTER
+         swExtendSurfaceContentBounds(sw, minX, minY, maxX, maxY);
+         if (sw->blendEnable && sw->blendMode == bm_subtract && normalState) {
++            RD_SCOPE(stepX == 65536 || stepX == -65536 ? RD_SUBTRACT_UNIT : RD_SUBTRACT_SCALED,
++                     sw->currentSurface, (uint64_t)(maxX-minX)*(uint64_t)(maxY-minY));
+             const int32_t width = maxX - minX;
+             for (int32_t y = minY; y < maxY; ++y) {
+                 int32_t sourceY = (int32_t)(srcY0 +
+@@ -2344,6 +2354,10 @@ void SWRenderer_clearFrameBuffer(Renderer* renderer, uint32_t color) {
+ 
+ static void swClearScreen(Renderer* renderer, uint32_t color, float alpha) {
+     SWRenderer* sw = (SWRenderer*)renderer;
++#ifdef MISTER_RENDER_DIAGNOSTICS
++    RD_SCOPE(swGpuIsOutputTarget(sw) ? RD_OUTPUT_AXIS : RD_USER_CLEAR,
++             sw->currentSurface, (uint64_t)sw->fbWidth*(uint64_t)sw->fbHeight);
++#endif
+     if (sw->framebuffer == nullptr) return;
+     uint8_t r = BGR_R(color), g = BGR_G(color), b = BGR_B(color);
+     uint8_t a = clampByte((int32_t)(alpha * 255.0f + 0.5f));
+diff --git a/src/backends/mister.c b/src/backends/mister.c
+index b494a1b..3493b92 100644
+--- a/src/backends/mister.c
++++ b/src/backends/mister.c
+@@ -5,6 +5,7 @@
+ #include "runner_keyboard.h"
+ #include "runner_mouse.h"
+ #include "backends/mister_gpu.h"
++#include "render_diagnostics.h"
+ 
+ #include <errno.h>
+ #include <fcntl.h>
+@@ -21,6 +22,11 @@
+ #include <time.h>
+ #include <unistd.h>
+ 
++#if defined(MISTER_RENDER_DIAGNOSTICS)
++#include <sys/stat.h>
++#include <sys/statvfs.h>
++#endif
++
+ #if defined(__ARM_NEON)
+ #include <arm_neon.h>
+ #endif
+@@ -172,6 +178,271 @@ static bool openJoyShared(void);
+ static void openVirtualInput(void);
+ static uint32_t reserveGpuTexture(size_t bytes);
+ 
++// Count bytes actually written to shared texture DDR, never CPU shadow copies.
++// The release macro expands to the original memcpy with no extra work.
++#if defined(MISTER_RENDER_DIAGNOSTICS)
++#define GPU_TEXTURE_COPY(destination, source, bytes) do { \
++    size_t rdTextureCopyBytes = (bytes); \
++    RD_UPLOAD_BYTES(rdTextureCopyBytes); \
++    memcpy((destination), (source), rdTextureCopyBytes); \
++} while (0)
++#else
++#define GPU_TEXTURE_COPY(destination, source, bytes) memcpy((destination), (source), (bytes))
++#endif
++
++#if defined(MISTER_RENDER_DIAGNOSTICS)
++// Deliberately intrusive, one-job diagnostic captures. No disk reads/writes,
++// request polling, or capture code are compiled into ordinary release builds.
++// The game thread is the sole submitter/texture writer here; all parallel CPU
++// compositing workers have joined before publication. Capture only while the
++// preceding GPU job is retired, then synchronously retire this job before the
++// game may mutate its inputs. Native scanout reads these buffers but never
++// writes them. Capturing a live in-flight /dev/mem snapshot would not be safe.
++// Prior on-chip RGBA/alpha is not exposed. Jobs without a leading clear are
++// captured unchanged, but are replayable only if the independent reference
++// proves every needed pixel initialized before it is read or presented. Never
++// substitute the alpha-discarding native XRGB copy or an invented black frame.
++typedef struct {
++    int directory;
++    uint32_t sequence, commandCount, commandPhysical, frameSerial;
++    uint32_t nativeSourceBase;
++    int gameFrame, room;
++    size_t textureBytes;
++    uint32_t exports[GPU_TEXTURE_RECORDS];
++    uint32_t exportCount;
++    bool requiresInitializationProof;
++} GpuCapture;
++static GpuCapture g_gpu_capture = { .directory = -1 };
++static int g_gpu_capture_root = -1;
++static bool g_gpu_capture_initialized = false;
++static uint32_t g_gpu_capture_attempts = 0;
++
++static bool gpuCaptureWrite(int directory, const char* name,
++                             const void* source, size_t bytes) {
++    int fd = openat(directory, name, O_WRONLY | O_CREAT | O_EXCL |
++                    O_NOFOLLOW | O_CLOEXEC, 0600);
++    if (fd < 0) return false;
++    // Limit additional RAM, and copy uncached device mappings to ordinary RAM
++    // before file I/O. No framebuffer/texture allocation is modified.
++    uint8_t buffer[16384];
++    const uint8_t* input = (const uint8_t*)source;
++    bool ok = true;
++    while (bytes != 0 && ok) {
++        size_t chunk = bytes < sizeof(buffer) ? bytes : sizeof(buffer);
++        memcpy(buffer, input, chunk);
++        size_t written = 0;
++        while (written != chunk) {
++            ssize_t count = write(fd, buffer + written, chunk - written);
++            if (count < 0 && errno == EINTR) continue;
++            if (count <= 0) { ok = false; break; }
++            written += (size_t)count;
++        }
++        input += chunk;
++        bytes -= chunk;
++    }
++    if (ok && fsync(fd) != 0) ok = false;
++    if (close(fd) != 0) ok = false;
++    return ok;
++}
++
++static void gpuCaptureAbort(const char* reason) {
++    logWarn("MiSTer GPU capture rejected/incomplete: %s (no manifest published)\n",
++            reason);
++    if (g_gpu_capture.directory >= 0) close(g_gpu_capture.directory);
++    g_gpu_capture.directory = -1;
++}
++
++static bool gpuCapturePrepare(uint32_t sequence, uint32_t physical) {
++    if (!g_gpu_capture_initialized) {
++        g_gpu_capture_initialized = true;
++        const char* path = getenv("AM2R_GPU_CAPTURE_DIR");
++        if (path != NULL && path[0] == '/') {
++            g_gpu_capture_root = open(path, O_RDONLY | O_DIRECTORY |
++                                      O_NOFOLLOW | O_CLOEXEC);
++            if (g_gpu_capture_root < 0)
++                logWarn("MiSTer GPU capture: cannot open requested output directory\n");
++        }
++    }
++    // At most eight requests per process. Caller creates the existing private
++    // QA directory and an empty regular capture.request file when ready.
++    if (g_gpu_capture_root < 0 || g_gpu_capture_attempts >= 8u) return false;
++    int request = openat(g_gpu_capture_root, "capture.request",
++                         O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
++    if (request < 0) return false;
++    struct stat requestStat;
++    bool valid = fstat(request, &requestStat) == 0 &&
++                 S_ISREG(requestStat.st_mode) && requestStat.st_size == 0;
++    close(request);
++    if (!valid) return false;
++    if (unlinkat(g_gpu_capture_root, "capture.request", 0) != 0) return false;
++    g_gpu_capture_attempts++;
++    RD_capturePerturbation();
++    RD_SCOPE(RD_CAPTURE, -1, 0);
++    if (g_gpu_pending || g_gpu_command_count < 2u ||
++        g_gpu_command_count > GPU_COMMAND_CAPACITY ||
++        g_gpu_texture_offset == 0 || g_gpu_texture_offset > GPU_TEXTURE_BYTES) {
++        gpuCaptureAbort("job is pending, empty, over capacity, or has invalid texture bounds");
++        return false;
++    }
++    GpuCapture* capture = &g_gpu_capture;
++    capture->sequence = sequence;
++    capture->commandCount = g_gpu_command_count;
++    capture->commandPhysical = physical;
++    capture->frameSerial = g_gpu_frame_serial;
++    capture->gameFrame = g_runner != NULL ? g_runner->frameCount : -1;
++    capture->room = g_runner != NULL ? g_runner->currentRoomIndex : -1;
++    capture->textureBytes = g_gpu_texture_offset;
++    capture->requiresInitializationProof = (uint8_t)g_gpu_commands[0].word[0] != 1u;
++    capture->nativeSourceBase = g_gpu_last_presented_valid ?
++        GPU_NATIVE_WINDOW_PHYS + GPU_NATIVE_BUFFER_OFFSET +
++            g_gpu_last_presented_buffer * GPU_NATIVE_BUFFER_BYTES : 0;
++    capture->exportCount = 0;
++    bool hasPotentialFramebufferWrite = false;
++    for (uint32_t i = 0; i < capture->commandCount; ++i) {
++        const MisterGpuCommand* command = &g_gpu_commands[i];
++        uint8_t opcode = (uint8_t)command->word[0];
++        if (opcode > 9u || ((opcode == 0u) != (i + 1u == capture->commandCount)) ||
++            (opcode == 8u && capture->nativeSourceBase == 0)) {
++            gpuCaptureAbort("unsupported opcode, missing END, or unavailable native source");
++            return false;
++        }
++        if (opcode == 6u) {
++            if (!hasPotentialFramebufferWrite) {
++                gpuCaptureAbort("export prefix needs unavailable prior BRAM RGBA");
++                return false;
++            }
++            uint32_t base = (uint32_t)command->word[1];
++            if ((base & 7u) != 0 || base < GPU_TEXTURE_PHYS ||
++                (uint64_t)base + MISTER_FB_BYTES >
++                    (uint64_t)GPU_TEXTURE_PHYS + capture->textureBytes) {
++                gpuCaptureAbort("export destination outside captured texture allocation");
++                return false;
++            }
++            uint32_t j = 0;
++            while (j < capture->exportCount && capture->exports[j] != base) j++;
++            if (j == capture->exportCount) {
++                if (j == GPU_TEXTURE_RECORDS) {
++                    gpuCaptureAbort("too many distinct export destinations");
++                    return false;
++                }
++                capture->exports[capture->exportCount++] = base;
++            }
++        }
++        if (opcode == 1u || opcode == 2u || opcode == 3u || opcode == 4u ||
++            opcode == 7u || opcode == 8u || opcode == 9u)
++            hasPotentialFramebufferWrite = true;
++    }
++    struct statvfs storage;
++    const uint64_t required = (uint64_t)capture->textureBytes +
++        (GPU_NATIVE_BUFFER_COUNT + 1u + capture->exportCount) * MISTER_FB_BYTES +
++        GPU_COMMAND_BYTES + 1024u * 1024u;
++    if (fstatvfs(g_gpu_capture_root, &storage) != 0 ||
++        (uint64_t)storage.f_bavail * storage.f_frsize < required) {
++        gpuCaptureAbort("insufficient output storage");
++        return false;
++    }
++    char name[96];
++    snprintf(name, sizeof(name), "job-%ld-%u-%u", (long)getpid(),
++             sequence, g_gpu_capture_attempts);
++    if (mkdirat(g_gpu_capture_root, name, 0700) != 0) {
++        gpuCaptureAbort("capture directory already exists or cannot be created");
++        return false;
++    }
++    capture->directory = openat(g_gpu_capture_root, name,
++        O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
++    if (capture->directory < 0) return false;
++    __sync_synchronize();
++    bool ok = gpuCaptureWrite(capture->directory, "commands.bin", g_gpu_commands,
++                              capture->commandCount * sizeof(MisterGpuCommand)) &&
++              gpuCaptureWrite(capture->directory, "textures.bin", g_gpu_textures,
++                              capture->textureBytes);
++    for (uint32_t i = 0; i < GPU_NATIVE_BUFFER_COUNT && ok; ++i) {
++        snprintf(name, sizeof(name), "native-%u.bin", i);
++        ok = gpuCaptureWrite(capture->directory, name,
++                              g_gpu_native_buffers[i], MISTER_FB_BYTES);
++    }
++    if (!ok) { gpuCaptureAbort("input write failed"); return false; }
++    logInfo("MiSTer GPU capture: inputs for sequence %u frozen (%zu texture bytes)\n",
++            sequence, capture->textureBytes);
++    return true;
++}
++
++static void gpuCaptureComplete(void) {
++    GpuCapture* capture = &g_gpu_capture;
++    if (capture->directory < 0) return;
++    RD_SCOPE(RD_CAPTURE, -1, 0);
++    if (g_gpu_pending || !g_gpu_available || !g_gpu_last_presented_valid ||
++        g_gpu_control[6] != capture->sequence) {
++        gpuCaptureAbort("captured job did not complete");
++        return;
++    }
++    __sync_synchronize();
++    bool ok = gpuCaptureWrite(capture->directory, "expected.bin",
++        g_gpu_native_buffers[g_gpu_last_presented_buffer], MISTER_FB_BYTES);
++    char name[64];
++    for (uint32_t i = 0; i < capture->exportCount && ok; ++i) {
++        snprintf(name, sizeof(name), "export-%u.bin", i);
++        ok = gpuCaptureWrite(capture->directory, name,
++            g_gpu_textures + (capture->exports[i] - GPU_TEXTURE_PHYS), MISTER_FB_BYTES);
++    }
++    if (!ok) { gpuCaptureAbort("expected-output write failed"); return; }
++    int fd = openat(capture->directory, "manifest.json.tmp", O_WRONLY | O_CREAT |
++                     O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
++    FILE* manifest = fd >= 0 ? fdopen(fd, "w") : NULL;
++    if (manifest == NULL) {
++        if (fd >= 0) close(fd);
++        gpuCaptureAbort("cannot create final manifest");
++        return;
++    }
++    fprintf(manifest,
++        "{\n  \"format\":\"am2r-gpu-capture-v1\",\n"
++        "  \"capture_kind\":\"gpu-job\",\"perturbs_timing\":true,\n"
++        "  \"initial_framebuffer_status\":\"unavailable\",\"requires_initialization_proof\":%s,\n"
++        "  \"sequence\":%u,\"frame_serial\":%u,\"game_frame\":%d,\"room\":%d,\n"
++        "  \"command_count\":%u,\"command_physical\":%u,\n"
++        "  \"gpu_cycles\":%u,\"completion_buffer\":%u,\"underflow\":%s,\n"
++        "  \"width\":320,\"height\":240,\"byte_order\":\"little\",\n"
++        "  \"commands\":{\"file\":\"commands.bin\"},\n"
++        "  \"regions\":[{\"base\":%u,\"file\":\"textures.bin\",\"bytes\":%zu}",
++        capture->requiresInitializationProof ? "true" : "false",
++        capture->sequence, capture->frameSerial, capture->gameFrame, capture->room,
++        capture->commandCount, capture->commandPhysical, g_gpu_last_completed_cycles,
++        g_gpu_last_presented_buffer, g_gpu_scanout_underflow ? "true" : "false",
++        GPU_TEXTURE_PHYS, capture->textureBytes);
++    for (uint32_t i = 0; i < GPU_NATIVE_BUFFER_COUNT; ++i)
++        fprintf(manifest, ",{\"base\":%u,\"file\":\"native-%u.bin\",\"bytes\":%zu}",
++            GPU_NATIVE_WINDOW_PHYS + GPU_NATIVE_BUFFER_OFFSET +
++                i * (uint32_t)GPU_NATIVE_BUFFER_BYTES, i, MISTER_FB_BYTES);
++    fprintf(manifest, "],\n  \"native_source_base\":");
++    if (capture->nativeSourceBase != 0) fprintf(manifest, "%u", capture->nativeSourceBase);
++    else fprintf(manifest, "null");
++    fprintf(manifest, ",\n  \"expected\":{\"file\":\"expected.bin\",\"format\":\"xrgb8888\"},\n"
++        "  \"expected_exports\":[");
++    for (uint32_t i = 0; i < capture->exportCount; ++i)
++        fprintf(manifest, "%s{\"base\":%u,\"file\":\"export-%u.bin\"}",
++                i == 0 ? "" : ",", capture->exports[i], i);
++    fprintf(manifest, "]\n}\n");
++    ok = !ferror(manifest) && fflush(manifest) == 0 && fsync(fd) == 0;
++    if (fclose(manifest) != 0) ok = false;
++    if (!ok) {
++        // A manifest is the completion marker, never leave a partial one.
++        unlinkat(capture->directory, "manifest.json.tmp", 0);
++        gpuCaptureAbort("manifest write failed");
++        return;
++    }
++    if (renameat(capture->directory, "manifest.json.tmp",
++                 capture->directory, "manifest.json") != 0) {
++        gpuCaptureAbort("manifest publication failed");
++        return;
++    }
++    fsync(capture->directory);
++    close(capture->directory);
++    capture->directory = -1;
++    logInfo("MiSTer GPU capture: sequence %u complete; capture pause is not a performance sample\n",
++            capture->sequence);
++}
++#endif
++
+ static bool mapFramebuffer(void) {
+     g_fb_fd = open("/dev/fb0", O_RDWR | O_SYNC | O_CLOEXEC);
+     if (g_fb_fd < 0) {
+@@ -257,6 +528,14 @@ static void unmapFramebuffer(void) {
+ }
+ 
+ static void unmapGpuHardware(void) {
++#if defined(MISTER_RENDER_DIAGNOSTICS)
++    // Diagnostic output descriptors are not GameMaker state and must not be
++    // carried across a DMTCP hardware detach/restore boundary.
++    if (g_gpu_capture.directory >= 0) gpuCaptureAbort("hardware detached");
++    if (g_gpu_capture_root >= 0) close(g_gpu_capture_root);
++    g_gpu_capture_root = -1;
++    g_gpu_capture_initialized = false;
++#endif
+     g_gpu_available = false;
+     g_gpu_pending = false;
+     g_gpu_commands = NULL;
+@@ -291,6 +570,7 @@ static void unmapGpuHardware(void) {
+ }
+ 
+ static bool waitGpuCompletion(uint32_t* cycles) {
++    RD_SCOPE(RD_GPU_WAIT, -1, 0);
+     if (cycles != NULL) *cycles = g_gpu_last_completed_cycles;
+     if (!g_gpu_available) return false;
+     if (!g_gpu_pending) return true;
+@@ -332,6 +612,10 @@ static bool submitGpuCommandsAsync(void) {
+     uint32_t next = g_gpu_sequence + 1;
+     if (next == 0) next = 1;
+ 
++#if defined(MISTER_RENDER_DIAGNOSTICS)
++    const bool capturing = gpuCapturePrepare(next, commandPhysical[g_gpu_write_buffer]);
++#endif
++
+     g_gpu_control[0] = 0;
+     __sync_synchronize();
+     g_gpu_control[2] = commandPhysical[g_gpu_write_buffer];
+@@ -349,6 +633,15 @@ static bool submitGpuCommandsAsync(void) {
+     g_gpu_pending = true;
+     g_gpu_write_buffer ^= 1u;
+     g_gpu_commands = g_gpu_command_buffers[g_gpu_write_buffer];
++#if defined(MISTER_RENDER_DIAGNOSTICS)
++    if (capturing) {
++        // Do not allow the next game step to overwrite any captured input or
++        // output. This single intentionally paused sample is not a speed test.
++        bool completed = waitGpuCompletion(NULL);
++        gpuCaptureComplete();
++        if (!completed) return false;
++    }
++#endif
+     return true;
+ }
+ 
+@@ -534,10 +827,10 @@ static MisterGpuTexture* reuseReleasedTexture(const void* rgbaPixels,
+     best->generation = nextTextureGeneration();
+     best->opaque_generation = 0;
+     memcpy(best->shadow, rgbaPixels, bytes);
+-    memcpy(g_gpu_textures + (best->physical[0] - GPU_TEXTURE_PHYS),
++    GPU_TEXTURE_COPY(g_gpu_textures + (best->physical[0] - GPU_TEXTURE_PHYS),
+            rgbaPixels, bytes);
+     if (best->physical[1] != 0)
+-        memcpy(g_gpu_textures + (best->physical[1] - GPU_TEXTURE_PHYS),
++        GPU_TEXTURE_COPY(g_gpu_textures + (best->physical[1] - GPU_TEXTURE_PHYS),
+                rgbaPixels, bytes);
+     if (best->shadow_alt != NULL) memcpy(best->shadow_alt, rgbaPixels, bytes);
+     __sync_synchronize();
+@@ -545,6 +838,7 @@ static MisterGpuTexture* reuseReleasedTexture(const void* rgbaPixels,
+ }
+ 
+ uint32_t MisterGpu_uploadTexture(const void* rgbaPixels, size_t bytes) {
++    RD_SCOPE(RD_UPLOAD, -1, 0);
+     if (!g_gpu_available || rgbaPixels == NULL || bytes == 0) return 0;
+     for (uint32_t i = 0; i < g_gpu_texture_record_count; ++i) {
+         if (!g_gpu_texture_records[i].released &&
+@@ -567,7 +861,7 @@ uint32_t MisterGpu_uploadTexture(const void* rgbaPixels, size_t bytes) {
+         return 0;
+     }
+     memcpy(shadow, rgbaPixels, bytes);
+-    memcpy(g_gpu_textures + (physical - GPU_TEXTURE_PHYS), rgbaPixels, bytes);
++    GPU_TEXTURE_COPY(g_gpu_textures + (physical - GPU_TEXTURE_PHYS), rgbaPixels, bytes);
+     __sync_synchronize();
+     MisterGpuTexture* record = &g_gpu_texture_records[g_gpu_texture_record_count++];
+     record->source = rgbaPixels;
+@@ -643,7 +937,7 @@ static uint32_t uploadSparseDynamicTexture(const void* rgbaPixels, size_t bytes,
+             last = (last + 3u) & ~(size_t)3u;
+             if (last > rowLength) last = rowLength;
+             memcpy(shadowRow + first, sourceRow + first, last - first);
+-            memcpy(targetPixels + rowOffset + first,
++            GPU_TEXTURE_COPY(targetPixels + rowOffset + first,
+                    sourceRow + first, last - first);
+             wrotePixels = true;
+         }
+@@ -683,8 +977,8 @@ static uint32_t uploadSparseDynamicTexture(const void* rgbaPixels, size_t bytes,
+     }
+     memcpy(shadow0, rgbaPixels, bytes);
+     memcpy(shadow1, rgbaPixels, bytes);
+-    memcpy(g_gpu_textures + (physical0 - GPU_TEXTURE_PHYS), rgbaPixels, bytes);
+-    memcpy(g_gpu_textures + (physical1 - GPU_TEXTURE_PHYS), rgbaPixels, bytes);
++    GPU_TEXTURE_COPY(g_gpu_textures + (physical0 - GPU_TEXTURE_PHYS), rgbaPixels, bytes);
++    GPU_TEXTURE_COPY(g_gpu_textures + (physical1 - GPU_TEXTURE_PHYS), rgbaPixels, bytes);
+     __sync_synchronize();
+     MisterGpuTexture* record = &g_gpu_texture_records[g_gpu_texture_record_count++];
+     record->source = rgbaPixels;
+@@ -754,7 +1048,7 @@ static uint32_t uploadDynamicTexture(const void* rgbaPixels, size_t bytes,
+             uint32_t physical = record->physical[record->active];
+             uint32_t offset = physical - GPU_TEXTURE_PHYS;
+             memcpy(record->shadow, rgbaPixels, bytes);
+-            memcpy(g_gpu_textures + offset, rgbaPixels, bytes);
++            GPU_TEXTURE_COPY(g_gpu_textures + offset, rgbaPixels, bytes);
+             __sync_synchronize();
+             record->last_upload_frame = g_gpu_frame_serial;
+             record->generation = nextTextureGeneration();
+@@ -780,7 +1074,7 @@ static uint32_t uploadDynamicTexture(const void* rgbaPixels, size_t bytes,
+         return 0;
+     }
+     memcpy(shadow, rgbaPixels, bytes);
+-    memcpy(g_gpu_textures + (physical0 - GPU_TEXTURE_PHYS), rgbaPixels, bytes);
++    GPU_TEXTURE_COPY(g_gpu_textures + (physical0 - GPU_TEXTURE_PHYS), rgbaPixels, bytes);
+     __sync_synchronize();
+     MisterGpuTexture* record = &g_gpu_texture_records[g_gpu_texture_record_count++];
+     record->source = rgbaPixels;
+@@ -810,11 +1104,13 @@ static uint32_t uploadDynamicTexture(const void* rgbaPixels, size_t bytes,
+ }
+ 
+ uint32_t MisterGpu_uploadDynamicTexture(const void* rgbaPixels, size_t bytes) {
++    RD_SCOPE(RD_UPLOAD, -1, 0);
+     return uploadDynamicTexture(rgbaPixels, bytes, false, 0);
+ }
+ 
+ uint32_t MisterGpu_uploadDynamicTextureRevision(const void* rgbaPixels, size_t bytes,
+                                                 uint32_t sourceRevision) {
++    RD_SCOPE(RD_UPLOAD, -1, 0);
+     return uploadDynamicTexture(rgbaPixels, bytes, true, sourceRevision);
+ }
+ 
+@@ -822,12 +1118,20 @@ uint32_t MisterGpu_uploadSparseDynamicTextureRevision(const void* rgbaPixels,
+                                                       size_t bytes,
+                                                       size_t rowBytes,
+                                                       uint32_t sourceRevision) {
++    RD_SCOPE(RD_UPLOAD, -1, 0);
+     return uploadSparseDynamicTexture(rgbaPixels, bytes, rowBytes, sourceRevision);
+ }
+ 
+ static void copyCroppedTextureRows(void* destination, const void* source,
+                                    size_t sourceRowBytes, size_t cropRowBytes,
+                                    size_t rowCount) {
++#if defined(MISTER_RENDER_DIAGNOSTICS)
++    uintptr_t address = (uintptr_t)destination;
++    uintptr_t base = (uintptr_t)g_gpu_textures;
++    if (g_gpu_textures != NULL && address >= base &&
++        address - base < GPU_TEXTURE_BYTES)
++        RD_UPLOAD_BYTES(cropRowBytes * rowCount);
++#endif
+     uint8_t* destinationPixels = (uint8_t*)destination;
+     const uint8_t* sourcePixels = (const uint8_t*)source;
+     for (size_t row = 0; row < rowCount; ++row)
+@@ -855,7 +1159,7 @@ static bool updateCroppedTextureChangedRows(uint8_t* shadowPixels,
+         last = (last + 3u) & ~(size_t)3u;
+         if (last > cropRowBytes) last = cropRowBytes;
+         memcpy(shadowRow + first, sourceRow + first, last - first);
+-        memcpy(targetPixels + row * cropRowBytes + first,
++        GPU_TEXTURE_COPY(targetPixels + row * cropRowBytes + first,
+                sourceRow + first, last - first);
+         wrotePixels = true;
+     }
+@@ -930,6 +1234,7 @@ uint32_t MisterGpu_uploadSparseDynamicTextureCropRevision(const void* rgbaPixels
+                                                           size_t cropRowBytes,
+                                                           size_t rowCount,
+                                                           uint32_t sourceRevision) {
++    RD_SCOPE(RD_UPLOAD, -1, 0);
+     if (!g_gpu_available || rgbaPixels == NULL || sourceRowBytes == 0 ||
+         cropRowBytes == 0 || cropRowBytes > sourceRowBytes || rowCount == 0 ||
+         cropRowBytes > SIZE_MAX / rowCount)
+@@ -2711,7 +3016,7 @@ bool MisterGpu_addWaterRows(uint32_t source, uint32_t stride,
+     uint32_t tablePhysical =
+         g_gpu_water_table_physical[g_gpu_write_buffer] +
+         g_gpu_water_table_rows * (uint32_t)sizeof(uint64_t);
+-    memcpy(g_gpu_textures + (tablePhysical - GPU_TEXTURE_PHYS), packedRows,
++    GPU_TEXTURE_COPY(g_gpu_textures + (tablePhysical - GPU_TEXTURE_PHYS), packedRows,
+            (size_t)rowCount * sizeof(uint64_t));
+ 
+     MisterGpuCommand* command = &g_gpu_commands[g_gpu_command_count++];
+@@ -2895,7 +3200,7 @@ bool MisterGpu_afterSaveStateRestore(void) {
+         for (uint32_t copy = 0; copy < (record->dynamic ? 2u : 1u); ++copy) {
+             size_t offset = (size_t)(record->physical[copy] - GPU_TEXTURE_PHYS);
+             if (offset <= GPU_TEXTURE_BYTES && record->bytes <= GPU_TEXTURE_BYTES - offset)
+-                memcpy(g_gpu_textures + offset, record->shadow, record->bytes);
++                GPU_TEXTURE_COPY(g_gpu_textures + offset, record->shadow, record->bytes);
+         }
+         record->active = 0;
+         record->last_upload_frame = g_gpu_frame_serial;
+@@ -3180,6 +3485,7 @@ static void reportPresentRate(void) {
+ }
+ 
+ void platformSwapBuffers(void) {
++    RD_SCOPE(RD_PRESENT, -1, 0);
+     if (g_fb == NULL || g_next_frame == NULL || g_next_width != MISTER_WIDTH || g_next_height != MISTER_HEIGHT) return;
+ 
+     bool softwareFrame = g_gpu_software_frame;
+@@ -3192,7 +3498,7 @@ void platformSwapBuffers(void) {
+         MisterGpu_beginFrame();
+         uint32_t source = g_gpu_software_frame_physical;
+         if (source != 0) {
+-            memcpy(g_gpu_textures + (source - GPU_TEXTURE_PHYS),
++            GPU_TEXTURE_COPY(g_gpu_textures + (source - GPU_TEXTURE_PHYS),
+                    g_next_frame, MISTER_FB_BYTES);
+             __sync_synchronize();
+         } else {
+diff --git a/src/render_diagnostics.c b/src/render_diagnostics.c
+new file mode 100644
+--- /dev/null
++++ b/src/render_diagnostics.c
+@@ -0,0 +1,183 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++#include "render_diagnostics.h"
++#ifdef MISTER_RENDER_DIAGNOSTICS
++#include <errno.h>
++#include <fcntl.h>
++#include <inttypes.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <time.h>
++#include <unistd.h>
++
++#ifndef RD_REQUEST
++#define RD_REQUEST "/tmp/am2r-render-diag.request"
++#endif
++#define RD_MAX_FRAMES 1800u
++#define RD_BUCKETS 64u
++
++typedef struct {
++    uint64_t nanos, pixels, bytes;
++    uint32_t calls;
++    int32_t surface, operation;
++} RD_Bucket;
++typedef struct {
++    uint64_t start, work;
++    int32_t frame, room;
++    uint32_t input, count, dropped;
++    RD_Bucket buckets[RD_BUCKETS];
++} RD_Frame;
++static const char* const operationNames[] = {
++    "cpu_work", "step", "draw", "present", "gpu_wait", "upload",
++    "user_axis", "user_triangle", "user_clear", "output_axis",
++    "subtract_scaled", "subtract_unit", "capture_perturbation"
++};
++static RD_Frame* frames;
++static RD_Frame* current;
++static uint32_t limit, used, polls;
++static uint32_t depths[RD_OPERATION_COUNT];
++static uint64_t origin;
++static FILE* output;
++
++static uint64_t rdNow(void) {
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
++}
++
++static int bucketFor(int operation, int32_t surface) {
++    for (uint32_t i = 0; i < current->count; ++i)
++        if (current->buckets[i].operation == operation &&
++            current->buckets[i].surface == surface) return (int)i;
++    if (current->count == RD_BUCKETS) {
++        current->dropped++;
++        return -1;
++    }
++    int index = (int)current->count++;
++    current->buckets[index].operation = operation;
++    current->buckets[index].surface = surface;
++    return index;
++}
++
++static void flushFrames(void) {
++    // Deliberately outside measured work. This finite diagnostic pass pauses
++    // here; never use its flush/capture boundary to measure gameplay cadence.
++    fputs("elapsed_ns,frame,room,operation,surface_id,calls,pixels,elapsed_work_ns,uploaded_bytes,input_mask,dropped_scopes\n", output);
++    for (uint32_t i = 0; i < used; ++i) {
++        RD_Frame* f = &frames[i];
++        for (uint32_t j = 0; j < f->count; ++j) {
++            RD_Bucket* b = &f->buckets[j];
++            fprintf(output, "%" PRIu64 ",%d,%d,%s,%d,%u,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%u,%u\n",
++                f->start - origin, f->frame, f->room, operationNames[b->operation],
++                b->surface, b->calls, b->pixels, b->nanos, b->bytes,
++                f->input, f->dropped);
++        }
++    }
++    int failed = ferror(output);
++    if (fclose(output) != 0) failed = 1;
++    fprintf(stderr, "AM2R render diagnostics: %u frames, output %s\n",
++            used, failed ? "FAILED (discard incomplete CSV)" : "complete");
++    output = NULL;
++    free(frames);
++    frames = current = NULL;
++}
++
++static void pollRequest(void) {
++    // One-shot request: '<frame count> <existing QA directory>\n'.
++    // Fixed filename, bounded allocation, exclusive output; never overwrite.
++    int fd = open(RD_REQUEST, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
++    if (fd < 0) return;
++    struct stat st;
++    char request[768];
++    ssize_t size = -1;
++    if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size < (off_t)sizeof(request))
++        size = read(fd, request, sizeof(request) - 1);
++    close(fd);
++    unlink(RD_REQUEST);
++    if (size <= 0) return;
++    request[size] = 0;
++    char* path;
++    errno = 0;
++    unsigned long wanted = strtoul(request, &path, 10);
++    if (errno || wanted < 1 || wanted > RD_MAX_FRAMES || *path != ' ') return;
++    while (*path == ' ') ++path;
++    path[strcspn(path, "\r\n")] = 0;
++    if (*path != '/' || stat(path, &st) != 0 || !S_ISDIR(st.st_mode)) return;
++    char name[1024];
++    if (snprintf(name, sizeof(name), "%s/render-timing.csv", path) >= (int)sizeof(name)) return;
++    RD_Frame* allocation = calloc(wanted, sizeof(*frames));
++    if (!allocation) return;
++    fd = open(name, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
++    if (fd < 0) { free(allocation); return; }
++    output = fdopen(fd, "w");
++    if (!output) { close(fd); free(allocation); return; }
++    frames = allocation;
++    limit = (uint32_t)wanted;
++    used = 0;
++    origin = rdNow();
++    fprintf(stderr, "AM2R render diagnostics: recording %u frames (timings inclusive; no per-frame I/O)\n", limit);
++}
++
++void RD_beginFrame(int32_t frame, int32_t room, uint32_t inputMask) {
++    // A prior incomplete iteration is discarded, not attributed to this one.
++    if (current) { current = NULL; memset(depths, 0, sizeof(depths)); }
++    if (!frames && (++polls & 15u) == 0) pollRequest();
++    if (!frames) return;
++    current = &frames[used];
++    memset(current, 0, sizeof(*current));
++    current->frame = frame;
++    current->room = room;
++    current->input = inputMask;
++    current->start = rdNow();
++    // Reserve mandatory coverage evidence even if a scene exceeds the detail cap.
++    (void)bucketFor(RD_CPU_WORK, -1);
++}
++
++void RD_endFrame(void) {
++    if (!current) return;
++    uint64_t elapsed = rdNow() - current->start;
++    int index = bucketFor(RD_CPU_WORK, -1);
++    if (index >= 0) {
++        current->buckets[index].calls = 1;
++        current->buckets[index].nanos = elapsed;
++    }
++    current = NULL;
++    memset(depths, 0, sizeof(depths));
++    if (++used == limit) flushFrames();
++}
++
++RD_Scope RD_scopeBegin(int operation, int32_t surface, uint64_t pixels) {
++    RD_Scope scope = {0, -1, -1};
++    if (!current || operation < 0 || operation >= RD_OPERATION_COUNT) return scope;
++    scope.operation = operation;
++    if (depths[operation]++ != 0) return scope;
++    scope.bucket = bucketFor(operation, surface);
++    if (scope.bucket >= 0) {
++        RD_Bucket* bucket = &current->buckets[scope.bucket];
++        bucket->calls++;
++        bucket->pixels += pixels;
++        scope.start = rdNow();
++    }
++    return scope;
++}
++
++void RD_scopeEnd(RD_Scope* scope) {
++    if (scope->operation < 0 || !current) return;
++    if (depths[scope->operation]) depths[scope->operation]--;
++    if (scope->bucket >= 0)
++        current->buckets[scope->bucket].nanos += rdNow() - scope->start;
++}
++
++void RD_uploadBytes(uint64_t bytes) {
++    if (!current) return;
++    int index = bucketFor(RD_UPLOAD, -1);
++    if (index >= 0) current->buckets[index].bytes += bytes;
++}
++
++void RD_capturePerturbation(void) {
++    if (!current) return;
++    int index = bucketFor(RD_CAPTURE, -1);
++    if (index >= 0) current->buckets[index].calls++;
++}
++#endif
+diff --git a/src/render_diagnostics.h b/src/render_diagnostics.h
+new file mode 100644
+--- /dev/null
++++ b/src/render_diagnostics.h
+@@ -0,0 +1,32 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++// Opt-in main-thread measurements. No timers, storage or I/O in release builds.
++#ifndef AM2R_RENDER_DIAGNOSTICS_H
++#define AM2R_RENDER_DIAGNOSTICS_H
++#include <stdint.h>
++
++enum RD_Operation {
++    RD_CPU_WORK, RD_STEP, RD_DRAW, RD_PRESENT, RD_GPU_WAIT, RD_UPLOAD,
++    RD_USER_AXIS, RD_USER_TRIANGLE, RD_USER_CLEAR, RD_OUTPUT_AXIS,
++    RD_SUBTRACT_SCALED, RD_SUBTRACT_UNIT, RD_CAPTURE, RD_OPERATION_COUNT
++};
++
++#ifdef MISTER_RENDER_DIAGNOSTICS
++typedef struct { uint64_t start; int bucket; int operation; } RD_Scope;
++void RD_beginFrame(int32_t frame, int32_t room, uint32_t inputMask);
++void RD_endFrame(void);
++RD_Scope RD_scopeBegin(int operation, int32_t surface, uint64_t pixels);
++void RD_scopeEnd(RD_Scope* scope);
++void RD_uploadBytes(uint64_t bytes);
++void RD_capturePerturbation(void);
++#define RD_SCOPE(op, surface, pixels) \
++    RD_Scope rdScope __attribute__((cleanup(RD_scopeEnd))) = \
++        RD_scopeBegin((op), (surface), (pixels))
++#define RD_UPLOAD_BYTES(bytes) RD_uploadBytes(bytes)
++#else
++#define RD_beginFrame(frame, room, inputMask) ((void)0)
++#define RD_endFrame() ((void)0)
++#define RD_SCOPE(op, surface, pixels) ((void)0)
++#define RD_UPLOAD_BYTES(bytes) ((void)0)
++#define RD_capturePerturbation() ((void)0)
++#endif
++#endif

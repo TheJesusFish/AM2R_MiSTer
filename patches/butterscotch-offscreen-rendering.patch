@@ -1,0 +1,1369 @@
+diff --git a/src/sw_renderer.c b/src/sw_renderer.c
+--- a/src/sw_renderer.c
++++ b/src/sw_renderer.c
+@@ -10,6 +10,7 @@
+ #ifdef USE_MISTER
+ #include "backends/mister_gpu.h"
+ #include "crt_ui_inset.h"
++#include "mister_offscreen.h"
+ #endif
+ 
+ #include "stb_ds.h"
+@@ -372,6 +373,9 @@
+            (sw->gpuHostContinuation && sw->currentSurface == RENDER_TARGET_HOST_FRAMEBUFFER);
+ }
+ 
++static void swOffscreenMaterialize(SWRenderer* sw, int32_t id);
++static void swOffscreenMaterializeSource(SWRenderer* sw, const uint8_t* source);
++
+ static void swResetSurfaceContentBounds(SWRenderer* sw, int32_t id, bool full) {
+     if (id < 0 || (uint32_t)id >= sw->surfaceCount) return;
+     sw->surfaceContentMinX[id] = 0;
+@@ -515,6 +519,7 @@
+ 
+ static uint32_t swGpuTextureAddress(SWRenderer* sw, const uint8_t* pixels,
+                                     int32_t width, int32_t height) {
++    swOffscreenMaterializeSource(sw, pixels);
+     for (uint32_t page = 0; page < sw->textureCount; ++page) {
+         if (sw->texturePixels[page] == pixels)
+             return sw->gpuTextureAddresses[page];
+@@ -534,6 +539,7 @@
+                                         int32_t* u, int32_t* v,
+                                         int32_t* du, int32_t* dv,
+                                         uint32_t* stride) {
++    swOffscreenMaterializeSource(sw, pixels);
+     for (uint32_t page = 0; page < sw->textureCount; ++page) {
+         if (sw->texturePixels[page] == pixels) {
+             *stride = (uint32_t)texW * 4u;
+@@ -728,8 +734,279 @@
+     return entry->address;
+ }
+ 
++// The first offscreen client is AM2R's 512x256 lighting surface. Its public
++// dimensions never change: only a proved 320x240 sample uses the GPU crop.
++// Unknown operations materialize the complete journal before touching pixels.
++// Atlas pointers are immutable for the renderer lifetime; surface sources are
++// deliberately not journaled (they require independent dependency snapshots).
++#define SW_OFFSCREEN_MAX_OPS 256u
++typedef struct {
++    MisterOffscreenAxis axis;
++    uint32_t address;
++    bool textured;
++    bool subtract;
++} SWOffscreenOperation;
++
++struct SWOffscreenJournal {
++    bool active;
++    uint32_t clear;
++    uint32_t count;
++    SWOffscreenOperation operations[SW_OFFSCREEN_MAX_OPS];
++};
++
++static void swMarkSurfaceWrite(SWRenderer* sw, int32_t id);
++
++static void swOffscreenDiscard(SWRenderer* sw, int32_t id) {
++    if (id < 0 || (uint32_t)id >= sw->surfaceCount) return;
++    SWOffscreenJournal* journal = sw->offscreenJournals[id];
++    if (journal) { journal->active = false; journal->count = 0; }
++    MisterGpu_releaseOffscreen(sw->surfacePixels[id]);
++}
++
++static void swOffscreenReplay(const SWOffscreenJournal* journal,
++        uint32_t* pixels, int32_t width, int32_t height) {
++    for (size_t i = 0; i < (size_t)width * height; ++i) pixels[i] = journal->clear;
++    for (uint32_t i = 0; i < journal->count; ++i) {
++        const SWOffscreenOperation* operation = &journal->operations[i];
++        const MisterOffscreenAxis* axis = &operation->axis;
++        if (operation->textured) {
++            // Operations are validated before recording; replay cannot fail.
++            // Use the same optimized spans as the immediate renderer.
++            for (int32_t y = axis->y; y < axis->y + axis->height; ++y) {
++                int32_t sy = (int32_t)(axis->sourceY0 +
++                    (((double)y + 0.5) - axis->vertexY0) * axis->sourceDy);
++                if (sy < 0) sy = 0;
++                if (sy >= axis->sourceHeight) sy = axis->sourceHeight - 1;
++                blendSubtractTextureSpan(pixels + (size_t)y * width + axis->x,
++                    axis->source + (size_t)sy * axis->sourceWidth,
++                    axis->sourceWidth, axis->startU, axis->stepU, axis->width,
++                    axis->tint, axis->tint >> 8, axis->tint >> 16, axis->tint >> 24);
++            }
++        } else {
++            for (int32_t y = axis->y; y < axis->y + axis->height; ++y) {
++                uint32_t* row = pixels + (size_t)y * width + axis->x;
++                if (operation->subtract)
++                    blendSubtractSolidSpan(row, axis->width, axis->tint,
++                        axis->tint >> 8, axis->tint >> 16, axis->tint >> 24);
++                else for (int32_t x = 0; x < axis->width; ++x) row[x] = axis->tint;
++            }
++        }
++    }
++}
++
++static void swOffscreenMaterialize(SWRenderer* sw, int32_t id) {
++    if (id < 0 || (uint32_t)id >= sw->surfaceCount) return;
++    SWOffscreenJournal* journal = sw->offscreenJournals[id];
++    if (!journal || !journal->active) return;
++    swOffscreenReplay(journal, (uint32_t*)sw->surfacePixels[id],
++        sw->surfaceWidths[id], sw->surfaceHeights[id]);
++    swOffscreenDiscard(sw, id);
++}
++
++#if defined(MISTER_RENDER_DIAGNOSTICS)
++bool SWRenderer_misterOffscreenReference(Renderer* renderer, uint32_t address,
++        uint8_t* crop) {
++    SWRenderer* sw = (SWRenderer*)renderer;
++    if (!sw || !crop || !address) return false;
++    for (uint32_t id = 0; id < sw->surfaceCount; ++id) {
++        const SWOffscreenJournal* journal = sw->offscreenJournals[id];
++        if (!journal || !journal->active ||
++            MisterGpu_findOffscreen(sw->surfacePixels[id], sw->surfaceRevisions[id]) != address)
++            continue;
++        const int32_t width = sw->surfaceWidths[id], height = sw->surfaceHeights[id];
++        uint32_t* full = safeMalloc((size_t)width * height * 4u);
++        swOffscreenReplay(journal, full, width, height);
++        for (int32_t y = 0; y < 240; ++y)
++            memcpy(crop + (size_t)y * 1280u, full + (size_t)y * width, 1280u);
++        free(full);
++        return true;
++    }
++    return false;
++}
++#endif
++
++static void swOffscreenMaterializeSource(SWRenderer* sw, const uint8_t* source) {
++    if (!sw->offscreenEnabled || !source) return;
++    for (uint32_t id = 0; id < sw->surfaceCount; ++id) {
++        if (!sw->surfaceExistsFlags[id]) continue;
++        const uintptr_t base = (uintptr_t)sw->surfacePixels[id];
++        const size_t bytes = (size_t)sw->surfaceWidths[id] * sw->surfaceHeights[id] * 4u;
++        if ((uintptr_t)source >= base && (uintptr_t)source - base < bytes) {
++            swOffscreenMaterialize(sw, (int32_t)id);
++            return;
++        }
++    }
++}
++
++void SWRenderer_materializeSurfaces(Renderer* renderer) {
++    SWRenderer* sw = (SWRenderer*)renderer;
++    if (!sw) return;
++    for (uint32_t id = 0; id < sw->surfaceCount; ++id)
++        swOffscreenMaterialize(sw, (int32_t)id);
++}
++
++static bool swOffscreenClear(SWRenderer* sw, uint32_t rgba) {
++    const int32_t id = sw->currentSurface;
++    if (!sw->offscreenEnabled || !MisterGpu_isAvailable() || id <= 0 ||
++        id == sw->base.runner->applicationSurfaceId || sw->fbWidth != 512 ||
++        sw->fbHeight != 256) return false;
++    swOffscreenDiscard(sw, id);
++    if (!sw->offscreenJournals[id])
++        sw->offscreenJournals[id] = safeCalloc(1, sizeof(SWOffscreenJournal));
++    SWOffscreenJournal* journal = sw->offscreenJournals[id];
++    journal->clear = rgba;
++    journal->count = 0;
++    journal->active = true;
++    swMarkSurfaceWrite(sw, id);
++    return true;
++}
++
++static bool swOffscreenTryAxis(SWRenderer* sw, SWVertex v[4],
++        const uint8_t* source, int32_t texW, int32_t texH,
++        int32_t minX, int32_t minY, int32_t maxX, int32_t maxY,
++        bool compatible, uint32_t tint) {
++    const int32_t id = sw->currentSurface;
++    if (id < 0 || (uint32_t)id >= sw->surfaceCount) return false;
++    SWOffscreenJournal* journal = sw->offscreenJournals[id];
++    if (!journal || !journal->active || !compatible ||
++        journal->count == SW_OFFSCREEN_MAX_OPS) return false;
++    SWOffscreenOperation op = {0};
++    op.axis.x = minX; op.axis.y = minY;
++    op.axis.width = maxX-minX; op.axis.height = maxY-minY;
++    op.axis.tint = tint;
++    op.subtract = sw->blendEnable && sw->blendMode == bm_subtract;
++    if (source) {
++        if (!op.subtract || texW <= 0 || texH <= 0) return false;
++        for (uint32_t page = 0; page < sw->textureCount; ++page)
++            if (source == sw->texturePixels[page]) op.address = sw->gpuTextureAddresses[page];
++        if (!op.address) return false;
++        const float dx = v[1].x-v[0].x, dy = v[3].y-v[0].y;
++        const double sx = (double)v[0].u*texW;
++        const double du = (double)(v[1].u-v[0].u)*texW/dx;
++        const double start = (sx+(((double)minX+0.5)-v[0].x)*du)*65536.0;
++        const double step = du*65536.0;
++        op.axis.sourceY0 = (double)v[0].v*texH;
++        op.axis.sourceDy = (double)(v[3].v-v[0].v)*texH/dy;
++        op.axis.vertexY0 = v[0].y;
++        // Conservative bounded UVs make both signed conversion and replay
++        // safe. Unusual coordinates retain the original immediate path.
++        if (!isfinite(start) || !isfinite(step) || fabs(start)>1.0e12 ||
++            fabs(step)>1.0e9 || !isfinite(op.axis.sourceY0) ||
++            !isfinite(op.axis.sourceDy) || fabs(op.axis.sourceY0)>1.0e8 ||
++            fabs(op.axis.sourceDy)>1.0e5 || fabs(op.axis.vertexY0)>1.0e4)
++            return false;
++        op.axis.startU = (int64_t)start; op.axis.stepU = (int64_t)step;
++        op.axis.source = (const uint32_t*)source;
++        op.axis.sourceWidth = texW; op.axis.sourceHeight = texH;
++        op.textured = true;
++    } else {
++        if ((tint >> 24) != 255u ||
++            (sw->blendEnable && sw->blendMode != bm_normal && !op.subtract)) return false;
++    }
++    journal->operations[journal->count++] = op;
++    swMarkSurfaceWrite(sw, id);
++    return true;
++}
++
++static void swOffscreenEmitPending(SWRenderer* sw) {
++    if (!sw->offscreenEnabled) return;
++    for (uint32_t id = 0; id < sw->surfaceCount; ++id) {
++        SWOffscreenJournal* journal = sw->offscreenJournals[id];
++        if (!journal || !journal->active) continue;
++        // A fully covered, solid prefix still describes one constant crop.
++        // Fold it with the exact CPU channel operation before clearing BRAM.
++        // The logical journal retains every operation and all 512x256 pixels.
++        uint32_t clear = journal->clear, first = 0;
++        while (first < journal->count) {
++            const SWOffscreenOperation* op = &journal->operations[first];
++            if (op->textured || op->axis.x != 0 || op->axis.y != 0 ||
++                op->axis.width < 320 || op->axis.height < 240) break;
++            if (op->subtract) {
++                uint32_t result = 0;
++                for (unsigned shift = 0; shift < 32; shift += 8)
++                    result |= ((((clear >> shift) & 255u) *
++                        (255u - ((op->axis.tint >> shift) & 255u))) / 255u) << shift;
++                clear = result;
++            } else clear = op->axis.tint;
++            ++first;
++        }
++        bool ok = MisterGpu_beginOffscreen(sw->surfacePixels[id], sw->surfaceRevisions[id]);
++        if (ok) ok = MisterGpu_addClear(clear);
++        for (uint32_t i = first; ok && i < journal->count; ++i) {
++            const SWOffscreenOperation* op = &journal->operations[i];
++            if (op->textured) {
++                MisterOffscreenBlit blits[240];
++                size_t count = 0;
++                const bool floorTint = MisterGpu_hasFloorTint();
++                ok = MisterOffscreen_planAxisTint(&op->axis, 0, 0, 320, 240,
++                                               blits, 240, &count, floorTint);
++#if defined(MISTER_RENDER_DIAGNOSTICS)
++                if (!ok && sw->offscreenLogCount < 24)
++                    fprintf(stderr, "MiSTer offscreen reject: op=%u tint=%08x rect=%d,%d/%dx%d uv=%lld/%lld\n",
++                        i, op->axis.tint, op->axis.x, op->axis.y, op->axis.width,
++                        op->axis.height, (long long)op->axis.startU, (long long)op->axis.stepU);
++#endif
++                for (size_t b = 0; ok && b < count; ++b) {
++                    const MisterOffscreenBlit* blit = &blits[b];
++                    bool (*addBlit)(uint32_t, uint32_t, int16_t, int16_t,
++                        uint16_t, uint16_t, int32_t, int32_t, int32_t, int32_t,
++                        uint32_t, uint8_t) = floorTint ?
++                        MisterGpu_addBlitFloorTint : MisterGpu_addBlit;
++                    ok = addBlit(op->address, op->axis.sourceWidth*4u,
++                        blit->x, blit->y, blit->width, blit->height,
++                        blit->u, blit->v, blit->du, blit->dv,
++                        op->axis.tint, MISTER_GPU_BLEND_SUBTRACT);
++                }
++            } else {
++                const int32_t x = op->axis.x, y = op->axis.y;
++                int32_t x1 = x+op->axis.width, y1 = y+op->axis.height;
++                if (x1 > 320) x1 = 320; if (y1 > 240) y1 = 240;
++                if (x < x1 && y < y1)
++                    ok = MisterGpu_addFill(x, y, x1-x, y1-y, op->axis.tint,
++                        op->subtract ? MISTER_GPU_BLEND_SUBTRACT : MISTER_GPU_BLEND_NORMAL);
++            }
++        }
++        uint32_t address = ok ? MisterGpu_commitOffscreen() : 0;
++        if (!address) MisterGpu_abortOffscreen();
++#if defined(MISTER_RENDER_DIAGNOSTICS)
++        if (sw->offscreenLogCount < 24) {
++            fprintf(stderr, "MiSTer offscreen: id=%u ops=%u export=%08x revision=%u\n",
++                id, journal->count, address, sw->surfaceRevisions[id]);
++            sw->offscreenLogCount++;
++        }
++#endif
++        if (!address) swOffscreenMaterialize(sw, (int32_t)id);
++    }
++}
++
++static bool swOffscreenTryConsume(SWRenderer* sw, SWVertex v[4],
++        const uint8_t* source, int32_t texW, int32_t texH,
++        int32_t minX, int32_t minY, int32_t maxX, int32_t maxY,
++        bool compatible, uint32_t tint, uint8_t blend) {
++    if (!sw->offscreenEnabled || !source || !compatible || !sw->gpuFrameEligible || !sw->gpuSawClear ||
++        !swGpuIsOutputTarget(sw) || !sw->blendEnable || texW != 512 || texH != 256 ||
++        minX != 0 || minY != 0 || maxX != 320 || maxY != 240) return false;
++    const double dx = v[1].x-v[0].x, dy = v[3].y-v[0].y;
++    const double du = (double)(v[1].u-v[0].u)*texW/dx;
++    const double dv = (double)(v[3].v-v[0].v)*texH/dy;
++    if (du != 1.0 || dv != 1.0 ||
++        (double)v[0].u*texW+(0.5-v[0].x)*du != 0.5 ||
++        (double)v[0].v*texH+(0.5-v[0].y)*dv != 0.5) return false;
++    for (uint32_t id = 0; id < sw->surfaceCount; ++id) {
++        if (!sw->surfaceExistsFlags[id] || sw->surfacePixels[id] != source) continue;
++        const uint32_t address = MisterGpu_findOffscreen(source, sw->surfaceRevisions[id]);
++        if (!address) return false;
++        if (!MisterGpu_addBlit(address, 1280, 0, 0, 320, 240,
++            0x8000, 0x8000, 0x10000, 0x10000, tint, blend)) return false;
++        sw->gpuHasSkippedDraws = true;
++        return true;
++    }
++    return false;
++}
++
+ static bool swGpuTryAffineQuad(SWRenderer* sw, SWVertex v[4],
+                                const uint8_t* texPixels, int32_t texW, int32_t texH) {
++    swOffscreenMaterializeSource(sw, texPixels);
+     if (!sw->gpuFrameEligible || !sw->gpuSawClear || !swGpuIsOutputTarget(sw) ||
+         !sw->blendEnable || sw->base.currentShader >= 0 ||
+         (sw->blendMode != bm_normal && sw->blendMode != bm_add &&
+@@ -871,6 +1148,10 @@
+ #endif
+ 
+ static void rasterizeTriangle(SWRenderer* sw, SWVertex v0, SWVertex v1, SWVertex v2, const uint8_t* texPixels, int32_t texW, int32_t texH) {
++#ifdef USE_MISTER
++    swOffscreenMaterializeSource(sw, texPixels);
++    swOffscreenMaterialize(sw, sw->currentSurface);
++#endif
+ #ifdef MISTER_RENDER_DIAGNOSTICS
+     RD_SCOPE(swGpuIsOutputTarget(sw) ? RD_OUTPUT_AXIS : RD_USER_TRIANGLE, sw->currentSurface, 0);
+ #endif
+@@ -1087,6 +1368,17 @@
+     const uint8_t tintB=(uint8_t)lroundf(v[0].b*255.0f),tintA=(uint8_t)lroundf(v[0].a*255.0f);
+     const uint32_t tint=(uint32_t)tintR|((uint32_t)tintG<<8)|((uint32_t)tintB<<16)|((uint32_t)tintA<<24);
+ #ifdef USE_MISTER
++    if (swOffscreenTryConsume(sw, v, texPixels, texW, texH,
++        minX, minY, maxX, maxY, compatibleState, tint, gpuBlendMode)) return true;
++    if (swOffscreenTryAxis(sw, v, texPixels, texW, texH,
++        minX, minY, maxX, maxY, compatibleState, tint)) {
++        swExtendSurfaceContentBounds(sw, minX, minY, maxX, maxY);
++        return true;
++    }
++    // Before every ordinary CPU draw or upload. This must precede the opaque
++    // untextured fast fill as well as the final generic rasterizer.
++    swOffscreenMaterializeSource(sw, texPixels);
++    swOffscreenMaterialize(sw, sw->currentSurface);
+     if(!texPixels&&compatibleState&&sw->gpuFrameEligible&&sw->gpuSawClear&&
+        swGpuIsOutputTarget(sw)&&sw->blendEnable&&
+        MisterGpu_addFill((int16_t)minX,(int16_t)minY,(uint16_t)(maxX-minX),(uint16_t)(maxY-minY),tint,gpuBlendMode)){
+@@ -1518,6 +1810,8 @@
+     sw->surfaceExistsFlags = (bool*)safeRealloc(sw->surfaceExistsFlags, newCapacity * sizeof(bool));
+     sw->surfaceRevisions = (uint32_t*)safeRealloc(sw->surfaceRevisions, newCapacity * sizeof(uint32_t));
+ #ifdef USE_MISTER
++    sw->offscreenJournals = (SWOffscreenJournal**)safeRealloc(sw->offscreenJournals,
++        newCapacity * sizeof(SWOffscreenJournal*));
+     sw->surfaceContentMinX = (int32_t*)safeRealloc(sw->surfaceContentMinX, newCapacity * sizeof(int32_t));
+     sw->surfaceContentMinY = (int32_t*)safeRealloc(sw->surfaceContentMinY, newCapacity * sizeof(int32_t));
+     sw->surfaceContentMaxX = (int32_t*)safeRealloc(sw->surfaceContentMaxX, newCapacity * sizeof(int32_t));
+@@ -1530,6 +1824,7 @@
+         sw->surfaceExistsFlags[i] = false;
+         sw->surfaceRevisions[i] = 0;
+ #ifdef USE_MISTER
++        sw->offscreenJournals[i] = nullptr;
+         sw->surfaceContentMinX[i] = 0;
+         sw->surfaceContentMinY[i] = 0;
+         sw->surfaceContentMaxX[i] = 0;
+@@ -1569,11 +1864,23 @@
+     return true;
+ }
+ 
++#ifdef USE_MISTER
++static bool swOffscreenEnabledFromSetting(const char* setting, bool floorTint) {
++    // The backend capability probe finishes before renderer initialization.
++    // Explicit 1 retains old-RBF fallback testing; 0 (or any other value)
++    // disables the journal regardless of capability.
++    return setting != nullptr ? strcmp(setting, "1") == 0 : floorTint;
++}
++#endif
++
+ static void swInit(Renderer* renderer, DataWin* dataWin) {
+     SWRenderer* sw = (SWRenderer*) renderer;
+     renderer->dataWin = dataWin;
+ #ifdef USE_MISTER
+     sw->am2rMapSurfaceId = -1;
++    sw->offscreenEnabled = swOffscreenEnabledFromSetting(
++        getenv("AM2R_GPU_OFFSCREEN"), MisterGpu_hasFloorTint());
++    if (sw->offscreenEnabled) logInfo("MiSTer offscreen rendering enabled\n");
+ #endif
+ 
+     // Texture pages are decoded on demand so the MiSTer does not pay the
+@@ -1598,6 +1905,13 @@
+ 
+ static void swDestroy(Renderer* renderer) {
+     SWRenderer* sw = (SWRenderer*) renderer;
++#ifdef USE_MISTER
++    for (uint32_t i = 0; i < sw->surfaceCount; ++i) {
++        swOffscreenDiscard(sw, (int32_t)i);
++        free(sw->offscreenJournals[i]);
++    }
++    free(sw->offscreenJournals);
++#endif
+ 
+     for (uint32_t i = 0; sw->textureCount > i; i++) {
+         free(sw->texturePixels[i]);
+@@ -1695,6 +2009,7 @@
+ #ifdef USE_MISTER
+     sw->gpuHostContinuation = true;
+     if (sw->gpuFrameEligible && sw->gpuHasSkippedDraws) return;
++    swOffscreenMaterialize(sw, id);
+ #endif
+     int32_t copyW = sw->surfaceWidths[id] < sw->hostWidth ? sw->surfaceWidths[id] : sw->hostWidth;
+     int32_t copyH = sw->surfaceHeights[id] < sw->hostHeight ? sw->surfaceHeights[id] : sw->hostHeight;
+@@ -2465,6 +2780,14 @@
+ #ifdef USE_MISTER
+     if (sw->currentSurface >= 0)
+         swResetSurfaceContentBounds(sw, sw->currentSurface, a != 0);
++    const uint32_t offscreenRgba = (uint32_t)r | ((uint32_t)g << 8) |
++        ((uint32_t)b << 16) | ((uint32_t)a << 24);
++    if (swOffscreenClear(sw, offscreenRgba)) return;
++    // A full clear replaces deferred content; it does not need replay.
++    swOffscreenDiscard(sw, sw->currentSurface);
++    if (sw->gpuFrameEligible && !sw->gpuSawClear &&
++        swGpuIsOutputTarget(sw) && sw->fbWidth == 320 && sw->fbHeight == 240)
++        swOffscreenEmitPending(sw);
+     if (sw->gpuFrameEligible) {
+         if (swGpuIsOutputTarget(sw) && sw->fbWidth == 320 && sw->fbHeight == 240 &&
+             MisterGpu_addClear((uint32_t)r | ((uint32_t)g << 8) |
+@@ -2643,6 +2966,7 @@
+         sw->surfaceCount = id + 1;
+     }
+ #ifdef USE_MISTER
++    swOffscreenDiscard(sw, (int32_t)id);
+     MisterGpu_releaseTexture(sw->surfacePixels[id]);
+ #endif
+     free(sw->surfacePixels[id]);
+@@ -2671,6 +2995,7 @@
+     } else if (sw->surfaceWidths[id] != width || sw->surfaceHeights[id] != height) {
+         uint8_t* pixels = (uint8_t*)safeCalloc((size_t)width * (size_t)height, 4);
+ #ifdef USE_MISTER
++        swOffscreenDiscard(sw, id);
+         MisterGpu_releaseTexture(sw->surfacePixels[id]);
+ #endif
+         free(sw->surfacePixels[id]);
+@@ -2706,6 +3031,7 @@
+     if (!swSurfaceExists(renderer,id) || width <= 0 || height <= 0) return;
+     bool current = sw->currentSurface == id;
+ #ifdef USE_MISTER
++    swOffscreenDiscard(sw, id);
+     MisterGpu_releaseTexture(sw->surfacePixels[id]);
+ #endif
+     free(sw->surfacePixels[id]);
+@@ -2732,6 +3058,7 @@
+ #endif
+     if (sw->currentSurface == id) swUseHostTarget(sw);
+ #ifdef USE_MISTER
++    swOffscreenDiscard(sw, id);
+     MisterGpu_releaseTexture(sw->surfacePixels[id]);
+ #endif
+     free(sw->surfacePixels[id]); sw->surfacePixels[id]=nullptr;
+@@ -2888,6 +3215,7 @@
+     }
+ 
+     if (rowCount == 0) return true;
++    swOffscreenMaterialize(sw, surfaceId);
+     uint32_t source = MisterGpu_uploadDynamicTextureRevision(
+         sw->surfacePixels[surfaceId], 320u * 240u * 4u,
+         sw->surfaceRevisions[surfaceId]);
+@@ -2909,6 +3237,7 @@
+     if (sw == nullptr) return;
+     swUseHostTarget(sw);
+     for (uint32_t id = 0; id < sw->surfaceCount; ++id) {
++        swOffscreenDiscard(sw, (int32_t)id);
+         if (sw->surfacePixels[id] != nullptr)
+             MisterGpu_releaseTexture(sw->surfacePixels[id]);
+         free(sw->surfacePixels[id]);
+@@ -2939,6 +3268,7 @@
+         return false;
+     swEnsureSurfaceCapacity(sw, id + 1);
+     if (sw->surfaceCount <= id) sw->surfaceCount = id + 1;
++    swOffscreenDiscard(sw, (int32_t)id);
+     size_t bytes = (size_t)width * (size_t)height * 4u;
+     sw->surfacePixels[id] = (uint8_t*)safeMalloc(bytes);
+     memcpy(sw->surfacePixels[id], rgba, bytes);
+@@ -3044,6 +3374,8 @@
+     if(dy+sheight>sw->surfaceHeights[dstId])sheight=sw->surfaceHeights[dstId]-dy;
+     if(swidth<=0||sheight<=0)return;
+ #ifdef USE_MISTER
++    swOffscreenMaterialize(sw, srcId);
++    swOffscreenMaterialize(sw, dstId);
+     if (srcId == renderer->runner->applicationSurfaceId &&
+         dstId != renderer->runner->applicationSurfaceId &&
+         sw->gpuFrameEligible && sw->gpuHasSkippedDraws &&
+@@ -3106,6 +3438,7 @@
+ static bool swSurfaceGetPixels(Renderer* renderer, int32_t id, uint8_t* outRGBA) {
+     SWRenderer* sw=(SWRenderer*)renderer; if(!swSurfaceExists(renderer,id)||outRGBA==nullptr)return false;
+ #ifdef USE_MISTER
++    swOffscreenMaterialize(sw, id);
+     if (id == renderer->runner->applicationSurfaceId &&
+         !swGpuReadbackCheckpoint(sw))
+         swGpuFallback(sw, "application surface readback");
+diff --git a/src/sw_renderer.h b/src/sw_renderer.h
+--- a/src/sw_renderer.h
++++ b/src/sw_renderer.h
+@@ -5,6 +5,7 @@
+ #include "matrix_math.h"
+ 
+ #ifdef USE_MISTER
++typedef struct SWOffscreenJournal SWOffscreenJournal;
+ typedef enum {
+     SW_AM2R_MAP_CACHE_REBUILD = 0,
+     SW_AM2R_MAP_CACHE_HIT = 1,
+@@ -55,6 +56,11 @@
+     uint32_t textureCount;
+ #ifdef USE_MISTER
+     uint32_t* gpuTextureAddresses;
++    // Logical CPU operations survive Step -> beginFrame. FPGA crop textures
++    // are derived caches only; reads/saves replay the complete logical image.
++    SWOffscreenJournal** offscreenJournals;
++    bool offscreenEnabled;
++    uint32_t offscreenLogCount;
+ #endif
+ 
+     // View transform: world coords -> framebuffer pixel coords
+@@ -162,6 +168,11 @@
+ // Exact-ID dynamic-surface access used by AM2R logical save states. Static
+ // texture pages and FPGA-derived caches are intentionally outside the format.
+ void SWRenderer_fastStateResetSurfaces(Renderer* renderer);
++void SWRenderer_materializeSurfaces(Renderer* renderer);
++#if defined(MISTER_RENDER_DIAGNOSTICS)
++bool SWRenderer_misterOffscreenReference(Renderer* renderer, uint32_t address,
++                                        uint8_t* crop);
++#endif
+ bool SWRenderer_fastStateRestoreSurface(Renderer* renderer, uint32_t id,
+                                         int32_t width, int32_t height,
+                                         uint32_t revision,
+diff --git a/src/backends/mister.c b/src/backends/mister.c
+--- a/src/backends/mister.c
++++ b/src/backends/mister.c
+@@ -23,6 +23,7 @@
+ #include <unistd.h>
+ 
+ #if defined(MISTER_RENDER_DIAGNOSTICS)
++#include "sw_renderer.h"
+ #include <sys/stat.h>
+ #include <sys/statvfs.h>
+ #endif
+@@ -49,11 +50,16 @@
+ #define GPU_VBLANK_COUNTER_WORD 16u
+ #define GPU_VBLANK_MAGIC_WORD 17u
+ #define GPU_VBLANK_MAGIC 0x56424c4bu
++#define GPU_CAPABILITY_MAGIC_WORD 20u
++#define GPU_CAPABILITY_BITS_WORD 21u
++#define GPU_CAPABILITY_MAGIC 0x43473241u
++#define GPU_CAPABILITY_FLOOR_TINT 1u
+ #define GPU_COMMAND_BYTES 65536u
+ #define GPU_COMMAND_CAPACITY (GPU_COMMAND_BYTES / sizeof(MisterGpuCommand))
+ #define GPU_COMMAND_BUFFER_COUNT 2u
+ #define GPU_TEXTURE_BYTES (128u * 1024u * 1024u)
+ #define GPU_TEXTURE_RECORDS 128
++#define GPU_OFFSCREEN_RECORDS 16u
+ #define GPU_FUSED_PREFIX_COMMANDS 12u
+ #define GPU_FUSED_BASE_SOURCES 8u
+ #define GPU_WATER_ROWS MISTER_HEIGHT
+@@ -94,6 +100,17 @@
+     size_t opaque_word_count;
+     uint32_t opaque_generation;
+ } MisterGpuTexture;
++
++// GPU-only crop storage is deliberately separate from shadow-backed textures.
++// A 320x240 export must never be copied over a larger logical CPU surface by
++// the upload, opacity-cache, or DMTCP paths. The renderer owns that full-size
++// surface and materializes its journal when CPU-visible pixels are required.
++typedef struct {
++    const void* key;
++    uint32_t physical[GPU_COMMAND_BUFFER_COUNT];
++    uint32_t revision;
++    uint32_t committed_frame;
++} MisterGpuOffscreen;
+ 
+ static Runner *g_runner = NULL;
+ static int g_fb_fd = -1;
+@@ -123,6 +140,7 @@
+ static bool g_gpu_scanout_underflow = false;
+ static bool g_gpu_pending = false;
+ static bool g_gpu_available = false;
++static bool g_gpu_floor_tint = false;
+ static bool g_gpu_presented = false;
+ static bool g_gpu_software_frame = false;
+ static uint32_t g_gpu_submitted_frames = 0;
+@@ -131,6 +149,14 @@
+ static uint32_t g_gpu_deferred_exports[GPU_TEXTURE_RECORDS];
+ static uint32_t g_gpu_deferred_export_count = 0;
+ static bool g_gpu_frame_open = false;
++static MisterGpuOffscreen g_gpu_offscreen[GPU_OFFSCREEN_RECORDS];
++static uint32_t g_gpu_offscreen_index = UINT32_MAX;
++static const void* g_gpu_offscreen_key = NULL;
++static uint32_t g_gpu_offscreen_revision = 0;
++static uint32_t g_gpu_offscreen_start = 0;
++static uint32_t g_gpu_scene_start = 0;
++static bool g_gpu_offscreen_allowed = false;
++static bool g_gpu_offscreen_needs_scene_clear = false;
+ static uint32_t g_gpu_water_table_physical[GPU_COMMAND_BUFFER_COUNT] = { 0, 0 };
+ static uint32_t g_gpu_water_table_rows = 0;
+ static uint32_t g_gpu_water_direct_rows = 0;
+@@ -209,6 +235,7 @@
+     int gameFrame, room;
+     size_t textureBytes;
+     uint32_t exports[GPU_TEXTURE_RECORDS];
++    bool cpuReferences[GPU_TEXTURE_RECORDS];
+     uint32_t exportCount;
+     bool requiresInitializationProof;
+ } GpuCapture;
+@@ -334,7 +361,7 @@
+     }
+     struct statvfs storage;
+     const uint64_t required = (uint64_t)capture->textureBytes +
+-        (GPU_NATIVE_BUFFER_COUNT + 1u + capture->exportCount) * MISTER_FB_BYTES +
++        (GPU_NATIVE_BUFFER_COUNT + 1u + 2u * capture->exportCount) * MISTER_FB_BYTES +
+         GPU_COMMAND_BYTES + 1024u * 1024u;
+     if (fstatvfs(g_gpu_capture_root, &storage) != 0 ||
+         (uint64_t)storage.f_bavail * storage.f_frsize < required) {
+@@ -361,6 +388,21 @@
+         ok = gpuCaptureWrite(capture->directory, name,
+                               g_gpu_native_buffers[i], MISTER_FB_BYTES);
+     }
++    // Capture the original CPU journal result before submission, while the
++    // same logical generation still exists. This independently validates the
++    // translation into descriptors as well as the GPU's descriptor execution.
++    uint8_t* cpuReference = capture->exportCount ? malloc(MISTER_FB_BYTES) : NULL;
++    if (capture->exportCount && !cpuReference) ok = false;
++    for (uint32_t i = 0; i < capture->exportCount && ok; ++i) {
++        capture->cpuReferences[i] = g_runner &&
++            SWRenderer_misterOffscreenReference(g_runner->renderer,
++                capture->exports[i], cpuReference);
++        if (capture->cpuReferences[i]) {
++            snprintf(name, sizeof(name), "cpu-export-%u.bin", i);
++            ok = gpuCaptureWrite(capture->directory, name, cpuReference, MISTER_FB_BYTES);
++        }
++    }
++    free(cpuReference);
+     if (!ok) { gpuCaptureAbort("input write failed"); return false; }
+     logInfo("MiSTer GPU capture: inputs for sequence %u frozen (%zu texture bytes)\n",
+             sequence, capture->textureBytes);
+@@ -418,9 +460,13 @@
+     else fprintf(manifest, "null");
+     fprintf(manifest, ",\n  \"expected\":{\"file\":\"expected.bin\",\"format\":\"xrgb8888\"},\n"
+         "  \"expected_exports\":[");
+-    for (uint32_t i = 0; i < capture->exportCount; ++i)
+-        fprintf(manifest, "%s{\"base\":%u,\"file\":\"export-%u.bin\"}",
++    for (uint32_t i = 0; i < capture->exportCount; ++i) {
++        fprintf(manifest, "%s{\"base\":%u,\"file\":\"export-%u.bin\"",
+                 i == 0 ? "" : ",", capture->exports[i], i);
++        if (capture->cpuReferences[i])
++            fprintf(manifest, ",\"cpu_reference\":\"cpu-export-%u.bin\"", i);
++        fprintf(manifest, "}");
++    }
+     fprintf(manifest, "]\n}\n");
+     ok = !ferror(manifest) && fflush(manifest) == 0 && fsync(fd) == 0;
+     if (fclose(manifest) != 0) ok = false;
+@@ -537,6 +583,16 @@
+     g_gpu_capture_initialized = false;
+ #endif
+     g_gpu_available = false;
++    g_gpu_floor_tint = false;
++    g_gpu_scene_start = 0;
++    g_gpu_offscreen_index = UINT32_MAX;
++    g_gpu_offscreen_key = NULL;
++    g_gpu_offscreen_allowed = false;
++    g_gpu_offscreen_needs_scene_clear = false;
++    for (uint32_t i = 0; i < GPU_OFFSCREEN_RECORDS; ++i) {
++        g_gpu_offscreen[i].key = NULL;
++        g_gpu_offscreen[i].committed_frame = 0;
++    }
+     g_gpu_pending = false;
+     g_gpu_commands = NULL;
+     if (g_gpu_textures != NULL) {
+@@ -690,6 +746,12 @@
+     g_gpu_last_presented_buffer = 0;
+     g_gpu_last_presented_valid = false;
+     g_gpu_available = true;
++    // DDR survives an RBF change. Clear the extension mailbox before the
++    // completed probe establishes capabilities of the currently loaded core.
++    g_gpu_floor_tint = false;
++    g_gpu_control[GPU_CAPABILITY_MAGIC_WORD] = 0;
++    g_gpu_control[GPU_CAPABILITY_BITS_WORD] = 0;
++    __sync_synchronize();
+     if (g_gpu_software_frame_physical == 0) {
+         // Native scanout cannot see Linux's /dev/fb0. Keep one guaranteed
+         // staging allocation outside the ordinary texture-record table so a
+@@ -703,8 +765,12 @@
+     MisterGpu_addClear(0xff000000u);
+     appendGpuEnd();
+     uint32_t cycles = 0;
+-    if (submitGpuCommandsAsync() && waitGpuCompletion(&cycles))
++    if (submitGpuCommandsAsync() && waitGpuCompletion(&cycles)) {
++        g_gpu_floor_tint =
++            g_gpu_control[GPU_CAPABILITY_MAGIC_WORD] == GPU_CAPABILITY_MAGIC &&
++            (g_gpu_control[GPU_CAPABILITY_BITS_WORD] & GPU_CAPABILITY_FLOOR_TINT) != 0;
+         logInfo("MiSTer FPGA GPU: online (probe %u cycles)\n", cycles);
++    }
+     g_gpu_presented = false;
+     if (!g_gpu_available) {
+         unmapGpuHardware();
+@@ -714,6 +780,7 @@
+ }
+ 
+ bool MisterGpu_isAvailable(void) { return g_gpu_available; }
++bool MisterGpu_hasFloorTint(void) { return g_gpu_available && g_gpu_floor_tint; }
+ 
+ uint32_t MisterGpu_getCrtUiInset(void) {
+     return g_joy_shm != NULL ? g_joy_shm->crt_ui_inset : 0;
+@@ -723,6 +790,10 @@
+     g_gpu_frame_serial++;
+     if (g_gpu_frame_serial == 0) g_gpu_frame_serial = 1;
+     g_gpu_command_count = 0;
++    g_gpu_offscreen_index = UINT32_MAX;
++    g_gpu_offscreen_key = NULL;
++    g_gpu_offscreen_allowed = true;
++    g_gpu_offscreen_needs_scene_clear = false;
+     g_gpu_frame_open = true;
+     // GameMaker Step events run before the renderer opens the next frame.
+     // AM2R's water effect snapshots application_surface there, while the FPGA
+@@ -735,6 +806,7 @@
+         command->word[1] = g_gpu_deferred_exports[i];
+     }
+     g_gpu_deferred_export_count = 0;
++    g_gpu_scene_start = g_gpu_command_count;
+     g_gpu_water_table_rows = 0;
+     g_gpu_water_direct_rows = 0;
+     g_gpu_presented = false;
+@@ -848,7 +920,12 @@
+     }
+     MisterGpuTexture* reused = reuseReleasedTexture(
+         rgbaPixels, bytes, false, false, false, 0);
+-    if (reused != NULL) return reused->physical[reused->active];
++    if (reused != NULL) {
++        // A retained second allocation is capacity, not permission to mutate
++        // this newly uploaded immutable source. A later dynamic reuse resets it.
++        reused->dynamic = false;
++        return reused->physical[reused->active];
++    }
+     if (g_gpu_texture_record_count >= GPU_TEXTURE_RECORDS) {
+         warnTextureTableExhausted();
+         return 0;
+@@ -1546,6 +1623,150 @@
+     return NULL;
+ }
+ 
++bool MisterGpu_beginOffscreen(const void* key, uint32_t revision) {
++    if (!g_gpu_available || !g_gpu_frame_open || !g_gpu_offscreen_allowed ||
++        key == NULL || g_gpu_offscreen_index != UINT32_MAX ||
++        g_gpu_command_count != g_gpu_scene_start ||
++        g_gpu_command_count > GPU_COMMAND_CAPACITY - 4u)
++        return false;
++
++    uint32_t selected = UINT32_MAX;
++    for (uint32_t i = 0; i < GPU_OFFSCREEN_RECORDS; ++i) {
++        MisterGpuOffscreen* record = &g_gpu_offscreen[i];
++        if (record->key == key) {
++            // A second version in one command list would overwrite the first
++            // before scene commands have sampled it. Materialize on CPU instead.
++            if (record->committed_frame == g_gpu_frame_serial) return false;
++            selected = i;
++            break;
++        }
++        if (selected == UINT32_MAX && record->key == NULL &&
++            record->committed_frame != g_gpu_frame_serial)
++            selected = i;
++    }
++    if (selected == UINT32_MAX) return false;
++    MisterGpuOffscreen* record = &g_gpu_offscreen[selected];
++    if (record->physical[0] == 0) {
++        // Reserve both command-bank copies atomically. No CPU writes target
++        // this storage. The preceding job owns the opposite command bank;
++        // released entries therefore need no overlap-destroying wait here.
++        uint32_t physical = reserveGpuTexture(
++            MISTER_FB_BYTES * GPU_COMMAND_BUFFER_COUNT);
++        if (physical == 0) return false;
++        for (uint32_t bank = 0; bank < GPU_COMMAND_BUFFER_COUNT; ++bank)
++            record->physical[bank] = physical + bank * (uint32_t)MISTER_FB_BYTES;
++    }
++    g_gpu_offscreen_index = selected;
++    g_gpu_offscreen_key = key;
++    g_gpu_offscreen_revision = revision;
++    g_gpu_offscreen_start = g_gpu_command_count;
++    return true;
++}
++
++void MisterGpu_abortOffscreen(void) {
++    if (g_gpu_offscreen_index == UINT32_MAX) return;
++    g_gpu_command_count = g_gpu_offscreen_start;
++    g_gpu_offscreen_index = UINT32_MAX;
++    g_gpu_offscreen_key = NULL;
++}
++
++static bool offscreenAxisSourceIsStable(const MisterGpuCommand* command) {
++    size_t offset = 0;
++    MisterGpuTexture* record = textureRecordForPhysical(
++        (uint32_t)command->word[1], &offset);
++    if (record == NULL || record->dynamic || !record->shadow_valid)
++        return false;
++    uint32_t stride = (uint32_t)(command->word[1] >> 32);
++    if (stride < 4u || (stride & 3u) != 0) return false;
++    int32_t x = (int16_t)command->word[2];
++    int32_t y = (int16_t)(command->word[2] >> 16);
++    int32_t width = (uint16_t)(command->word[0] >> 16);
++    int32_t height = (uint16_t)(command->word[0] >> 32);
++    int32_t x0 = x < 0 ? -x : 0;
++    int32_t y0 = y < 0 ? -y : 0;
++    int32_t x1 = width < MISTER_WIDTH - x ? width : MISTER_WIDTH - x;
++    int32_t y1 = height < MISTER_HEIGHT - y ? height : MISTER_HEIGHT - y;
++    if (x1 <= x0 || y1 <= y0) return true;
++    int64_t u = (int32_t)command->word[4];
++    int64_t v = (int32_t)(command->word[4] >> 32);
++    int64_t du = (int32_t)command->word[5];
++    int64_t dv = (int32_t)(command->word[5] >> 32);
++    int64_t u0 = u + x0 * du, u1 = u + (x1 - 1) * du;
++    int64_t v0 = v + y0 * dv, v1 = v + (y1 - 1) * dv;
++    int64_t minU = u0 < u1 ? u0 : u1, maxU = u0 > u1 ? u0 : u1;
++    int64_t minV = v0 < v1 ? v0 : v1, maxV = v0 > v1 ? v0 : v1;
++    // Prove every sampled byte belongs to this immutable allocation, and that
++    // the RTL's signed 16.16 accumulators cannot wrap on any visible sample.
++    if (minU < 0 || minV < 0 || maxU > INT32_MAX || maxV > INT32_MAX ||
++        (uint64_t)(maxU / 65536) * 4u + 4u > stride)
++        return false;
++    uint64_t last = (uint64_t)offset +
++        (uint64_t)(maxV / 65536) * stride +
++        (uint64_t)(maxU / 65536) * 4u;
++    return last <= record->bytes && 4u <= record->bytes - last;
++}
++
++uint32_t MisterGpu_commitOffscreen(void) {
++    if (g_gpu_offscreen_index == UINT32_MAX) return 0;
++    bool valid = g_gpu_available && g_gpu_frame_open &&
++        g_gpu_command_count > g_gpu_offscreen_start &&
++        // Keep the export, the caller's mandatory scene clear, and END atomic
++        // with respect to command capacity. Never present a light mask alone.
++        g_gpu_command_count <= GPU_COMMAND_CAPACITY - 3u &&
++        g_gpu_commands[g_gpu_offscreen_start].word[0] == 1u;
++    for (uint32_t i = g_gpu_offscreen_start + 1u;
++         i < g_gpu_command_count && valid; ++i) {
++        const MisterGpuCommand* command = &g_gpu_commands[i];
++        uint32_t opcode = (uint8_t)command->word[0];
++        uint32_t flags = (uint16_t)command->word[0] & ~0xffu;
++        if ((flags & (1u << 10)) && opcode == 2u && g_gpu_floor_tint)
++            flags &= ~(1u << 10);
++        valid = (flags == 0 || flags == (1u << 8) || flags == (1u << 9)) &&
++            (opcode == 3u || (opcode == 2u && offscreenAxisSourceIsStable(command)));
++    }
++    if (!valid) {
++        MisterGpu_abortOffscreen();
++        return 0;
++    }
++    MisterGpuOffscreen* record = &g_gpu_offscreen[g_gpu_offscreen_index];
++    uint32_t physical = record->physical[g_gpu_write_buffer];
++    MisterGpuCommand* command = &g_gpu_commands[g_gpu_command_count++];
++    memset(command, 0, sizeof(*command));
++    command->word[0] = 6u;
++    command->word[1] = physical;
++    record->key = g_gpu_offscreen_key;
++    record->revision = g_gpu_offscreen_revision;
++    record->committed_frame = g_gpu_frame_serial;
++    g_gpu_scene_start = g_gpu_command_count;
++    g_gpu_offscreen_index = UINT32_MAX;
++    g_gpu_offscreen_key = NULL;
++    g_gpu_offscreen_needs_scene_clear = true;
++    return physical;
++}
++
++uint32_t MisterGpu_findOffscreen(const void* key, uint32_t revision) {
++    if (!g_gpu_available || !g_gpu_frame_open || !g_gpu_offscreen_allowed ||
++        key == NULL) return 0;
++    for (uint32_t i = 0; i < GPU_OFFSCREEN_RECORDS; ++i) {
++        const MisterGpuOffscreen* record = &g_gpu_offscreen[i];
++        if (record->key == key && record->revision == revision &&
++            record->committed_frame == g_gpu_frame_serial)
++            return record->physical[g_gpu_write_buffer];
++    }
++    return 0;
++}
++
++void MisterGpu_releaseOffscreen(const void* key) {
++    if (key == NULL) return;
++    if (g_gpu_offscreen_key == key) MisterGpu_abortOffscreen();
++    for (uint32_t i = 0; i < GPU_OFFSCREEN_RECORDS; ++i) {
++        if (g_gpu_offscreen[i].key == key)
++            g_gpu_offscreen[i].key = NULL;
++    }
++    // Retain allocation/frame tags: an already queued export and its consumers
++    // remain valid even after surface_free, and same-frame reuse is prohibited.
++}
++
+ static int32_t gpuFixedFloor(int32_t value);
+ 
+ static bool prepareTextureOpacity(MisterGpuTexture *record) {
+@@ -1734,12 +1955,18 @@
+         groupEnd = groupStart;
+     }
+ 
+-    if (bestPrefix != 0) {
+-        memmove(g_gpu_commands, &g_gpu_commands[bestPrefix],
++    // Exports are observable side effects, even when a later opaque layer
++    // replaces the visible target. Preserve each export and all its producers.
++    uint32_t protectedPrefix = 0;
++    for (uint32_t i = 0; i < bestPrefix; ++i)
++        if ((uint8_t)g_gpu_commands[i].word[0] == 6u)
++            protectedPrefix = i + 1u;
++    if (bestPrefix > protectedPrefix) {
++        memmove(&g_gpu_commands[protectedPrefix], &g_gpu_commands[bestPrefix],
+                 (g_gpu_command_count - bestPrefix) * sizeof(MisterGpuCommand));
+-        g_gpu_command_count -= bestPrefix;
+-    }
+-    return bestPrefix;
++        g_gpu_command_count -= bestPrefix - protectedPrefix;
++    }
++    return bestPrefix - protectedPrefix;
+ }
+ 
+ static uint8_t gpuMul255(uint8_t a, uint8_t b) {
+@@ -2971,6 +3198,8 @@
+     memset(command, 0, sizeof(*command));
+     command->word[0] = 1;
+     command->word[1] = rgba;
++    if (g_gpu_offscreen_index == UINT32_MAX)
++        g_gpu_offscreen_needs_scene_clear = false;
+     return true;
+ }
+ 
+@@ -2982,6 +3211,8 @@
+ 
+ bool MisterGpu_addFill(int16_t x, int16_t y, uint16_t width, uint16_t height,
+                        uint32_t rgba, uint8_t blendMode) {
++    if (g_gpu_offscreen_needs_scene_clear && g_gpu_offscreen_index == UINT32_MAX)
++        return false;
+     if (!g_gpu_available || g_gpu_command_count >= GPU_COMMAND_CAPACITY - 1) return false;
+     MisterGpuCommand* command = &g_gpu_commands[g_gpu_command_count++];
+     memset(command, 0, sizeof(*command));
+@@ -3006,6 +3237,8 @@
+                        int16_t x, int16_t y, uint16_t width, uint16_t height,
+                        int32_t u, int32_t v, int32_t du, int32_t dv,
+                        uint32_t tint, uint8_t blendMode) {
++    if (g_gpu_offscreen_needs_scene_clear && g_gpu_offscreen_index == UINT32_MAX)
++        return false;
+     if (!g_gpu_available || source == 0 || g_gpu_command_count >= GPU_COMMAND_CAPACITY - 1) return false;
+     MisterGpuCommand* command = &g_gpu_commands[g_gpu_command_count++];
+     memset(command, 0, sizeof(*command));
+@@ -3020,6 +3253,16 @@
+     return true;
+ }
+ 
++bool MisterGpu_addBlitFloorTint(uint32_t source, uint32_t stride,
++                       int16_t x, int16_t y, uint16_t width, uint16_t height,
++                       int32_t u, int32_t v, int32_t du, int32_t dv,
++                       uint32_t tint, uint8_t blendMode) {
++    if (!MisterGpu_hasFloorTint() || !MisterGpu_addBlit(source, stride,
++        x, y, width, height, u, v, du, dv, tint, blendMode)) return false;
++    g_gpu_commands[g_gpu_command_count - 1].word[0] |= 1u << 10;
++    return true;
++}
++
+ bool MisterGpu_addBlitVGradient(uint32_t source, uint32_t stride,
+                        int16_t x, int16_t y, uint16_t width, uint16_t height,
+                        int32_t u, int32_t v, int32_t du, int32_t dv,
+@@ -3039,6 +3282,8 @@
+                        int32_t uStart, int32_t vStart,
+                        int32_t uDx, int32_t vDx, int32_t uDy, int32_t vDy,
+                        uint32_t tint, uint8_t blendMode) {
++    if (g_gpu_offscreen_needs_scene_clear && g_gpu_offscreen_index == UINT32_MAX)
++        return false;
+     uint32_t needed = (tint != 0xffffffffu || blendMode != MISTER_GPU_BLEND_NORMAL) ? 2u : 1u;
+     if (!g_gpu_available || source == 0 ||
+         g_gpu_command_count >= GPU_COMMAND_CAPACITY - needed) return false;
+@@ -3065,6 +3310,8 @@
+ }
+ 
+ bool MisterGpu_addFramebufferExport(uint32_t destination) {
++    if (g_gpu_offscreen_needs_scene_clear && g_gpu_offscreen_index == UINT32_MAX)
++        return false;
+     if (!g_gpu_available || destination == 0) return false;
+     if (!g_gpu_frame_open) {
+         for (uint32_t i = 0; i < g_gpu_deferred_export_count; ++i) {
+@@ -3086,6 +3333,8 @@
+                             int16_t firstDestinationY,
+                             const uint64_t* packedRows, uint16_t rowCount,
+                             uint32_t tint) {
++    if (g_gpu_offscreen_needs_scene_clear && g_gpu_offscreen_index == UINT32_MAX)
++        return false;
+     if (!g_gpu_available || source == 0 || packedRows == NULL || rowCount == 0 ||
+         rowCount > GPU_WATER_ROWS - g_gpu_water_table_rows ||
+         g_gpu_command_count >= GPU_COMMAND_CAPACITY)
+@@ -3118,6 +3367,8 @@
+ }
+ 
+ bool MisterGpu_finishFrame(uint32_t* cycles) {
++    if (g_gpu_offscreen_index != UINT32_MAX || g_gpu_offscreen_needs_scene_clear)
++        return false;
+     if (!appendGpuEnd()) {
+         g_gpu_frame_open = false;
+         return false;
+@@ -3180,6 +3431,11 @@
+     // the shared scanout buffer; start a fresh list that draws on that result.
+     if (!g_gpu_available || g_gpu_pending) return;
+     g_gpu_command_count = 0;
++    g_gpu_scene_start = 0;
++    g_gpu_offscreen_allowed = false;
++    g_gpu_offscreen_index = UINT32_MAX;
++    g_gpu_offscreen_key = NULL;
++    g_gpu_offscreen_needs_scene_clear = false;
+     g_gpu_frame_open = true;
+     g_gpu_software_frame = false;
+ }
+@@ -3188,6 +3444,9 @@
+     // A software fallback writes the same scanout framebuffer as the GPU DMA.
+     // Do not let the two producers overlap.
+     waitGpuCompletion(NULL);
++    MisterGpu_abortOffscreen();
++    g_gpu_offscreen_allowed = false;
++    g_gpu_offscreen_needs_scene_clear = false;
+     g_gpu_frame_open = false;
+     g_gpu_presented = false;
+     g_gpu_software_frame = true;
+@@ -3568,6 +3827,29 @@
+ #endif
+ }
+ 
++static void optimizeGpuScene(uint32_t* waterRowsOut, uint32_t* repeatedOut) {
++    // Prepasses and prior-frame water exports are ordered side effects.
++    // Existing screen-only optimizers see only the ordinary scene suffix;
++    // none may fuse, cull, or move commands through this boundary.
++    MisterGpuCommand* commandBase = g_gpu_commands;
++    uint32_t protectedPrefix = g_gpu_scene_start;
++    g_gpu_commands += protectedPrefix;
++    g_gpu_command_count -= protectedPrefix;
++    {
++        uint32_t waterRows = tryFuseWaterEffect();
++        uint32_t nativeWaterRows = 0;
++        finalizeWaterExports();
++        uint32_t repeatedTileCommands = tryFuseRepeatedAdditiveTiles();
++        tryFuseMapBackground();
++        cullFullyCoveredPrefix();
++        *waterRowsOut = waterRows;
++        *repeatedOut = repeatedTileCommands;
++        (void)nativeWaterRows;
++    }
++    g_gpu_command_count += protectedPrefix;
++    g_gpu_commands = commandBase;
++}
++
+ void platformSwapBuffers(void) {
+     RD_SCOPE(RD_PRESENT, -1, 0);
+     if (g_fb == NULL || g_next_frame == NULL || g_next_width != MISTER_WIDTH || g_next_height != MISTER_HEIGHT) return;
+@@ -3605,12 +3887,10 @@
+     }
+ 
+     if (!softwareFrame && g_gpu_command_count != 0) {
+-        uint32_t waterRows = tryFuseWaterEffect();
++        uint32_t waterRows = 0;
+         uint32_t nativeWaterRows = 0;
+-        finalizeWaterExports();
+-        uint32_t repeatedTileCommands = tryFuseRepeatedAdditiveTiles();
+-        tryFuseMapBackground();
+-        cullFullyCoveredPrefix();
++        uint32_t repeatedTileCommands = 0;
++        optimizeGpuScene(&waterRows, &repeatedTileCommands);
+         uint32_t cycles = 0;
+ #if defined(MISTER_GPU_DIAGNOSTICS)
+         uint32_t commandCount = g_gpu_command_count;
+diff --git a/src/backends/mister_gpu.h b/src/backends/mister_gpu.h
+--- a/src/backends/mister_gpu.h
++++ b/src/backends/mister_gpu.h
+@@ -10,8 +10,21 @@
+ #define MISTER_GPU_BLEND_SUBTRACT 2u
+ 
+ bool MisterGpu_isAvailable(void);
++bool MisterGpu_hasFloorTint(void);
+ uint32_t MisterGpu_getCrtUiInset(void);
+ void MisterGpu_beginFrame(void);
++// Transactional, frame-local 320x240 RGBA prepasses. The caller queues these
++// after beginFrame and immediately before the ordinary application clear.
++// Only immutable atlas sources are accepted; the logical offscreen surface
++// remains the caller's responsibility (including full-size CPU/save replay).
++// Use existing clear/blit/fill builders between begin and commit. A failed
++// commit aborts without publishing any commands. A nonzero result is a texture
++// address with 1280-byte stride, valid only in this open frame/revision.
++bool MisterGpu_beginOffscreen(const void* key, uint32_t revision);
++uint32_t MisterGpu_commitOffscreen(void);
++void MisterGpu_abortOffscreen(void);
++uint32_t MisterGpu_findOffscreen(const void* key, uint32_t revision);
++void MisterGpu_releaseOffscreen(const void* key);
+ uint32_t MisterGpu_uploadTexture(const void* rgbaPixels, size_t bytes);
+ uint32_t MisterGpu_uploadDynamicTexture(const void* rgbaPixels, size_t bytes);
+ uint32_t MisterGpu_uploadDynamicTextureRevision(const void* rgbaPixels, size_t bytes,
+@@ -35,6 +48,10 @@
+                        uint32_t tintStart, int16_t dr, int16_t dg,
+                        int16_t db, int16_t da, uint8_t blendMode);
+ bool MisterGpu_addBlit(uint32_t source, uint32_t stride,
++                       int16_t x, int16_t y, uint16_t width, uint16_t height,
++                       int32_t u, int32_t v, int32_t du, int32_t dv,
++                       uint32_t tint, uint8_t blendMode);
++bool MisterGpu_addBlitFloorTint(uint32_t source, uint32_t stride,
+                        int16_t x, int16_t y, uint16_t width, uint16_t height,
+                        int32_t u, int32_t v, int32_t du, int32_t dv,
+                        uint32_t tint, uint8_t blendMode);
+diff --git a/src/am2r_fast_state.c b/src/am2r_fast_state.c
+--- a/src/am2r_fast_state.c
++++ b/src/am2r_fast_state.c
+@@ -964,6 +964,10 @@
+ 
+ static bool writeSurfaces(FastWriter* writer, Runner* runner) {
+     SWRenderer* sw = (SWRenderer*)runner->renderer;
++    // A deferred FPGA viewport is only a derived representation. Save the
++    // complete logical surfaces, including pixels outside that viewport, by
++    // replaying their CPU journals before serializing metadata or pixel bytes.
++    SWRenderer_materializeSurfaces(runner->renderer);
+     if (!writerU32(writer, sw->surfaceCount) || !writerI32(writer, sw->currentSurface))
+         return false;
+     repeat(sw->surfaceCount, id) {
+diff --git a/src/mister_offscreen.c b/src/mister_offscreen.c
+new file mode 100644
+--- /dev/null
++++ b/src/mister_offscreen.c
+@@ -0,0 +1,190 @@
++#include "mister_offscreen.h"
++
++#include <limits.h>
++#include <math.h>
++#include <string.h>
++
++static bool sampleU(const MisterOffscreenAxis* op, int64_t offset,
++                    int64_t* result) {
++    int64_t delta;
++    return !__builtin_mul_overflow(offset, op->stepU, &delta) &&
++           !__builtin_add_overflow(op->startU, delta, result);
++}
++
++static bool sampleRow(const MisterOffscreenAxis* op, int32_t y,
++                      int32_t* result) {
++    const double value = op->sourceY0 +
++        (((double)y + 0.5) - op->vertexY0) * op->sourceDy;
++    // Match the defined range of the CPU int32 cast; reject invalid geometry
++    // before any output can be partially materialized.
++    if (!isfinite(value) || value < INT32_MIN || value > INT32_MAX) return false;
++    int32_t row = (int32_t)value;
++    if (row < 0) row = 0;
++    if (row >= op->sourceHeight) row = op->sourceHeight - 1;
++    *result = row;
++    return true;
++}
++
++static bool valid(const MisterOffscreenAxis* op) {
++    if (!op || !op->source || op->sourceWidth <= 0 ||
++        op->sourceHeight <= 0 || op->sourceWidth > 32767 ||
++        op->sourceHeight > 32767 || op->x < 0 || op->y < 0 ||
++        op->width < 0 || op->height < 0 ||
++        (int64_t)op->x + op->width > INT32_MAX ||
++        (int64_t)op->y + op->height > INT32_MAX ||
++        !isfinite(op->sourceY0) || !isfinite(op->sourceDy) ||
++        !isfinite(op->vertexY0)) return false;
++    int64_t last;
++    if (op->width == 0) return true;
++    if (!sampleU(op, (int64_t)op->width - 1, &last)) return false;
++    // The original CPU path casts the shifted sample to int32 before clamping.
++    // Do not silently choose different behavior for an out-of-range conversion.
++    return (op->startU >> 16) >= INT32_MIN &&
++           (op->startU >> 16) <= INT32_MAX &&
++           (last >> 16) >= INT32_MIN && (last >> 16) <= INT32_MAX;
++}
++
++static uint32_t subtract(uint32_t destination, uint32_t source,
++                         uint32_t tint) {
++    uint32_t result = 0;
++    for (unsigned shift = 0; shift < 32; shift += 8) {
++        const uint32_t sample = ((source >> shift) & 255u) *
++                                ((tint >> shift) & 255u) / 255u;
++        const uint32_t channel = ((destination >> shift) & 255u) *
++                                  (255u - sample) / 255u;
++        result |= channel << shift;
++    }
++    return result;
++}
++
++bool MisterOffscreen_replayAxis(uint32_t* target, int32_t targetWidth,
++                               int32_t targetHeight,
++                               const MisterOffscreenAxis* op) {
++    if (!target || targetWidth <= 0 || targetHeight <= 0 || !valid(op) ||
++        (int64_t)op->x + op->width > targetWidth ||
++        (int64_t)op->y + op->height > targetHeight ||
++        (uint64_t)targetWidth * (uint64_t)targetHeight > SIZE_MAX / 4u)
++        return false;
++    if (!op->width || !op->height) return true;
++    // Validate all Y conversions first so failure is transactional.
++    for (int32_t row = 0; row < op->height; ++row) {
++        int32_t unused;
++        if (!sampleRow(op, op->y + row, &unused)) return false;
++    }
++    for (int32_t row = 0; row < op->height; ++row) {
++        int32_t sy;
++        (void)sampleRow(op, op->y + row, &sy);
++        int64_t u = op->startU;
++        uint32_t* destination = target +
++            (size_t)(op->y + row) * (size_t)targetWidth + (size_t)op->x;
++        const uint32_t* source = op->source +
++            (size_t)sy * (size_t)op->sourceWidth;
++        for (int32_t col = 0; col < op->width; ++col) {
++            int64_t sx = u >> 16;
++            if (sx < 0) sx = 0;
++            if (sx >= op->sourceWidth) sx = op->sourceWidth - 1;
++            // Sample before writing; do not vectorize away self-alias order.
++            const uint32_t pixel = source[sx];
++            destination[col] = subtract(destination[col], pixel, op->tint);
++            if (col + 1 < op->width) u += op->stepU;
++        }
++    }
++    return true;
++}
++
++bool MisterOffscreen_planAxisTint(const MisterOffscreenAxis* op,
++                             int32_t viewX, int32_t viewY,
++                             int32_t viewWidth, int32_t viewHeight,
++                             MisterOffscreenBlit* output, size_t capacity,
++                             size_t* count, bool floorTint) {
++    if (!count) return false;
++    *count = 0;
++    if (!valid(op) || viewX < 0 || viewY < 0 || viewWidth <= 0 ||
++        viewHeight <= 0 || viewWidth > 320 || viewHeight > 240 ||
++        (int64_t)viewX + viewWidth > INT32_MAX ||
++        (int64_t)viewY + viewHeight > INT32_MAX) return false;
++    int32_t left = op->x > viewX ? op->x : viewX;
++    int32_t top = op->y > viewY ? op->y : viewY;
++    int32_t right = op->x + op->width;
++    int32_t bottom = op->y + op->height;
++    if (right > viewX + viewWidth) right = viewX + viewWidth;
++    if (bottom > viewY + viewHeight) bottom = viewY + viewHeight;
++    if (left >= right || top >= bottom) return true;
++    for (unsigned shift = 0; shift < 32; shift += 8) {
++        uint32_t lane = (op->tint >> shift) & 255u;
++        if (!floorTint && lane != 0 && lane != 255) return false;
++    }
++    int64_t u, last;
++    if (!sampleU(op, (int64_t)left - op->x, &u) ||
++        !sampleU(op, (int64_t)right - op->x - 1, &last) ||
++        u < INT32_MIN || u > INT32_MAX ||
++        last < INT32_MIN || last > INT32_MAX ||
++        op->stepU < INT32_MIN || op->stepU > INT32_MAX ||
++        (u >> 16) < 0 || (u >> 16) >= op->sourceWidth ||
++        (last >> 16) < 0 || (last >> 16) >= op->sourceWidth) return false;
++    int32_t rows[MISTER_OFFSCREEN_MAX_BLITS];
++    const int32_t height = bottom - top;
++    for (int32_t row = 0; row < height; ++row)
++        if (!sampleRow(op, top + row, &rows[row])) return false;
++    // A fractional scale usually fits one ordinary 16.16 blit. Prove this
++    // against EVERY CPU-selected row instead of trusting endpoint rounding.
++    // Each row gives an interval for the starting accumulator; a nonempty
++    // intersection supplies an exact descriptor even at integer boundaries.
++    // Clamp plateaus or unrepresentable row sequences use the row runs below.
++    const double proposedStep = op->sourceDy * 65536.0;
++    if (isfinite(proposedStep) && proposedStep >= INT32_MIN && proposedStep <= INT32_MAX) {
++        const int32_t step = (int32_t)proposedStep;
++        int64_t lower = INT32_MIN, upper = INT32_MAX;
++        for (int32_t row = 0; row < height; ++row) {
++            const int64_t start = (int64_t)rows[row] * 65536 - (int64_t)row * step;
++            if (start > lower) lower = start;
++            if (start + 65535 < upper) upper = start + 65535;
++        }
++        if (lower <= upper) {
++            if (!capacity || !output) return false;
++            output[0] = (MisterOffscreenBlit){
++                .x = (int16_t)(left - viewX), .y = (int16_t)(top - viewY),
++                .width = (uint16_t)(right - left), .height = (uint16_t)height,
++                .u = (int32_t)u, .v = (int32_t)lower,
++                .du = (int32_t)op->stepU, .dv = step,
++            };
++            *count = 1;
++            return true;
++        }
++    }
++    MisterOffscreenBlit planned[MISTER_OFFSCREEN_MAX_BLITS];
++    size_t total = 0;
++    for (int32_t first = 0; first < height;) {
++        const int32_t delta = first + 1 < height ?
++            rows[first + 1] - rows[first] : 0;
++        int32_t end = first + 1;
++        if (end < height) {
++            ++end;
++            while (end < height && rows[end] - rows[end - 1] == delta) ++end;
++        }
++        planned[total++] = (MisterOffscreenBlit){
++            .x = (int16_t)(left - viewX),
++            .y = (int16_t)(top + first - viewY),
++            .width = (uint16_t)(right - left),
++            .height = (uint16_t)(end - first),
++            .u = (int32_t)u,
++            .v = rows[first] * 65536,
++            .du = (int32_t)op->stepU,
++            .dv = delta * 65536,
++        };
++        first = end;
++    }
++    if (total > capacity || (total && !output)) return false;
++    memcpy(output, planned, total * sizeof(*output));
++    *count = total;
++    return true;
++}
++
++bool MisterOffscreen_planAxis(const MisterOffscreenAxis* op,
++                             int32_t viewX, int32_t viewY,
++                             int32_t viewWidth, int32_t viewHeight,
++                             MisterOffscreenBlit* output, size_t capacity,
++                             size_t* count) {
++    return MisterOffscreen_planAxisTint(op, viewX, viewY, viewWidth, viewHeight,
++        output, capacity, count, false);
++}
+diff --git a/src/mister_offscreen.h b/src/mister_offscreen.h
+new file mode 100644
+--- /dev/null
++++ b/src/mister_offscreen.h
+@@ -0,0 +1,55 @@
++#pragma once
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++// An already-covered/scissored logical CPU axis draw. The source is immutable
++// until its deferred use completes; ownership is the caller's responsibility.
++// startU is quantized at x, not at the later visible-crop origin. CPU Y is
++// recomputed as sourceY0 + (((double)y + .5) - vertexY0) * sourceDy per row.
++typedef struct {
++    const uint32_t* source;
++    int32_t sourceWidth, sourceHeight;
++    int32_t x, y, width, height;
++    int64_t startU, stepU;
++    double sourceY0, sourceDy, vertexY0;
++    uint32_t tint;
++} MisterOffscreenAxis;
++
++// Existing opcode-2 axis descriptor geometry, relative to the visible crop.
++// The caller provides source address/stride, the original tint, and subtract
++// blend mode. Rows have exact integer source indices, not approximate Y steps.
++typedef struct {
++    int16_t x, y;
++    uint16_t width, height;
++    int32_t u, v, du, dv;
++} MisterOffscreenBlit;
++
++#define MISTER_OFFSCREEN_MAX_BLITS 240u
++
++// Exact scalar materialization of the full original logical coverage. Performs
++// validation before writing anything; reproduces per-channel floor tint and
++// ZERO/INV_SRC_COLOR blend, including alpha-zero RGB. Aliases retain CPU order.
++bool MisterOffscreen_replayAxis(uint32_t* target, int32_t targetWidth,
++                               int32_t targetHeight,
++                               const MisterOffscreenAxis* operation);
++
++// Conservative unchanged-RBF plan: binary (0/255) tint lanes, no visible X
++// clamp/overflow, exact CPU Y rows grouped into arithmetic-progression runs.
++// viewW/H must fit 320x240. Empty visible coverage succeeds with zero commands.
++// Failure leaves output untouched and sets *count to zero. Caller must rule out
++// source/destination aliasing and prove supported shader/blend/write state.
++bool MisterOffscreen_planAxis(const MisterOffscreenAxis* operation,
++                             int32_t viewX, int32_t viewY,
++                             int32_t viewWidth, int32_t viewHeight,
++                             MisterOffscreenBlit* output, size_t capacity,
++                             size_t* count);
++
++// Same sampling proof with arbitrary tint when the current RBF advertises
++// exact floor-tint opcode support. The caller must set that descriptor flag.
++bool MisterOffscreen_planAxisTint(const MisterOffscreenAxis* operation,
++                             int32_t viewX, int32_t viewY,
++                             int32_t viewWidth, int32_t viewHeight,
++                             MisterOffscreenBlit* output, size_t capacity,
++                             size_t* count, bool floorTint);
