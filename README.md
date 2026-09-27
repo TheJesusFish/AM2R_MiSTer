@@ -72,6 +72,28 @@ Classic Morph Ball accepts crouch followed by Down again, so the Morph action
 is optional with the game's default setting. Weapon Select+Start exits the ARM
 runtime and returns to `menu.rbf`.
 
+## Video output
+
+**Video Standard** selects the analog raster:
+
+| Setting | Raster | Line rate | Refresh | Composite/S-Video subcarrier |
+| --- | --- | --- | --- | --- |
+| NTSC | 398×262 | 15.704 kHz | 59.94 Hz | from `ntsc_mode` in MiSTer.ini |
+| PAL60 | 398×262 | 15.704 kHz | 59.94 Hz | PAL (4.43 MHz) |
+| PAL | 400×312 | 15.625 kHz | 50.08 Hz | PAL (4.43 MHz) |
+
+NTSC and PAL60 have identical RGB timing; PAL60 only changes the colour
+subcarrier for composite and S-Video. PAL centres the 240 active lines in the
+taller 50 Hz frame. The game still runs at full 60 Hz speed in PAL mode, so
+one frame in six is not displayed.
+
+**Scale** provides MiSTer's standard HDMI integer-scaling modes. Gamma curves
+from the MiSTer video menu apply to both outputs. With `forced_scandoubler=1`
+in MiSTer.ini, the analog output is line-doubled to 31 kHz for VGA monitors,
+and **Scandoubler Fx** offers HQ2x or scanlines. For HDMI, `vsync_adjust=1` or
+`vsync_adjust=2` in MiSTer.ini matches the output refresh to the core instead
+of periodically repeating or dropping a frame.
+
 ## CRT adjustments
 
 The core's **CRT Adjustments** submenu provides signed horizontal and vertical
@@ -95,7 +117,9 @@ adjustment also changes the signal presented to ascal even though the final
 HDMI mode is still produced by the normal framework. Leave the controls off
 when only HDMI is in use. That limitation also applies to the UI inset because
 the runner composes it before the framework split. Horizontal scaling buffers
-one scanline, not a frame; the UI inset adds no video buffering.
+one scanline, not a frame; the UI inset adds no video buffering. The
+horizontal scaler is disabled while `forced_scandoubler` is active because it
+exists only for 15 kHz displays.
 
 ## Architecture
 

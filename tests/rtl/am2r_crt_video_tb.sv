@@ -24,6 +24,7 @@ module am2r_crt_video_tb;
 	am2r_native_video source(
 		.clk(clk),
 		.reset(reset),
+		.standard(2'd0),
 		.frame_ready(1'b0),
 		.frame_r(8'd0),
 		.frame_g(8'd0),
@@ -36,6 +37,7 @@ module am2r_crt_video_tb;
 		.new_frame(new_frame),
 		.new_line(new_line),
 		.pace_tick(),
+		.pal(),
 		.r(source_r),
 		.g(source_g),
 		.b(source_b)

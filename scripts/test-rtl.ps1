@@ -129,8 +129,10 @@ try {
     & vlog -sv -work $library rtl\am2r_native_video.sv tests\rtl\am2r_native_video_tb.sv
     if ($LASTEXITCODE -ne 0) { throw "native-video vlog failed with exit code $LASTEXITCODE." }
 
-    & vsim -c -lib $library am2r_native_video_tb -do 'onerror {quit -code 1}; run -all; quit -code 0'
-    if ($LASTEXITCODE -ne 0) { throw "native-video vsim failed with exit code $LASTEXITCODE." }
+    foreach ($standard in 0, 1, 2) {
+        & vsim -c -lib $library am2r_native_video_tb "-gSTANDARD=$standard" -do 'onerror {quit -code 1}; run -all; quit -code 0'
+        if ($LASTEXITCODE -ne 0) { throw "native-video vsim (standard $standard) failed with exit code $LASTEXITCODE." }
+    }
 
 	& vlog -sv -work $library rtl\am2r_native_video.sv rtl\am2r_crt_resync.sv rtl\am2r_video_line_ram.sv rtl\am2r_video_hscale.sv rtl\am2r_crt_video.sv tests\rtl\am2r_crt_video_tb.sv
 	if ($LASTEXITCODE -ne 0) { throw "CRT-video vlog failed with exit code $LASTEXITCODE." }
@@ -153,8 +155,10 @@ try {
 	& vlog -sv -work $library rtl\am2r_native_video.sv rtl\am2r_native_reader.sv tests\rtl\am2r_native_reader_late_frame_tb.sv
 	if ($LASTEXITCODE -ne 0) { throw "late-frame native-reader vlog failed with exit code $LASTEXITCODE." }
 
-	& vsim -c -L altera_mf -lib $library am2r_native_reader_late_frame_tb -do 'onerror {quit -code 1}; run -all; quit -code 0'
-	if ($LASTEXITCODE -ne 0) { throw "late-frame native-reader vsim failed with exit code $LASTEXITCODE." }
+	foreach ($standard in 0, 2) {
+		& vsim -c -L altera_mf -lib $library am2r_native_reader_late_frame_tb "-gSTANDARD=$standard" -do 'onerror {quit -code 1}; run -all; quit -code 0'
+		if ($LASTEXITCODE -ne 0) { throw "late-frame native-reader vsim (standard $standard) failed with exit code $LASTEXITCODE." }
+	}
 
     & vlog -sv -work $library rtl\am2r_framebuffer_config.sv tests\rtl\am2r_framebuffer_config_tb.sv
     if ($LASTEXITCODE -ne 0) { throw "framebuffer vlog failed with exit code $LASTEXITCODE." }

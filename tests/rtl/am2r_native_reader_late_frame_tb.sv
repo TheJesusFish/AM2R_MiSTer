@@ -1,6 +1,9 @@
 `timescale 1ns/1ps
 
-module am2r_native_reader_late_frame_tb;
+module am2r_native_reader_late_frame_tb #(parameter integer STANDARD = 0);
+	// Last accepted and first deferred blank line for each raster.
+	localparam integer LAST_ACCEPTED = STANDARD >= 2 ? 65 : 15;
+	localparam integer FIRST_DEFERRED = STANDARD >= 2 ? 68 : 18;
 	localparam [28:0] BUF0_ADDR = 29'h07400020;
 	localparam [28:0] BUF1_ADDR = 29'h07409620;
 	localparam [28:0] BUF2_ADDR = 29'h07412c20;
@@ -35,12 +38,13 @@ module am2r_native_reader_late_frame_tb;
 	integer errors = 0;
 	reg [7:0] expected_tag;
 
+	wire pal;
 	am2r_native_video timing(
-		.clk(clk_vid), .reset(reset),
+		.clk(clk_vid), .reset(reset), .standard(STANDARD[1:0]),
 		.frame_ready(frame_ready), .frame_r(r), .frame_g(g), .frame_b(b),
 		.ce_pix(ce_pix), .hblank(hblank), .hsync(hsync), .vblank(vblank),
 		.vsync(vsync), .new_frame(new_frame), .new_line(new_line),
-		.pace_tick(),
+		.pace_tick(), .pal(pal),
 		.r(), .g(), .b()
 	);
 
@@ -49,7 +53,7 @@ module am2r_native_reader_late_frame_tb;
 		.ddr_burstcnt(ddr_burstcnt), .ddr_addr(ddr_addr), .ddr_dout(ddr_dout),
 		.ddr_dout_ready(ddr_dout_ready), .ddr_rd(ddr_rd),
 		.clk_vid(clk_vid), .ce_pix(ce_pix), .de(~(hblank | vblank)),
-		.vblank(vblank), .new_frame(new_frame), .new_line(new_line),
+		.vblank(vblank), .pal(pal), .new_frame(new_frame), .new_line(new_line),
 		.source_frame(source_frame), .source_buffer(source_buffer),
 		.frame_ready(frame_ready), .scanout_frame(scanout_frame),
 		.buffer_in_use_valid(buffer_in_use_valid),
@@ -152,9 +156,10 @@ module am2r_native_reader_late_frame_tb;
 		if (scanout_frame != 2) errors = errors + 1;
 
 		// Exercise the end of the widened acceptance window.  Publication on
-		// blank line 15 must still restart the preload in time for active video.
+		// the last accepted blank line must still restart the preload in time
+		// for active video.
 		wait_for_new_frame();
-		wait_blank_lines(15);
+		wait_blank_lines(LAST_ACCEPTED);
 		source_buffer = 2'd2;
 		source_frame = 3;
 		expected_buffer = 2'd2;
@@ -165,10 +170,10 @@ module am2r_native_reader_late_frame_tb;
 		if (buffer_in_use != 2'd2) errors = errors + 1;
 		if (scanout_frame != 3) errors = errors + 1;
 
-		// A publication after the 16-line cutoff must remain queued for the
-		// following raster, avoiding a FIFO reset too close to active video.
+		// A publication after the cutoff must remain queued for the following
+		// raster, avoiding a FIFO reset too close to active video.
 		wait_for_new_frame();
-		wait_blank_lines(18);
+		wait_blank_lines(FIRST_DEFERRED);
 		source_buffer = 2'd0;
 		source_frame = 4;
 		expected_buffer = 2'd2;
@@ -191,13 +196,15 @@ module am2r_native_reader_late_frame_tb;
 		if (underflow_toggle != 0) errors = errors + 1;
 
 		if (errors == 0)
-			$display("PASS: 16-line vblank publication is atomic and post-cutoff publication waits one raster");
+			$display("PASS: standard %0d, %0d-line vblank publication is atomic and post-cutoff publication waits one raster",
+			         STANDARD, LAST_ACCEPTED + 1);
 		else $fatal(1, "FAIL: %0d late-frame reader errors", errors);
 		$finish;
 	end
 
+	// Six rasters plus margin: 100 ms at 59.94 Hz, 120 ms at 50 Hz.
 	initial begin
-		#100000000;
+		#(STANDARD >= 2 ? 120000000 : 100000000);
 		$fatal(1, "FAIL: late-frame reader timeout samples=%0d", samples);
 	end
 endmodule

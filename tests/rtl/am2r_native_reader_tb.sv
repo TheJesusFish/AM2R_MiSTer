@@ -28,12 +28,13 @@ module am2r_native_reader_tb;
 	integer request_offset;
 	reg [7:0] word_id;
 
+	wire pal;
 	am2r_native_video timing(
-		.clk(clk_vid), .reset(reset),
+		.clk(clk_vid), .reset(reset), .standard(2'd0),
 		.frame_ready(frame_ready), .frame_r(r), .frame_g(g), .frame_b(b),
 		.ce_pix(ce_pix), .hblank(hblank), .hsync(hsync), .vblank(vblank),
 		.vsync(vsync), .new_frame(new_frame), .new_line(new_line),
-		.pace_tick(),
+		.pace_tick(), .pal(pal),
 		.r(), .g(), .b()
 	);
 
@@ -42,7 +43,7 @@ module am2r_native_reader_tb;
 		.ddr_burstcnt(ddr_burstcnt), .ddr_addr(ddr_addr), .ddr_dout(ddr_dout),
 		.ddr_dout_ready(ddr_dout_ready), .ddr_rd(ddr_rd),
 		.clk_vid(clk_vid), .ce_pix(ce_pix), .de(~(hblank | vblank)),
-		.vblank(vblank), .new_frame(new_frame), .new_line(new_line),
+		.vblank(vblank), .pal(pal), .new_frame(new_frame), .new_line(new_line),
 		.source_frame(32'd1), .source_buffer(2'd0), .frame_ready(frame_ready),
 		.scanout_frame(scanout_frame),
 		.buffer_in_use_valid(buffer_in_use_valid), .buffer_in_use(buffer_in_use),

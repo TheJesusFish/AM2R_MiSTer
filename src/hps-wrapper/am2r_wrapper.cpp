@@ -29,6 +29,7 @@
 
 #include "am2r_savestate.h"
 #include "am2r_joy_shm.h"
+#include "cfg.h"
 #include "file_io.h"
 #include "fpga_io.h"
 #include "frame_timer.h"
@@ -460,6 +461,28 @@ void publish_joy_masks(StateControl &state, FILE *log)
 	// runner applies it only to edge UI; game layers remain native 320x240.
 	gJoyShm->crt_ui_inset = user_io_status_get("[26:24]") * 2u;
 	__sync_synchronize();
+}
+
+// The core's Video Standard option is NTSC, PAL60 or PAL. The FPGA switches
+// between its 60 Hz and 50 Hz rasters, and Main_MiSTer already selects the PAL
+// subcarrier for any raster below 55 Hz. PAL60 keeps the 60 Hz raster, so only
+// the frontend can select its subcarrier: override MiSTer.ini's ntsc_mode for
+// PAL60 and restore the ini value otherwise. Main_MiSTer can re-parse the ini
+// on a video change, so the override is re-applied whenever it is lost.
+void apply_video_standard(FILE *log)
+{
+	static int iniNtscMode = -1;
+	if (iniNtscMode < 0) iniNtscMode = cfg.ntsc_mode;
+
+	const uint32_t standard = user_io_status_get("[28:27]");
+	const char wanted = standard == 1 ? 1 : (char)iniNtscMode;
+	if (cfg.ntsc_mode == wanted) return;
+
+	cfg.ntsc_mode = wanted;
+	log_line(log, "video_standard=%u ntsc_mode=%d", standard, (int)wanted);
+	// The subcarrier only matters on composite/S-Video output. Forcing a mode
+	// re-evaluation elsewhere could needlessly resynchronize HDMI.
+	if (cfg.vga_mode_int >= 2) video_mode_adjust(true);
 }
 
 void cleanup_joy_shm()
@@ -1657,6 +1680,7 @@ int run_child(FILE *wrapperLog)
             frame_timer();
 			input_poll(0);
 			publish_joy_masks(state, wrapperLog);
+			apply_video_standard(wrapperLog);
             HandleUI();
             OsdUpdate();
             handle_state_osd(state, child, wrapperLog);
