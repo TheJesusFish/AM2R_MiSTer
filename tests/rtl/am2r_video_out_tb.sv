@@ -153,7 +153,8 @@ module am2r_video_out_tb;
 			if (hs_edges > 2000) $fatal(1, "VSync stopped: %0d lines without three VSyncs", hs_edges);
 		end
 
-		// Two full frames lie between the first and third VSync.
+		// Counting starts mid-frame, so two to three frames elapse before the
+		// third VSync.
 		if (hs_edges < 2 * 262 - 2 || hs_edges > 3 * 262)
 			$fatal(1, "HSync count %0d over two frames", hs_edges);
 		if (de_edges < 2 * 240 - 2)
