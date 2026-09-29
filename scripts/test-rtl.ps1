@@ -140,6 +140,21 @@ try {
 	& vsim -c -lib $library am2r_crt_video_tb -do 'onerror {quit -code 1}; run -all; quit -code 0'
 	if ($LASTEXITCODE -ne 0) { throw "CRT-video vsim failed with exit code $LASTEXITCODE." }
 
+	# Core video output (gamma + video_mixer) with the native pulsed pixel
+	# enable and the H Scaler's continuous one. The simulation copy of
+	# sys/video_mixer.sv only hoists declarations; sys/ stays untouched.
+	$simMixer = Join-Path $library 'video_mixer_sim.sv'
+	& python tests\rtl\sim\make_sim_video_mixer.py $simMixer
+	if ($LASTEXITCODE -ne 0) { throw "video_mixer simulation copy failed with exit code $LASTEXITCODE." }
+	& vlog -sv -work $library rtl\am2r_native_video.sv rtl\am2r_crt_resync.sv rtl\am2r_video_line_ram.sv rtl\am2r_video_hscale.sv rtl\am2r_crt_video.sv $simMixer sys\scandoubler.v tests\rtl\sim\hq2x_stub.sv sys\gamma_corr.sv sys\video_freezer.sv rtl\am2r_video_out.sv tests\rtl\am2r_video_out_tb.sv
+	if ($LASTEXITCODE -ne 0) { throw "video-output vlog failed with exit code $LASTEXITCODE." }
+	foreach ($hscale in 0, 1) {
+		foreach ($gamma in 0, 1) {
+			& vsim -c -lib $library am2r_video_out_tb "-gHSCALE=$hscale" "-gGAMMA_EN=$gamma" -do 'onerror {quit -code 1}; run -all; quit -code 0'
+			if ($LASTEXITCODE -ne 0) { throw "video-output vsim (H Scale $hscale, gamma $gamma) failed with exit code $LASTEXITCODE." }
+		}
+	}
+
 	& vlog -sv -work $library rtl\am2r_ddr_arbiter.sv tests\rtl\am2r_ddr_arbiter_tb.sv
 	if ($LASTEXITCODE -ne 0) { throw "DDR-arbiter vlog failed with exit code $LASTEXITCODE." }
 

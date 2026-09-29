@@ -331,31 +331,32 @@ assign CLK_VIDEO = clk_video;
 
 // Framework gamma and, when MiSTer.ini forces it for 31 kHz displays, the
 // scandoubler with optional HQ2x. Without forced_scandoubler this is a
-// registered pass-through of the native or CRT-adjusted 15 kHz raster.
+// registered pass-through of the native or CRT-adjusted 15 kHz raster. The
+// gamma stage accepts the H Scaler's continuous pixel enable as well as the
+// native pulsed one; see rtl/am2r_video_out.sv.
 wire vga_de;
-video_mixer #(.LINE_LENGTH(320), .HALF_DEPTH(0), .GAMMA(1)) video_mixer
+am2r_video_out #(.LINE_LENGTH(320)) video_out
 (
-	.CLK_VIDEO(CLK_VIDEO),
-	.CE_PIXEL(CE_PIXEL),
+	.clk(CLK_VIDEO),
 	.ce_pix(crt_ce_pix),
 	.scandoubler(forced_scandoubler),
 	.hq2x(sd_fx == 3'd1),
+	.freeze(HDMI_FREEZE),
 	.gamma_bus(gamma_bus),
-	.R(crt_r),
-	.G(crt_g),
-	.B(crt_b),
-	.HSync(crt_hsync),
-	.VSync(crt_vsync),
-	.HBlank(crt_hblank),
-	.VBlank(crt_vblank),
-	.HDMI_FREEZE(HDMI_FREEZE),
-	.freeze_sync(),
-	.VGA_R(VGA_R),
-	.VGA_G(VGA_G),
-	.VGA_B(VGA_B),
-	.VGA_VS(VGA_VS),
-	.VGA_HS(VGA_HS),
-	.VGA_DE(vga_de)
+	.r(crt_r),
+	.g(crt_g),
+	.b(crt_b),
+	.hsync(crt_hsync),
+	.vsync(crt_vsync),
+	.hblank(crt_hblank),
+	.vblank(crt_vblank),
+	.ce_pix_out(CE_PIXEL),
+	.vga_r(VGA_R),
+	.vga_g(VGA_G),
+	.vga_b(VGA_B),
+	.vga_hs(VGA_HS),
+	.vga_vs(VGA_VS),
+	.vga_de(vga_de)
 );
 
 // Scanline effects apply only to the scandoubled 31 kHz output.
