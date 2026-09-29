@@ -2,10 +2,10 @@
 
 module am2r_native_video_tb #(parameter integer STANDARD = 0);
 	localparam integer PAL = STANDARD >= 2;
-	localparam integer H_TOTAL = PAL ? 400 : 398;
+	localparam integer H_TOTAL = PAL ? 429 : 427;
 	localparam integer V_TOTAL = PAL ? 312 : 262;
 	localparam integer V_SYNC_START = PAL ? 270 : 245;
-	localparam integer PACE_PERIOD = 4 * 398 * 262;
+	localparam integer PACE_PERIOD = 4 * 427 * 262;
 	reg clk = 0;
 	reg reset = 1;
 	reg frame_ready = 1;
@@ -102,7 +102,7 @@ module am2r_native_video_tb #(parameter integer STANDARD = 0);
 			$display("Active area %0d pixels", active_pixels);
 			errors = errors + 1;
 		end
-		if (active_lines != 240 || hsync_pixels != 30 * V_TOTAL || vsync_lines != 3) begin
+		if (active_lines != 240 || hsync_pixels != 32 * V_TOTAL || vsync_lines != 3) begin
 			$display("Timing mismatch active_lines=%0d hsync_pixels=%0d vsync_lines=%0d",
 				active_lines, hsync_pixels, vsync_lines);
 			errors = errors + 1;

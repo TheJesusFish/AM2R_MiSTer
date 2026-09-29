@@ -202,9 +202,9 @@ module am2r_native_reader_late_frame_tb #(parameter integer STANDARD = 0);
 		$finish;
 	end
 
-	// Six rasters plus margin: 100 ms at 59.94 Hz, 120 ms at 50 Hz.
+	// Six rasters plus margin: 130 ms at 59.94 Hz, 160 ms at 50 Hz.
 	initial begin
-		#(STANDARD >= 2 ? 120000000 : 100000000);
+		#(STANDARD >= 2 ? 160000000 : 130000000);
 		$fatal(1, "FAIL: late-frame reader timeout samples=%0d", samples);
 	end
 endmodule

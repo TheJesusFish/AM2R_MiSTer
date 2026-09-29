@@ -1,11 +1,14 @@
 //============================================================================
 // AM2R native 320x240p scanout
 //
-// CLK_VIDEO is a dedicated 25 MHz PLL output. CE_PIXEL divides it by four for
-// a 6.25 MHz effective pixel clock. Two rasters are available:
+// CLK_VIDEO is a dedicated 26.8229 MHz PLL output (50 MHz x 103 / 4 / 48).
+// CE_PIXEL divides it by four for a 6.7057 MHz pixel clock, so the 320 active
+// pixels span 47.7 us: the same active width as the Mega Drive's H40 mode,
+// inside the visible area of typical 15 kHz televisions. Two rasters are
+// available:
 //
-//   60 Hz (NTSC and PAL60): 398x262, 15.704 kHz / 59.94 Hz
-//   50 Hz (PAL):            400x312, 15.625 kHz / 50.08 Hz
+//   60 Hz (NTSC and PAL60): 427x262, 15.704 kHz / 59.94 Hz
+//   50 Hz (PAL):            429x312, 15.631 kHz / 50.10 Hz
 //
 // NTSC and PAL60 share one raster; they differ only in the composite/S-Video
 // colour subcarrier, which Main_MiSTer selects. The 50 Hz raster centres the
@@ -46,19 +49,21 @@ module am2r_native_video
 );
 
 	localparam integer H_ACTIVE = 320;
-	localparam integer H_FP = 16;
-	localparam integer H_SYNC = 30;
+	// 4.2 us front porch and 4.8 us sync; the remaining 7.0 us back porch
+	// centres the 47.7 us image in the standard 52.6 us active window.
+	localparam integer H_FP = 28;
+	localparam integer H_SYNC = 32;
 	localparam integer V_ACTIVE = 240;
 	localparam integer V_SYNC = 3;
 	localparam integer CE_DIV = 4;
 
-	localparam integer H_TOTAL_60 = 398;
+	localparam integer H_TOTAL_60 = 427;
 	localparam integer V_FP_60 = 5;
 	localparam integer V_TOTAL_60 = 262;
 
-	// 6.25 MHz / 400 is exactly PAL's 15.625 kHz line rate. The 50 extra
-	// lines are split around the 60 Hz porches so the image stays centred.
-	localparam integer H_TOTAL_50 = 400;
+	// 429 pixels is the closest line to PAL's 15.625 kHz. The 50 extra lines
+	// are split around the 60 Hz porches so the image stays centred.
+	localparam integer H_TOTAL_50 = 429;
 	localparam integer V_FP_50 = 30;
 	localparam integer V_TOTAL_50 = 312;
 

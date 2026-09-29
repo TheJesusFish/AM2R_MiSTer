@@ -177,8 +177,8 @@ module am2r_crt_video_tb;
 					end
 					have_active_start = 0;
 					if (have_rise) begin
-						if (period_clocks != 1592)
-							$fatal(1, "scaled line period was %0d clocks, expected 1592", period_clocks);
+						if (period_clocks != 1708)
+							$fatal(1, "scaled line period was %0d clocks, expected 1708", period_clocks);
 						line_periods_checked = line_periods_checked + 1;
 					end
 					period_clocks = 0;
@@ -235,7 +235,7 @@ module am2r_crt_video_tb;
 		wait_frames(4);
 		next_output_hsync(3, shifted_hsync);
 		next_output_vsync(shifted_vsync);
-		if (shifted_hsync != ((baseline_hsync + 398 - 3) % 398))
+		if (shifted_hsync != ((baseline_hsync + 427 - 3) % 427))
 			$fatal(1, "H position shift was %0d -> %0d, expected three pixels earlier",
 				baseline_hsync, shifted_hsync);
 		if (shifted_vsync != ((baseline_vsync + 262 + 2) % 262))
