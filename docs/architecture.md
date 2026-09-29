@@ -67,8 +67,8 @@ The command ABI is implemented in `rtl/am2r_gpu.sv` and
   `0x40` and `0x44`;
 - alternating 64 KiB descriptor buffers at `0x23fe0000` and `0x23fd0000`;
 - texture pool beginning at `0x24000000`;
-- three 320×240 XRGB8888 native presentation buffers beginning at
-  `0x3a000100`, stride 1,280;
+- four 320×240 XRGB8888 native presentation buffers beginning at
+  `0x3a000100`, stride 1,280 (the fourth at `0x3a0e1100`);
 - opcodes: end/present, clear, axis blit, solid/vertical-gradient fill, and
   affine blit.
 
@@ -124,14 +124,15 @@ nominal period on an independent HPS clock. Older RBFs, lower room rates, and
 explicit speed overrides retain an absolute timer derived from the raster
 period. The GPU runs at 88 MHz. Its paired-pixel
 fast path resolves two adjacent opaque or transparent pixels per common
-textured draw cycle. Completed frames rotate among three HPS-DDR buffers so the
-GPU can avoid the immutable buffer currently in scanout without waiting a full
-raster; scanout still adopts only the newest complete buffer at a frame
-boundary. It prefetches each line through a show-ahead dual-clock FIFO. A
+textured draw cycle. Completed frames rotate among four HPS-DDR buffers so the
+GPU can avoid the latest published buffer, the one in analog scanout and those
+the HDMI framebuffer reader holds without waiting a full raster; scanout still
+adopts only the newest complete buffer at a frame boundary. It prefetches each line through a show-ahead dual-clock FIFO. A
 dedicated 25 MHz video PLL with pixel enable
 divided by four produces a 398×262 total raster: 320×240 active, 15.704 kHz and
-59.94 Hz. `VGA_SCALER=0` keeps the core-owned 15 kHz raster on analog VGA while
-the framework can process the same timing for HDMI. ALSA feeds MiSTer's normal
+59.94 Hz. `VGA_SCALER=0` keeps the core-owned 15 kHz raster on analog VGA, while
+HDMI reads the published frames directly through the framework framebuffer
+interface (`rtl/am2r_hdmi_fb.sv`). ALSA feeds MiSTer's normal
 audio mixer independently. Input is sampled from `MiSTer virtual input` at the
 runtime event boundary. The HPS frontend traps normal/error exits and reloads
 `/media/fat/menu.rbf`; Weapon Select+Start requests a normal runner exit. The

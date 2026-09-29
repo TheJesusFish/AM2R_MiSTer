@@ -1,6 +1,6 @@
 // DDR-backed native scanout, adapted to AM2R from the line-on-demand design
 // used by 3s-mister-arm. The GPU publishes complete XRGB8888 frames into one
-// of three DDR buffers. This reader preloads 32 lines at vblank and keeps that
+// of four DDR buffers. This reader preloads 32 lines at vblank and keeps that
 // lead topped up through a dual-clock FIFO. Refilling from FIFO occupancy,
 // rather than from one-shot line pulses, also lets scanout catch up after a
 // delayed DDR burst instead of permanently losing its prefetch margin.

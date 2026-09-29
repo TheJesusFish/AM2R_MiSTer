@@ -16,6 +16,7 @@
 #define NATIVE_BUF0_PHYS 0x3a000100u
 #define NATIVE_BUF1_PHYS 0x3a04b100u
 #define NATIVE_BUF2_PHYS 0x3a096100u
+#define NATIVE_BUF3_PHYS 0x3a0e1100u
 #define NATIVE_BUF_BYTES (320u * 240u * 4u)
 
 typedef struct { uint64_t word[8]; } Command;
@@ -133,10 +134,10 @@ int main(void)
            " other_tint=%" PRIu64 " gradient=%" PRIu64 "\n",
            whiteArea, alphaOnlyArea, otherTintArea, gradientArea);
 
-	const uint32_t nativePhys[3] = {
-		NATIVE_BUF0_PHYS, NATIVE_BUF1_PHYS, NATIVE_BUF2_PHYS
+	const uint32_t nativePhys[4] = {
+		NATIVE_BUF0_PHYS, NATIVE_BUF1_PHYS, NATIVE_BUF2_PHYS, NATIVE_BUF3_PHYS
 	};
-	for (uint32_t buffer = 0; buffer < 3; ++buffer) {
+	for (uint32_t buffer = 0; buffer < 4; ++buffer) {
         uint32_t pageBase = nativePhys[buffer] & ~4095u;
         size_t pageOffset = nativePhys[buffer] - pageBase;
         size_t mapBytes = pageOffset + NATIVE_BUF_BYTES;

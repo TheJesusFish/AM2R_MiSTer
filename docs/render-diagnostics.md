@@ -220,7 +220,7 @@ to stop it early. Exiting mid-pass leaves an empty/incomplete output, not valid 
 Set `AM2R_GPU_CAPTURE_DIR` to an existing absolute QA directory before launching
 the diagnostic runner. An empty regular `capture.request` inside that directory
 requests one GPU job. It creates a fresh `job-<pid>-<sequence>-<attempt>` directory
-with commands, the allocated texture-pool prefix, all three native buffers,
+with commands, the allocated texture-pool prefix, all four native buffers,
 completed output, and any exports. A final `manifest.json` is the completion
 marker. Partial directories without it are invalid. Capture is bounded to eight
 requests per process and 128 MiB of texture input per job; storage is checked

@@ -88,7 +88,10 @@ taller 50 Hz frame. The game still runs at full 60 Hz speed in PAL mode, so
 one frame in six is not displayed.
 
 **Scale** provides MiSTer's standard HDMI integer-scaling modes. Gamma curves
-from the MiSTer video menu apply to both outputs. With `forced_scandoubler=1`
+from the MiSTer video menu apply to the analog output, and to HDMI only with
+`direct_video=1`. Normal HDMI output reads the rendered 320×240 frames
+directly from DDR (see below), so it is not gamma corrected; the framework
+scaler has no gamma stage for 32-bit framebuffers. With `forced_scandoubler=1`
 in MiSTer.ini, the analog output is line-doubled to 31 kHz for VGA monitors,
 and **Scandoubler Fx** offers HQ2x or scanlines. For HDMI, `vsync_adjust=1` or
 `vsync_adjust=2` in MiSTer.ini matches the output refresh to the core instead

@@ -14,7 +14,7 @@
 #define CONTROL_PHYS UINT32_C(0x23ff0000)
 #define NATIVE_PHYS UINT32_C(0x3a000000)
 #define FRAME_BYTES (320u * 240u * 4u)
-#define NATIVE_BYTES (256u + 3u * FRAME_BYTES)
+#define NATIVE_BYTES (256u + 4u * FRAME_BYTES)
 #define GPU_MAGIC UINT32_C(0x50473241)
 
 int main(int argc, char **argv)
@@ -37,7 +37,7 @@ int main(int argc, char **argv)
         uint32_t sequence = control[6], completion = control[7];
         uint32_t frame = control[19];
         unsigned buffer = completion >> 30;
-        if (control[0] == GPU_MAGIC && sequence && buffer < 3 &&
+        if (control[0] == GPU_MAGIC && sequence && buffer < 4 &&
             sequence == control[1]) {
             __sync_synchronize();
             memcpy(snapshot, native + 256u + buffer * FRAME_BYTES, FRAME_BYTES);

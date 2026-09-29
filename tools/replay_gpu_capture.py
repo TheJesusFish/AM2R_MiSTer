@@ -29,6 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
 COMMAND_BASE = 0x23FE0000
 CONTROL_BASE = 0x23FF0000
 NATIVE_BASE = 0x3A000100
+NATIVE_BUFFER_COUNT = 4
 MAX_REPLAY_BYTES = 136 * 1024 * 1024
 
 
@@ -49,7 +50,7 @@ def prepare(path: Path, directory: Path) -> tuple[reference.RenderResult, dict, 
     native = manifest.get("native_source_base")
     native = reference._integer(native, "native_source_base") if native is not None else None
     result = reference.render(commands, regions, initial, native_source_base=native)
-    if native is not None and native not in [NATIVE_BASE + i * reference.FRAME_BYTES for i in range(3)]:
+    if native is not None and native not in [NATIVE_BASE + i * reference.FRAME_BYTES for i in range(NATIVE_BUFFER_COUNT)]:
         raise reference.CaptureError("native_source_base is not an actual AM2R native buffer")
     prior_native = 0 if native is None else (native - NATIVE_BASE) // reference.FRAME_BYTES
     memory = dict(regions)
@@ -83,7 +84,7 @@ def prepare(path: Path, directory: Path) -> tuple[reference.RenderResult, dict, 
             del memory[start]
         memory[first] = bytes(merged)
 
-    for index in range(3):
+    for index in range(NATIVE_BUFFER_COUNT):
         reserve_output(NATIVE_BASE + index * reference.FRAME_BYTES, reference.FRAME_BYTES)
     exports = sorted(result.exports)
     for base in exports:
