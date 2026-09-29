@@ -9,6 +9,7 @@ module am2r_gpu_tb;
 	localparam [28:0] NATIVE_BUF0_WORD = 32'h3a000100 >> 3;
 	localparam [28:0] NATIVE_BUF1_WORD = 32'h3a04b100 >> 3;
 	localparam [28:0] NATIVE_BUF2_WORD = 32'h3a096100 >> 3;
+	localparam [28:0] NATIVE_BUF3_WORD = 32'h3a0e1100 >> 3;
 	localparam integer FB_WORDS = 320 * 240 / 2;
 
 	reg clk = 0;
@@ -26,6 +27,7 @@ module am2r_gpu_tb;
 	wire [1:0] native_buffer;
 	reg scan_buffer_valid = 0;
 	reg [1:0] scan_buffer = 0;
+	reg [3:0] hdmi_protect = 0;
 	reg scan_underflow_toggle = 0;
 
 	reg [63:0] control [0:10];
@@ -56,7 +58,7 @@ module am2r_gpu_tb;
 		.ddram_addr(ddram_addr), .ddram_dout(ddram_dout),
 		.ddram_dout_ready(ddram_dout_ready), .ddram_rd(ddram_rd),
 		.ddram_din(ddram_din), .ddram_be(ddram_be), .ddram_we(ddram_we),
-		.scan_buffer_valid(scan_buffer_valid), .scan_buffer(scan_buffer),
+		.scan_buffer_valid(scan_buffer_valid), .scan_buffer(scan_buffer), .hdmi_protect(hdmi_protect),
 		.scan_underflow_toggle(scan_underflow_toggle),
 		.native_frame(native_frame), .native_buffer(native_buffer)
 	);
@@ -82,6 +84,8 @@ module am2r_gpu_tb;
 				read_memory = captured_frame[address - NATIVE_BUF1_WORD];
 			else if (address >= NATIVE_BUF2_WORD && address < NATIVE_BUF2_WORD + FB_WORDS)
 				read_memory = captured_frame[address - NATIVE_BUF2_WORD];
+			else if (address >= NATIVE_BUF3_WORD && address < NATIVE_BUF3_WORD + FB_WORDS)
+				read_memory = captured_frame[address - NATIVE_BUF3_WORD];
 		end
 	endfunction
 
@@ -109,6 +113,8 @@ module am2r_gpu_tb;
 				captured_frame[address - NATIVE_BUF1_WORD] = data;
 			end else if (address >= NATIVE_BUF2_WORD && address < NATIVE_BUF2_WORD + FB_WORDS) begin
 				captured_frame[address - NATIVE_BUF2_WORD] = data;
+			end else if (address >= NATIVE_BUF3_WORD && address < NATIVE_BUF3_WORD + FB_WORDS) begin
+				captured_frame[address - NATIVE_BUF3_WORD] = data;
 			end else if (address >= EXPORT_WORD && address < EXPORT_WORD + FB_WORDS) begin
 				exported_frame[address - EXPORT_WORD] = data;
 			end else begin
@@ -540,8 +546,8 @@ module am2r_gpu_tb;
 
 		// Once scanout has latched buffer 0, the next frame may publish buffer
 		// 1. A third frame must use buffer 2 immediately rather than overwrite
-		// buffer 0 or wait a complete raster. Further jobs may alternate the two
-		// free buffers while scanout remains on buffer 0.
+		// buffer 0 or wait a complete raster. Further jobs use any buffer that
+		// is neither latched by scanout nor the latest published frame.
 		scan_buffer_valid = 1;
 		scan_buffer = 2'd0;
 		control[0] = (64'd2 << 32) | 64'h50473241;
@@ -564,10 +570,36 @@ module am2r_gpu_tb;
 		end
 		control[0] = (64'd4 << 32) | 64'h50473241;
 		wait (control[3][31:0] == 4);
-		if (native_frame != 4 || native_buffer != 2'd1) begin
+		if (native_frame != 4 || native_buffer != 2'd3) begin
 			$display("GPU did not keep the active scanout buffer immutable");
 			errors = errors + 1;
 		end
+
+		// Buffers held by the HDMI framebuffer reader are equally immutable.
+		// Scanout holds 0, HDMI holds 1 and 3 is the latest frame: only 2 is free.
+		hdmi_protect = 4'b0010;
+		control[0] = (64'd41 << 32) | 64'h50473241;
+		wait (control[3][31:0] == 41);
+		if (native_frame != 5 || native_buffer != 2'd2) begin
+			$display("GPU overwrote a buffer held by the HDMI reader (buffer=%0d)", native_buffer);
+			errors = errors + 1;
+		end
+		// With 0 (scanout), 1 and 3 (HDMI) and 2 (latest) all held, the next
+		// presentation must wait instead of overwriting any of them.
+		hdmi_protect = 4'b1010;
+		control[0] = (64'd42 << 32) | 64'h50473241;
+		repeat (400000) @(posedge clk);
+		if (control[3][31:0] == 42 || native_frame != 5) begin
+			$display("GPU published while every native buffer was held");
+			errors = errors + 1;
+		end
+		hdmi_protect = 4'b1000;
+		wait (control[3][31:0] == 42);
+		if (native_frame != 6 || native_buffer != 2'd1) begin
+			$display("GPU did not use the buffer the HDMI reader released (buffer=%0d)", native_buffer);
+			errors = errors + 1;
+		end
+		hdmi_protect = 4'b0000;
 
 		// A scanout underflow crosses from the video clock as a toggle. The
 		// completion word must report it once without contaminating the 29-bit

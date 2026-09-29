@@ -155,6 +155,12 @@ try {
 		}
 	}
 
+	& vlog -sv -work $library rtl\am2r_hdmi_fb.sv tests\rtl\am2r_hdmi_fb_tb.sv
+	if ($LASTEXITCODE -ne 0) { throw "HDMI-framebuffer vlog failed with exit code $LASTEXITCODE." }
+
+	& vsim -c -lib $library am2r_hdmi_fb_tb -do 'onerror {quit -code 1}; run -all; quit -code 0'
+	if ($LASTEXITCODE -ne 0) { throw "HDMI-framebuffer vsim failed with exit code $LASTEXITCODE." }
+
 	& vlog -sv -work $library rtl\am2r_ddr_arbiter.sv tests\rtl\am2r_ddr_arbiter_tb.sv
 	if ($LASTEXITCODE -ne 0) { throw "DDR-arbiter vlog failed with exit code $LASTEXITCODE." }
 

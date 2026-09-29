@@ -48,7 +48,7 @@ module am2r_gpu_replay_tb;
         .ddram_burstcnt(ddram_burstcnt), .ddram_addr(ddram_addr),
         .ddram_dout(ddram_dout), .ddram_dout_ready(ddram_dout_ready),
         .ddram_rd(ddram_rd), .ddram_din(ddram_din), .ddram_be(ddram_be),
-        .ddram_we(ddram_we), .scan_buffer_valid(1'b0), .scan_buffer(2'b0),
+        .ddram_we(ddram_we), .scan_buffer_valid(1'b0), .scan_buffer(2'b0), .hdmi_protect(4'b0),
         .scan_underflow_toggle(1'b0), .native_frame(native_frame),
         .native_buffer(native_buffer)
     );
