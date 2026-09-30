@@ -1846,12 +1846,15 @@ module am2r_gpu
 							generic_state <= GP_TINT_RESULT;
 						end
 						GP_TINT_RESULT: begin
+							// Stage tint independently of alpha rejection. Rejected
+							// pixels skip its consumers, so the comparison need not
+							// be on the shared tint/DSP register-enable path.
+							tinted_pixel <= {generic_tint_product[3][39:32],
+								generic_fog ? generic_fog_color[23:0] :
+								{generic_tint_product[2][39:32], generic_tint_product[1][39:32], generic_tint_product[0][39:32]}};
 							if (generic_alpha_test && generic_tint_product[3][39:32] < generic_alpha_ref)
 								advance_generic_pixel();
 							else begin
-								tinted_pixel <= {generic_tint_product[3][39:32],
-									generic_fog ? generic_fog_color[23:0] :
-									{generic_tint_product[2][39:32], generic_tint_product[1][39:32], generic_tint_product[0][39:32]}};
 								generic_state <= GP_FACTORS;
 							end
 						end
