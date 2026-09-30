@@ -84,18 +84,33 @@ localparam CONF_STR = {
 };
 
 wire         forced_scandoubler;
+wire         direct_video;
 wire  [21:0] gamma_bus;
 wire   [1:0] buttons;
 wire [127:0] status;
 
+// Normal HDMI uses the fixed 320x240 framebuffer, so Main must measure the
+// native raster, not sync pulses shifted by the analog CRT controls. In
+// particular, an extreme V position can move VSync into active picture and
+// corrupt the framework's measured height. Direct video still needs the real
+// adjusted timing for its HDMI metadata. Preserve every clock and all lower
+// bidirectional command/response bits; only select CE/DE/HS/VS here.
+wire native_de = ~(hblank | vblank);
+wire [3:0] measured_video = direct_video ? HPS_BUS[41:38] :
+	{ce_pix, native_de, hsync, vsync};
+
 hps_io #(.CONF_STR(CONF_STR)) hps_io
 (
 	.clk_sys(clk_sys),
-	.HPS_BUS(HPS_BUS),
+	.HPS_BUS({HPS_BUS[45:42], measured_video, HPS_BUS[37:0]}),
 	.EXT_BUS(),
 	.gamma_bus(gamma_bus),
 	.status_menumask({15'd0, ~forced_scandoubler}),
 	.forced_scandoubler(forced_scandoubler),
+	.direct_video(direct_video),
+	// PAL and NTSC share active dimensions; explicitly notify Main when the
+	// latched raster period changes even though the measured size does not.
+	.new_vmode(native_pal),
 	.buttons(buttons),
 	.status(status)
 );

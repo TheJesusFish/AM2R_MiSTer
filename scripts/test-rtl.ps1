@@ -152,6 +152,12 @@ try {
         if ($LASTEXITCODE -ne 0) { throw "vlib failed with exit code $LASTEXITCODE." }
     }
 
+    # Exercise the actual framework measurement logic through source-derived
+    # core wiring. Includes rejection witnesses for the old CRT-coupled bus
+    # and missing live PAL/NTSC notification; SYS is never edited.
+    & python scripts\test-hps-video-measurement.py
+    if ($LASTEXITCODE -ne 0) { throw 'HPS video measurement regression failed.' }
+
     & vlog -sv -work $library rtl\am2r_native_video.sv tests\rtl\am2r_native_video_tb.sv
     if ($LASTEXITCODE -ne 0) { throw "native-video vlog failed with exit code $LASTEXITCODE." }
 
