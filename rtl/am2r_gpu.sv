@@ -111,7 +111,11 @@ module am2r_gpu
 	reg signed [31:0] u_y_step, v_x_step;
 	reg signed [31:0] u_current, u_next, v_current;
 	reg signed [31:0] u_min, u_max, v_min, v_max;
-	reg [31:0] source_row_addr, source_byte_addr, source_byte_addr_1, tint_color;
+	// Keep the completed row address at this pipeline boundary. Retiming it
+	// into the row multiply joins its base add to the next pixel/cache lookup
+	// and DDR request enable, exceeding the GPU clock budget.
+	(* preserve *) reg [31:0] source_row_addr;
+	reg [31:0] source_byte_addr, source_byte_addr_1, tint_color;
 	reg [15:0] source_row_index_stage;
 	reg [31:0] source_stride_stage, tint_color_stage;
 	reg signed [24:0] tint_r_current, tint_g_current, tint_b_current, tint_a_current;
