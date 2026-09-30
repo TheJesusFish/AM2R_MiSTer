@@ -17,7 +17,8 @@ set_global_assignment -name LAST_QUARTUS_VERSION "17.0.2 Lite Edition"
 
 set_global_assignment -name GENERATE_RBF_FILE ON
 set_global_assignment -name PROJECT_OUTPUT_DIRECTORY output_files
-set_global_assignment -name NUM_PARALLEL_PROCESSORS ALL
+# Keep the default worker pool bounded on shared build machines.
+set_global_assignment -name NUM_PARALLEL_PROCESSORS 4
 set_global_assignment -name SAVE_DISK_SPACE OFF
 set_global_assignment -name SMART_RECOMPILE ON
 set_global_assignment -name MIN_CORE_JUNCTION_TEMP "-40"
@@ -32,9 +33,9 @@ set_global_assignment -name OPTIMIZATION_MODE "HIGH PERFORMANCE EFFORT"
 set_global_assignment -name ALLOW_POWER_UP_DONT_CARE ON
 set_global_assignment -name QII_AUTO_PACKED_REGISTERS NORMAL
 set_global_assignment -name ROUTER_LCELL_INSERTION_AND_LOGIC_DUPLICATION ON
-# Quartus 17 Boolean resynthesis becomes excessively slow on the registered
-# blend-product datapath. Keep the independent register optimizations enabled;
-# the unchanged TimeQuest requirements still gate every generated release.
+# Bound optional combinational optimization effort while retaining independent
+# register optimizations. Build duration does not identify an optimizer fault;
+# unchanged TimeQuest requirements still gate every generated release.
 set_global_assignment -name PHYSICAL_SYNTHESIS_COMBO_LOGIC OFF
 set_global_assignment -name PHYSICAL_SYNTHESIS_REGISTER_DUPLICATION ON
 set_global_assignment -name PHYSICAL_SYNTHESIS_REGISTER_RETIMING ON
