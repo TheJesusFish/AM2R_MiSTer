@@ -4,6 +4,8 @@
 // identical two-clock CALCULATE/COMMIT latency and native integer pixels.
 // The optional exhaustive check calls the production product combiner for
 // every 8-bit source/destination/alpha combination in both normal/add modes.
+// It also checks fused additive arithmetic over the complete 16-bit product
+// domain, including the historical quotient's wrap for products FF00..FFFF.
 module am2r_gpu_blend_pipeline_tb;
 	reg clk = 0, reset = 1;
 	am2r_gpu dut (
@@ -19,6 +21,8 @@ module am2r_gpu_blend_pipeline_tb;
 	integer mode, lane, a, b, s, d, i, channel;
 	integer divisor_input;
 	reg [16:0] divisor_reference;
+	reg [8:0] additive_reference;
+	reg [7:0] additive_got, additive_expected;
 	reg [31:0] random_state = 32'h461fee29;
 	reg [31:0] source0, source1, destination0, destination1;
 	reg [31:0] got, expected;
@@ -122,6 +126,22 @@ module am2r_gpu_blend_pipeline_tb;
 		$display("PASS blend pipeline: %0d scalar/pair cases, exactly 2 clocks each (CALCULATE + COMMIT)", cases_run);
 
 `ifdef CHECK_BLEND_PRODUCTS_EXHAUSTIVE
+		// Use the OLD shift/add divider expression, not the production helper
+		// or /255. Above the reachable 8x8 product range its byte return wraps;
+		// the fused helper must preserve that complete historical domain too.
+		for (divisor_input = 0; divisor_input < 65536; divisor_input = divisor_input + 1) begin
+			divisor_reference = 17'(divisor_input) + 17'd1 + (17'(divisor_input) >> 8);
+			for (d = 0; d < 256; d = d + 1) begin
+				additive_reference = {1'b0, divisor_reference[15:8]} + 9'(d);
+				additive_expected = additive_reference[8] ? 8'hff : additive_reference[7:0];
+				additive_got = dut.saturating_add_product(d[7:0], divisor_input[15:0]);
+				if (additive_got !== additive_expected)
+					$fatal(1, "Fused additive mismatch product=%h dst=%h got=%h expected=%h",
+						divisor_input[15:0], d[7:0], additive_got, additive_expected);
+			end
+		end
+		$display("PASS fused additive: all 16777216 product/destination combinations preserve historical byte-wrap and saturation");
+
 		// Zero-delay exhaustive arithmetic; the stateful checks above already
 		// exercise the actual registers and byte/lane mapping.
 		for (mode = 0; mode < 2; mode = mode + 1) begin

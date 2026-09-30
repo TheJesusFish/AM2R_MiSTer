@@ -234,6 +234,11 @@ try {
 
     Invoke-VideoSimulation 'am2r_gpu_row_pipeline_tb'
 
+    & vlog -sv -work $library rtl\am2r_gpu.sv tests\rtl\am2r_gpu_surface_address_tb.sv
+    if ($LASTEXITCODE -ne 0) { throw 'GPU surface address vlog failed.' }
+
+    Invoke-VideoSimulation 'am2r_gpu_surface_address_tb'
+
     & vlog -sv -work $library rtl\am2r_gpu.sv tests\rtl\am2r_gpu_tb.sv
     if ($LASTEXITCODE -ne 0) { throw "GPU vlog failed with exit code $LASTEXITCODE." }
 

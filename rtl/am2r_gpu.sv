@@ -165,6 +165,9 @@ module am2r_gpu
 	reg [31:0] surface_row_addr, surface_stride;
 	reg [15:0] surface_width, surface_height, surface_row;
 	reg [16:0] surface_row_linear;
+	// Stage the invariant row origin in the existing burst-setup cycle.
+	// Keep subtraction and odd-bank adjustment out of each issued RAM read.
+	(* preserve *) reg [15:0] surface_read_base, surface_read_base_plus1;
 	reg [8:0] surface_row_words, surface_word_index;
 	reg surface_first_lane, surface_pixel_odd;
 	reg [7:0] surface_be_pipe0, surface_be_pipe1;
@@ -337,8 +340,9 @@ module am2r_gpu
 		{7'b0, surface_load_pixel} - {16'b0, surface_first_lane};
 	wire [8:0] surface_issue_word = surface_word_index + {1'b0, framebuffer_reads_issued};
 	wire [9:0] surface_issue_pixel = {surface_issue_word, 1'b0};
-	wire [16:0] surface_issue_linear = surface_row_linear +
-		{7'b0, surface_issue_pixel} - {16'b0, surface_first_lane};
+	wire [16:0] surface_row_origin = surface_row_linear - {16'b0, surface_first_lane};
+	wire [15:0] surface_issue_address = surface_read_base + {7'd0, surface_issue_word};
+	wire [15:0] surface_issue_address_plus1 = surface_read_base_plus1 + {7'd0, surface_issue_word};
 	wire surface_issue_valid0 = !(surface_issue_word == 0 && surface_first_lane);
 	wire surface_issue_valid1 = surface_issue_pixel + 10'd1 <
 		{1'b0, surface_width[8:0]} + {9'b0, surface_first_lane};
@@ -450,6 +454,25 @@ module am2r_gpu
 		begin
 			sum = a + b;
 			saturating_add = sum[8] ? 8'hff : sum[7:0];
+		end
+	endfunction
+
+	function automatic [7:0] saturating_add_product;
+		input [7:0] destination;
+		input [15:0] product;
+		reg correction;
+		reg [9:0] doubled_sum;
+		begin
+			// Insert the /255 correction as the low-bit carry of ONE adder.
+			// Dropping bit0 gives destination + product[15:8] + correction,
+			// without a quotient increment followed by a second carry chain.
+			correction = product[7:0] >= ~product[15:8];
+			doubled_sum = {1'b0, destination, 1'b1} +
+				{1'b0, product[15:8], correction};
+			// Preserve historical div255_floor byte wrap over the full16-bit
+			// domain, even though an8x8 product cannot reach this high byte.
+			saturating_add_product = (&product[15:8]) ? destination :
+				(doubled_sum[9] ? 8'hff : doubled_sum[8:1]);
 		end
 	endfunction
 
@@ -634,9 +657,9 @@ module am2r_gpu
 			// Inverse-source modulation has its own registered pipeline below.
 			if (src[31:24] == 0) blended_pixel_products = dst;
 			else if (add_mode) begin
-				blended_pixel_products[7:0] = saturating_add(dst[7:0], div255_floor({1'b0, source_products[15:0]}));
-				blended_pixel_products[15:8] = saturating_add(dst[15:8], div255_floor({1'b0, source_products[31:16]}));
-				blended_pixel_products[23:16] = saturating_add(dst[23:16], div255_floor({1'b0, source_products[47:32]}));
+				blended_pixel_products[7:0] = saturating_add_product(dst[7:0], source_products[15:0]);
+				blended_pixel_products[15:8] = saturating_add_product(dst[15:8], source_products[31:16]);
+				blended_pixel_products[23:16] = saturating_add_product(dst[23:16], source_products[47:32]);
 				blended_pixel_products[31:24] = saturating_add(dst[31:24], src[31:24]);
 			end else if (src[31:24] == 8'hff) blended_pixel_products = src;
 			else begin
@@ -711,12 +734,12 @@ module am2r_gpu
 	task automatic issue_surface_pair;
 		begin
 			if (surface_pixel_odd) begin
-				fb_odd_read_address <= surface_issue_valid0 ? surface_issue_linear[16:1] : 16'd0;
+				fb_odd_read_address <= surface_issue_valid0 ? surface_issue_address : 16'd0;
 				fb_even_read_address <= surface_issue_valid1 ?
-					(surface_issue_linear[16:1] + 16'd1) : 16'd0;
+					surface_issue_address_plus1 : 16'd0;
 			end else begin
-				fb_even_read_address <= surface_issue_valid0 ? surface_issue_linear[16:1] : 16'd0;
-				fb_odd_read_address <= surface_issue_valid1 ? surface_issue_linear[16:1] : 16'd0;
+				fb_even_read_address <= surface_issue_valid0 ? surface_issue_address : 16'd0;
+				fb_odd_read_address <= surface_issue_valid1 ? surface_issue_address : 16'd0;
 			end
 			surface_be_pipe0 <= {{4{surface_issue_valid1}}, {4{surface_issue_valid0}}};
 			framebuffer_reads_issued <= framebuffer_reads_issued + 1'b1;
@@ -1925,6 +1948,8 @@ module am2r_gpu
 					endcase
 				end
 				ST_SURFACE_BURST: begin
+					surface_read_base <= surface_row_origin[16:1];
+					surface_read_base_plus1 <= surface_row_origin[16:1] + 16'd1;
 					framebuffer_write_burst_length <= surface_burst_words;
 					framebuffer_write_beats_left <= surface_burst_words;
 					if (surface_store) begin
