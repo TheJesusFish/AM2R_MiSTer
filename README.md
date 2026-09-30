@@ -50,8 +50,9 @@ message before loading or copying a slot.
 
 Save/load time depends on snapshot size and storage. Earlier USB-1 tests of
 1.53 MB gameplay states took 0.28–0.68 seconds to save and 0.40–0.49 seconds
-to load. September 30 tests of a 10.54 MB late-game state took 2.36–8.30 seconds
-to save and 0.84–0.89 seconds to load; large states are not instantaneous.
+to load. Final September 30 tests of a 10.54 MB late-game state took 1.84–1.92
+seconds to save and 0.84–0.88 seconds to load. Earlier runs took up to 8.30
+seconds to save the same-sized state; large states are not instantaneous.
 States survive a core exit and can be overwritten after loading. Legacy
 `.dmtcp` files are left untouched but are not logical-state slots and cannot
 be converted to `.fast`.
