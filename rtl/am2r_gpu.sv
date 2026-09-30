@@ -127,6 +127,10 @@ module am2r_gpu
 	reg [31:0] tinted_pixel_1;
 	reg [31:0] blended_pixel_result0, blended_pixel_result1;
 	(* preserve *) reg [31:0] blend_destination0, blend_destination1;
+	// The existing CALCULATE/COMMIT stages split DSP products from the
+	// weighted sum, /255 and saturation. No extra pixel or pair cycle.
+	(* preserve *) reg [47:0] blend_source_product0, blend_source_product1;
+	(* preserve *) reg [63:0] blend_destination_product0, blend_destination_product1;
 	reg [15:0] tint_product [0:7];
 	reg [31:0] subtract_destination0, subtract_destination1;
 	reg [31:0] subtract_factor0, subtract_factor1;
@@ -598,16 +602,33 @@ module am2r_gpu
 	assign ddram_be = state == ST_SURFACE_STORE_STREAM ?
 		surface_fifo_be[framebuffer_fifo_read_ptr] : ddram_be_control;
 
-	function automatic [31:0] blended_pixel;
+	function automatic [31:0] blended_pixel_products;
 		input [31:0] src, dst;
+		input [47:0] source_products;
+		input [63:0] destination_products;
+		input add_mode;
 		begin
 			// Inverse-source modulation has its own registered pipeline below.
-			if (src[31:24] == 0) blended_pixel = dst;
-			else if (additive_mode) blended_pixel = additive_blend(src, dst);
-			else if (src[31:24] == 8'hff) blended_pixel = src;
-			else blended_pixel = alpha_blend(src, dst);
+			if (src[31:24] == 0) blended_pixel_products = dst;
+			else if (add_mode) begin
+				blended_pixel_products[7:0] = saturating_add(dst[7:0], div255_floor({1'b0, source_products[15:0]}));
+				blended_pixel_products[15:8] = saturating_add(dst[15:8], div255_floor({1'b0, source_products[31:16]}));
+				blended_pixel_products[23:16] = saturating_add(dst[23:16], div255_floor({1'b0, source_products[47:32]}));
+				blended_pixel_products[31:24] = saturating_add(dst[31:24], src[31:24]);
+			end else if (src[31:24] == 8'hff) blended_pixel_products = src;
+			else begin
+				blended_pixel_products[7:0] = div255_floor({1'b0, source_products[15:0]} + {1'b0, destination_products[15:0]});
+				blended_pixel_products[15:8] = div255_floor({1'b0, source_products[31:16]} + {1'b0, destination_products[31:16]});
+				blended_pixel_products[23:16] = div255_floor({1'b0, source_products[47:32]} + {1'b0, destination_products[47:32]});
+				blended_pixel_products[31:24] = src[31:24] + div255_floor({1'b0, destination_products[63:48]});
+			end
 		end
 	endfunction
+
+	wire [31:0] blend_commit0 = subtract_mode ? blended_pixel_result0 :
+		blended_pixel_products(tinted_pixel, blend_destination0, blend_source_product0, blend_destination_product0, additive_mode);
+	wire [31:0] blend_commit1 = subtract_mode ? blended_pixel_result1 :
+		blended_pixel_products(tinted_pixel_1, blend_destination1, blend_source_product1, blend_destination_product1, additive_mode);
 
 	// Keep the wide M10K bank-output mux out of the normal/add blend DSP path.
 	// The extra operand register costs one clock per blended scalar/pair only;
@@ -1600,18 +1621,30 @@ module am2r_gpu
 					else stage_blend();
 				end
 				ST_BLEND_CALCULATE: begin
-					blended_pixel_result0 <= blended_pixel(tinted_pixel, blend_destination0);
-					blended_pixel_result1 <= blended_pixel(tinted_pixel_1, blend_destination1);
+					blend_source_product0[15:0] <= tinted_pixel[7:0] * tinted_pixel[31:24];
+					blend_source_product0[31:16] <= tinted_pixel[15:8] * tinted_pixel[31:24];
+					blend_source_product0[47:32] <= tinted_pixel[23:16] * tinted_pixel[31:24];
+					blend_destination_product0[15:0] <= blend_destination0[7:0] * (8'd255 - tinted_pixel[31:24]);
+					blend_destination_product0[31:16] <= blend_destination0[15:8] * (8'd255 - tinted_pixel[31:24]);
+					blend_destination_product0[47:32] <= blend_destination0[23:16] * (8'd255 - tinted_pixel[31:24]);
+					blend_destination_product0[63:48] <= blend_destination0[31:24] * (8'd255 - tinted_pixel[31:24]);
+					blend_source_product1[15:0] <= tinted_pixel_1[7:0] * tinted_pixel_1[31:24];
+					blend_source_product1[31:16] <= tinted_pixel_1[15:8] * tinted_pixel_1[31:24];
+					blend_source_product1[47:32] <= tinted_pixel_1[23:16] * tinted_pixel_1[31:24];
+					blend_destination_product1[15:0] <= blend_destination1[7:0] * (8'd255 - tinted_pixel_1[31:24]);
+					blend_destination_product1[31:16] <= blend_destination1[15:8] * (8'd255 - tinted_pixel_1[31:24]);
+					blend_destination_product1[47:32] <= blend_destination1[23:16] * (8'd255 - tinted_pixel_1[31:24]);
+					blend_destination_product1[63:48] <= blend_destination1[31:24] * (8'd255 - tinted_pixel_1[31:24]);
 					state <= pair_mode ? ST_PAIR_BLEND_COMMIT : ST_BLEND_COMMIT;
 				end
 				ST_BLEND_COMMIT: begin
 					fb_even_write_address <= destination_word;
 					fb_odd_write_address <= destination_word;
 					if (destination_odd) begin
-						fb_odd_write_data <= blended_pixel_result0;
+						fb_odd_write_data <= blend_commit0;
 						fb_odd_we <= 1;
 					end else begin
-						fb_even_write_data <= blended_pixel_result0;
+						fb_even_write_data <= blend_commit0;
 						fb_even_we <= 1;
 					end
 					advance_blit_pixel();
@@ -1678,14 +1711,14 @@ module am2r_gpu
 				ST_PAIR_BLEND_COMMIT: begin
 					if (destination_odd) begin
 						fb_odd_write_address <= destination_word;
-						fb_odd_write_data <= blended_pixel_result0;
+						fb_odd_write_data <= blend_commit0;
 						fb_even_write_address <= destination_word + 1'b1;
-						fb_even_write_data <= blended_pixel_result1;
+						fb_even_write_data <= blend_commit1;
 					end else begin
 						fb_even_write_address <= destination_word;
-						fb_even_write_data <= blended_pixel_result0;
+						fb_even_write_data <= blend_commit0;
 						fb_odd_write_address <= destination_word;
-						fb_odd_write_data <= blended_pixel_result1;
+						fb_odd_write_data <= blend_commit1;
 					end
 					fb_even_we <= 1;
 					fb_odd_we <= 1;
