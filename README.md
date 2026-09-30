@@ -101,6 +101,15 @@ and **Scandoubler Fx** offers HQ2x or scanlines. For HDMI, `vsync_adjust=1` or
 `vsync_adjust=2` in MiSTer.ini matches the output refresh to the core instead
 of periodically repeating or dropping a frame.
 
+PAL requests synced HDMI at approximately 50.10 Hz. In hardware testing,
+`video_mode=8` with `vsync_adjust=2` produced a black UGREEN capture, including
+the OSD, although game rendering continued. Keeping HDMI at its configured
+refresh with `vsync_adjust=0` restored capture without changing the PAL analog
+raster. If this combination loses the HDMI picture on your setup, use
+`vsync_adjust=0` in the `[AM2R]` section, or select NTSC/PAL60. The 50.10 Hz
+HDMI output still needs independent display/signal validation; a black capture
+alone does not establish whether the source timing or receiver is responsible.
+
 ## CRT adjustments
 
 The core's **CRT Adjustments** submenu provides signed horizontal and vertical
