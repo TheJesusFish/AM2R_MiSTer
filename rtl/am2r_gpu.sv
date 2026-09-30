@@ -1267,6 +1267,12 @@ module am2r_gpu
 				end
 				ST_BLIT_PIXEL: begin
 					destination_linear <= destination_linear_calc;
+					// Speculatively stage the solid color before clipping/pair tests.
+					// Only the solid-pair shortcut consumes it directly; texture and
+					// affine paths replace it before blending. Keep coordinate logic
+					// out of the tint register/DSP enable without adding a clock.
+					tinted_pixel <= tint_color;
+					tinted_pixel_1 <= tint_color;
 					if (affine_mode) begin
 						source_row_index_stage <= v_current >>> 16;
 						source_stride_stage <= src_stride;
@@ -1368,8 +1374,6 @@ module am2r_gpu
 						              (tint_color[31:24] != 0 && tint_color[31:24] != 8'hff))) begin
 							// The read above supplies ST_PAIR_BLEND_WRITE after the
 							// existing one-cycle M10K latency.
-							tinted_pixel <= tint_color;
-							tinted_pixel_1 <= tint_color;
 							state <= ST_PAIR_BLEND_READ;
 						end else if (solid_mode) begin
 							state <= ST_SOLID_READY;
