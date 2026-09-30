@@ -48,10 +48,13 @@ final file is published by an atomic same-filesystem rename, so an interrupted
 write cannot replace the previous slot. Wait for the **Save state written**
 message before loading or copying a slot.
 
-On USB-1, ordinary 1.53 MB gameplay states saved in 0.28–0.68 seconds and
-loaded in 0.40–0.49 seconds during the final repeated test. States survive a
-core exit and can be overwritten after loading. Legacy `.dmtcp` files are left
-untouched but are not logical-state slots and cannot be converted to `.fast`.
+Save/load time depends on snapshot size and storage. Earlier USB-1 tests of
+1.53 MB gameplay states took 0.28–0.68 seconds to save and 0.40–0.49 seconds
+to load. September 30 tests of a 10.54 MB late-game state took 2.36–8.30 seconds
+to save and 0.84–0.89 seconds to load; large states are not instantaneous.
+States survive a core exit and can be overwritten after loading. Legacy
+`.dmtcp` files are left untouched but are not logical-state slots and cannot
+be converted to `.fast`.
 
 ## Controls
 
@@ -102,8 +105,9 @@ and **Scandoubler Fx** offers HQ2x or scanlines. For HDMI, `vsync_adjust=1` or
 of periodically repeating or dropping a frame.
 
 PAL requests synced HDMI at approximately 50.10 Hz. In hardware testing,
-`video_mode=8` with `vsync_adjust=2` produced a black UGREEN capture, including
-the OSD, although game rendering continued. Keeping HDMI at its configured
+`video_mode=8` with `vsync_adjust=2` produced a black UGREEN capture during
+gameplay, although native rendering continued; opening the OSD restored the
+capture until the menu was closed. Keeping HDMI at its configured
 refresh with `vsync_adjust=0` restored capture without changing the PAL analog
 raster. If this combination loses the HDMI picture on your setup, use
 `vsync_adjust=0` in the `[AM2R]` section, or select NTSC/PAL60. The 50.10 Hz
