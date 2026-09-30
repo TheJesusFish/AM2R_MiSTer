@@ -65,9 +65,10 @@ git apply ../../patches/butterscotch-crop-split-upload.patch
 git apply ../../patches/butterscotch-offscreen-rendering.patch
 git apply ../../patches/butterscotch-unified-renderer.patch
 git apply ../../patches/butterscotch-crt-ui-composition.patch
+git apply ../../patches/butterscotch-four-native-buffers.patch
 ```
 
-The fifty-four files preserve the working tree, including the native-lighting
+The fifty-five files preserve the working tree, including the native-lighting
 correction described below. Each applies in the order above; applying them to a fresh
 detached clone at the base commit reconstructs the current runner source after
 normalizing checkout line endings. See the final hardware and save-state
@@ -336,6 +337,7 @@ stage tracing found no frame longer than 20 ms across 603 cycles.
 | `butterscotch-offscreen-rendering.patch` | `c4bfb6e853ae572eda91ab4f683e5fbbc245f51e7e555ab0d4a845c2eb0f3781` |
 | `butterscotch-unified-renderer.patch` | `1d26a90fde435b34161c18dec55b249839d82e738711388c74910e21bc24dea6` |
 | `butterscotch-crt-ui-composition.patch` | `ebf4b31b16fa44b4152300b397b127ffa9928688d6fe1de594a4a850973a03d2` |
+| `butterscotch-four-native-buffers.patch` | `b3b8e74d338f8b3ee9d160203b66dad0806270878642dd1e5eeaa844517fd41b` |
 
 ## General FPGA rendering experiment
 
@@ -554,3 +556,14 @@ plugin uses the explicit 64-bit metadata ABI so 32-bit MiSTer builds can open
 ordinary saves stored on CIFS servers with inode numbers wider than `ino_t`.
 The plugin link also omits an embedded second C++ runtime; it resolves against
 the packaged `libc++_am2r.so`, matching the MiSTer runtime ABI.
+
+## HDMI framebuffer source
+
+Patch 55, `butterscotch-four-native-buffers.patch`, raises the native
+presentation buffer count from three to four. HDMI now reads published frames
+directly from DDR through the core framebuffer interface (`rtl/am2r_hdmi_fb.sv`)
+while the native reader scans the analog raster, so the two readers can hold
+different frames at once. The fourth buffer at `0x3a0e1100` lets the GPU always
+publish without overwriting either held frame or the latest published frame.
+An older runner rejects buffer index 3, so the runner and RBF must be deployed
+together.

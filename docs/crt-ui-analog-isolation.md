@@ -1,28 +1,29 @@
 # Analog-only CRT UI inset: feasibility
 
-Status: **proposal, not implemented or hardware-validated**. Source inspection
-on September 26, 2026 establishes a route that leaves the upstream `sys/` tree
-untouched. It does not establish its performance or latency.
+Status: the HDMI/analog output split is **implemented**; the analog-only UI
+inset is **not**.
 
 ## Current path
 
 ```text
-one completed image, including UI inset
-  -> native scanout -> CRT position / H Scale -> emu VGA RGB
-                                                   |-> native analog
-                                                   `-> HDMI ascal
+GPU publishes a completed image, including UI inset, into native buffer N
+  |-> native reader -> CRT position / H Scale -> emu VGA RGB -> analog
+  `-> am2r_hdmi_fb (MISTER_FB, FB_BASE = buffer N) -> ascal -> HDMI
 ```
 
-The UI inset changes rendering coordinates before final presentation; both
-outputs therefore receive those changed pixels. `AM2R.sv` connects the output
-of `am2r_crt_video` to the core's sole RGB/sync interface. In `sys/sys_top.v`,
-`hr_out`/`hg_out`/`hb_out` and the HDMI input timing are aliases of the same
-VGA-derived stream, which feeds `ascal`.
+HDMI reads the published XRGB8888 frame from DDR through the core framebuffer
+interface (`rtl/am2r_hdmi_fb.sv`), so the CRT position and horizontal-scale
+controls no longer reach HDMI. `am2r_hdmi_fb` selects the latest published
+buffer at each HDMI vblank, before ascal copies `FB_BASE` at the falling edge
+of HDMI VSync, and reports the buffers ascal may hold so the GPU never
+overwrites them. Four native buffers reduce contention, but do not guarantee
+non-blocking publication: if all four are protected, the GPU waits until a
+reader releases one. Frame pacing and latency require measurement for both
+outputs.
 
-The existing H Scale and position controls also precede this split. HDMI
-scaling may conceal their visible geometry changes, but these controls are
-**not literally independent HDMI and analog RGB paths**. Moving the inset
-into that same CRT block would not by itself isolate it from HDMI.
+The UI inset still changes rendering coordinates before publication, so both
+outputs receive the moved HUD. Making it analog-only requires the second final
+composition described below.
 
 ## Proposed separation
 

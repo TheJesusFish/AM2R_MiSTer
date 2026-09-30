@@ -1,5 +1,8 @@
 [CmdletBinding()]
-param()
+param(
+    # Focused video/scanout checks; does not require the ARM runtime checkout.
+    [switch]$VideoOnly
+)
 
 $ErrorActionPreference = 'Stop'
 $projectRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
@@ -7,10 +10,29 @@ $runId = [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss')
 $library = Join-Path $projectRoot "data\build\sim-am2r-video-$runId"
 $env:ZIG_GLOBAL_CACHE_DIR = Join-Path $projectRoot 'data\build\zig-global-cache'
 
+function Invoke-VideoSimulation {
+    param([string]$Name, [string[]]$Parameters = @(), [string[]]$Libraries = @())
+    $label = ($Name + '-' + ($Parameters -join '-')) -replace '[^A-Za-z0-9_-]', '_'
+    $log = Join-Path $library "$label.log"
+    $output = & vsim -c -l $log -lib $library @Libraries $Name @Parameters -do 'run -all; quit -code 0' 2>&1
+    $code = $LASTEXITCODE
+    $output | Write-Output
+    $text = $output -join "`n"
+    # A trailing quit can mask a Verilog $fatal on older ModelSim versions.
+    if ($code -ne 0 -or $text -notmatch 'PASS' -or
+        $text -match '\*\*\s+(Fatal|Error):|Errors:\s*[1-9]') {
+        throw "Video simulation $label failed (exit $code); see $log."
+    }
+}
+
 Push-Location $projectRoot
 try {
+    if (-not $VideoOnly) {
     & python tests\renderer\audit_sw_renderer.py
     if ($LASTEXITCODE -ne 0) { throw "renderer operation audit failed with exit code $LASTEXITCODE." }
+
+    & python tests\renderer\test_gpu_sample.py
+    if ($LASTEXITCODE -ne 0) { throw "GPU diagnostic sampler regression failed with exit code $LASTEXITCODE." }
 
     & python tests\renderer\test_subtractive_blend.py
     if ($LASTEXITCODE -ne 0) { throw "native blend regression failed with exit code $LASTEXITCODE." }
@@ -125,36 +147,70 @@ try {
 
     & vsim -c -lib $library am2r_video_test_tb -do 'onerror {quit -code 1}; run -all; quit -code 0'
     if ($LASTEXITCODE -ne 0) { throw "vsim failed with exit code $LASTEXITCODE." }
+    } else {
+        & vlib $library
+        if ($LASTEXITCODE -ne 0) { throw "vlib failed with exit code $LASTEXITCODE." }
+    }
 
     & vlog -sv -work $library rtl\am2r_native_video.sv tests\rtl\am2r_native_video_tb.sv
     if ($LASTEXITCODE -ne 0) { throw "native-video vlog failed with exit code $LASTEXITCODE." }
 
-    & vsim -c -lib $library am2r_native_video_tb -do 'onerror {quit -code 1}; run -all; quit -code 0'
-    if ($LASTEXITCODE -ne 0) { throw "native-video vsim failed with exit code $LASTEXITCODE." }
+    foreach ($standard in 0, 1, 2) {
+        Invoke-VideoSimulation -Name am2r_native_video_tb -Parameters "-gSTANDARD=$standard"
+    }
 
 	& vlog -sv -work $library rtl\am2r_native_video.sv rtl\am2r_crt_resync.sv rtl\am2r_video_line_ram.sv rtl\am2r_video_hscale.sv rtl\am2r_crt_video.sv tests\rtl\am2r_crt_video_tb.sv
 	if ($LASTEXITCODE -ne 0) { throw "CRT-video vlog failed with exit code $LASTEXITCODE." }
 
-	& vsim -c -lib $library am2r_crt_video_tb -do 'onerror {quit -code 1}; run -all; quit -code 0'
-	if ($LASTEXITCODE -ne 0) { throw "CRT-video vsim failed with exit code $LASTEXITCODE." }
+	Invoke-VideoSimulation -Name am2r_crt_video_tb
+
+	# Core video output (gamma + video_mixer) with the native pulsed pixel
+	# enable and the H Scaler's continuous one. Declaration-only framework
+	# simulation copies support ModelSim 10.5b; sys/ stays untouched. HQ2x is
+	# stubbed and the generated mixer fails if scandoubler output is selected.
+	& python tests\rtl\sim\test_video_sim_adapters.py
+	if ($LASTEXITCODE -ne 0) { throw "video simulation adapter regression failed." }
+	$simMixer = Join-Path $library 'video_mixer_sim.sv'
+	& python tests\rtl\sim\make_sim_video_mixer.py $simMixer
+	if ($LASTEXITCODE -ne 0) { throw "video_mixer simulation copy failed with exit code $LASTEXITCODE." }
+	$simDoubler = Join-Path $library 'scandoubler_sim.sv'
+	$simGamma = Join-Path $library 'gamma_corr_sim.sv'
+	& vlog -sv -work $library rtl\am2r_native_video.sv rtl\am2r_crt_resync.sv rtl\am2r_video_line_ram.sv rtl\am2r_video_hscale.sv rtl\am2r_crt_video.sv $simMixer $simDoubler tests\rtl\sim\hq2x_stub.sv $simGamma sys\video_freezer.sv rtl\am2r_video_out.sv tests\rtl\am2r_video_out_tb.sv
+	if ($LASTEXITCODE -ne 0) { throw "video-output vlog failed with exit code $LASTEXITCODE." }
+	foreach ($hscale in 0, 1) {
+		foreach ($gamma in 0, 1) {
+			Invoke-VideoSimulation -Name am2r_video_out_tb -Parameters @("-gHSCALE=$hscale", "-gGAMMA_EN=$gamma")
+		}
+	}
+	foreach ($scale in -16, 15) {
+		Invoke-VideoSimulation -Name am2r_video_out_tb -Parameters @('-gHSCALE=1', '-gGAMMA_EN=1', "-gHSCALE_VALUE=$scale")
+	}
+
+	& vlog -sv -work $library rtl\am2r_hdmi_fb.sv tests\rtl\am2r_hdmi_fb_tb.sv
+	if ($LASTEXITCODE -ne 0) { throw "HDMI-framebuffer vlog failed with exit code $LASTEXITCODE." }
+
+	Invoke-VideoSimulation -Name am2r_hdmi_fb_tb
 
 	& vlog -sv -work $library rtl\am2r_ddr_arbiter.sv tests\rtl\am2r_ddr_arbiter_tb.sv
 	if ($LASTEXITCODE -ne 0) { throw "DDR-arbiter vlog failed with exit code $LASTEXITCODE." }
 
-	& vsim -c -lib $library am2r_ddr_arbiter_tb -do 'onerror {quit -code 1}; run -all; quit -code 0'
-	if ($LASTEXITCODE -ne 0) { throw "DDR-arbiter vsim failed with exit code $LASTEXITCODE." }
+	Invoke-VideoSimulation -Name am2r_ddr_arbiter_tb
 
 	& vlog -sv -work $library rtl\am2r_native_video.sv rtl\am2r_native_reader.sv tests\rtl\am2r_native_reader_tb.sv
 	if ($LASTEXITCODE -ne 0) { throw "native-reader vlog failed with exit code $LASTEXITCODE." }
 
-	& vsim -c -L altera_mf -lib $library am2r_native_reader_tb -do 'onerror {quit -code 1}; run -all; quit -code 0'
-	if ($LASTEXITCODE -ne 0) { throw "native-reader vsim failed with exit code $LASTEXITCODE." }
+	Invoke-VideoSimulation -Name am2r_native_reader_tb -Libraries @('-L', 'altera_mf')
 
 	& vlog -sv -work $library rtl\am2r_native_video.sv rtl\am2r_native_reader.sv tests\rtl\am2r_native_reader_late_frame_tb.sv
 	if ($LASTEXITCODE -ne 0) { throw "late-frame native-reader vlog failed with exit code $LASTEXITCODE." }
 
-	& vsim -c -L altera_mf -lib $library am2r_native_reader_late_frame_tb -do 'onerror {quit -code 1}; run -all; quit -code 0'
-	if ($LASTEXITCODE -ne 0) { throw "late-frame native-reader vsim failed with exit code $LASTEXITCODE." }
+	foreach ($standard in 0, 2) {
+		Invoke-VideoSimulation -Name am2r_native_reader_late_frame_tb -Libraries @('-L', 'altera_mf') -Parameters "-gSTANDARD=$standard"
+	}
+	if ($VideoOnly) {
+		Write-Output "PASS: focused video/scanout suite (scandoubler/HQ2x output not covered). Logs: $library"
+		return
+	}
 
     & vlog -sv -work $library rtl\am2r_framebuffer_config.sv tests\rtl\am2r_framebuffer_config_tb.sv
     if ($LASTEXITCODE -ne 0) { throw "framebuffer vlog failed with exit code $LASTEXITCODE." }

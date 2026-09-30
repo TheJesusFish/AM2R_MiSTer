@@ -48,7 +48,7 @@ module am2r_gpu_replay_tb;
         .ddram_burstcnt(ddram_burstcnt), .ddram_addr(ddram_addr),
         .ddram_dout(ddram_dout), .ddram_dout_ready(ddram_dout_ready),
         .ddram_rd(ddram_rd), .ddram_din(ddram_din), .ddram_be(ddram_be),
-        .ddram_we(ddram_we), .scan_buffer_valid(1'b0), .scan_buffer(2'b0),
+        .ddram_we(ddram_we), .scan_buffer_valid(1'b0), .scan_buffer(2'b0), .hdmi_protect(4'b0),
         .scan_underflow_toggle(1'b0), .native_frame(native_frame),
         .native_buffer(native_buffer)
     );
@@ -95,7 +95,7 @@ module am2r_gpu_replay_tb;
                 for (lane = 0; lane < 8; lane = lane + 1) begin
                     if (enable[lane]) begin
                         permitted = will_present != 0 && address >= (NATIVE_BASE >> 3) &&
-                            address < (NATIVE_BASE >> 3) + 3 * FRAME_WORDS;
+                            address < (NATIVE_BASE >> 3) + 4 * FRAME_WORDS;
                         for (i = 0; i < export_count; i = i + 1)
                             if ({address, 3'b0} + lane >= export_base[i] &&
                                 {address, 3'b0} + lane < export_base[i] + export_bytes[i])
@@ -176,7 +176,7 @@ module am2r_gpu_replay_tb;
         status = $fscanf(fd, "%d %d %d %d %d %d\n", region_count, export_count, command_count, prior_native, has_initial, will_present);
         if (status != 6 || region_count < 1 || region_count > MAX_REGIONS ||
             export_count < 0 || export_count > 1024 || command_count < 1 || command_count > 1024 ||
-            prior_native < 0 || prior_native > 2 || has_initial < 0 || has_initial > 1 ||
+            prior_native < 0 || prior_native > 3 || has_initial < 0 || has_initial > 1 ||
             will_present < 0 || will_present > 1)
             $fatal(1, "Invalid mapping header");
         for (n = 0; n < region_count; n = n + 1) begin

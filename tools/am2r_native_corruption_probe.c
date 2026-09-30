@@ -24,7 +24,7 @@
 #define HEIGHT 240u
 #define FRAME_PIXELS (WIDTH * HEIGHT)
 #define FRAME_BYTES (FRAME_PIXELS * 4u)
-#define NATIVE_BYTES (NATIVE_OFFSET + 3u * FRAME_BYTES)
+#define NATIVE_BYTES (NATIVE_OFFSET + 4u * FRAME_BYTES)
 #define MAX_EVENTS 8u
 
 static uint64_t monotonic_ns(void)
@@ -146,7 +146,7 @@ int main(int argc, char **argv)
 		}
 		__sync_synchronize();
 		unsigned buffer = control[7] >> 30;
-		if (buffer >= 3u) continue;
+		if (buffer >= 4u) continue;
 		memcpy(current, native + NATIVE_OFFSET + buffer * FRAME_BYTES,
 			FRAME_BYTES);
 		unsigned current_nonblack = nonblack_pixels(current);

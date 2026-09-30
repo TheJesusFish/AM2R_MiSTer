@@ -23,7 +23,7 @@
 #define HEIGHT 240u
 #define EDGE_X 280u
 #define FRAME_BYTES (WIDTH * HEIGHT * 4u)
-#define NATIVE_BYTES (NATIVE_OFFSET + 3u * FRAME_BYTES)
+#define NATIVE_BYTES (NATIVE_OFFSET + 4u * FRAME_BYTES)
 
 static uint64_t monotonic_ns(void)
 {

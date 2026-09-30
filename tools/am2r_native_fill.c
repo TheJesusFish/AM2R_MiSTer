@@ -12,7 +12,7 @@
 #define WIDTH 320u
 #define HEIGHT 240u
 #define NATIVE_BUFFER_BYTES (WIDTH * HEIGHT * 4u)
-#define NATIVE_BUFFER_COUNT 3u
+#define NATIVE_BUFFER_COUNT 4u
 #define NATIVE_WINDOW_BYTES (NATIVE_BUFFER_OFFSET + NATIVE_BUFFER_COUNT * NATIVE_BUFFER_BYTES)
 
 static uint32_t test_pixel(uint32_t x, uint32_t y)
@@ -50,7 +50,7 @@ int main(void)
                 pixels[y * WIDTH + x] = test_pixel(x, y);
     }
     __sync_synchronize();
-	printf("filled three AM2R native buffers from 0x3a000100\n");
+	printf("filled %u AM2R native buffers from 0x3a000100\n", NATIVE_BUFFER_COUNT);
 
     munmap(mapping, NATIVE_WINDOW_BYTES);
     close(fd);

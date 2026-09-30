@@ -26,6 +26,8 @@ module am2r_gpu
 	output reg         ddram_we,
 	input              scan_buffer_valid,
 	input       [1:0]  scan_buffer,
+	// Native buffers the HDMI framebuffer reader may still be reading.
+	input       [3:0]  hdmi_protect,
 	input              scan_underflow_toggle,
 	output reg  [31:0] native_frame,
 	output reg  [1:0]  native_buffer
@@ -39,6 +41,7 @@ module am2r_gpu
 	localparam [28:0] NATIVE_BUF0 = 29'h0740_0020; // 0x3a000100 >> 3
 	localparam [28:0] NATIVE_BUF1 = 29'h0740_9620; // 0x3a04b100 >> 3
 	localparam [28:0] NATIVE_BUF2 = 29'h0741_2c20; // 0x3a096100 >> 3
+	localparam [28:0] NATIVE_BUF3 = 29'h0741_c220; // 0x3a0e1100 >> 3
 	localparam integer FB_WIDTH = 320;
 	localparam integer FB_HEIGHT = 240;
 	localparam integer FB_WORDS = (FB_WIDTH * FB_HEIGHT) / 2;
@@ -429,35 +432,33 @@ module am2r_gpu
 			case (buffer_index)
 				2'd1: native_buffer_address = NATIVE_BUF1;
 				2'd2: native_buffer_address = NATIVE_BUF2;
+				2'd3: native_buffer_address = NATIVE_BUF3;
 				default: native_buffer_address = NATIVE_BUF0;
 			endcase
 		end
 	endfunction
 
 	// Keep the current completed buffer and the buffer being scanned immutable.
-	// With three presentation buffers, the next job can still choose the third
-	// buffer instead of waiting a complete raster for scanout to release one.
-	function automatic [1:0] next_present_buffer;
-		input [1:0] completed_buffer;
-		input scan_valid;
-		input [1:0] scan_buffer_index;
-		reg [1:0] candidate;
-		begin
-			case (completed_buffer)
-				2'd0: candidate = 2'd1;
-				2'd1: candidate = 2'd2;
-				default: candidate = 2'd0;
-			endcase
-			if (scan_valid && candidate == scan_buffer_index) begin
-				case (candidate)
-					2'd0: candidate = 2'd1;
-					2'd1: candidate = 2'd2;
-					default: candidate = 2'd0;
-				endcase
-			end
-			next_present_buffer = candidate;
-		end
-	endfunction
+	// Four presentation buffers: the latest published frame, the frame the
+	// native reader has latched, and up to two frames the HDMI framebuffer
+	// reader may hold can all differ, and the next job still needs one more
+	// only while the HDMI reader changes frames. ST_PRESENT_WAIT picks the
+	// first free buffer, starting after the one just published.
+	reg [3:0] present_busy;
+	always @(*) begin
+		present_busy = hdmi_protect;
+		if (scan_buffer_valid) present_busy[scan_buffer] = 1'b1;
+		if (native_frame != 0) present_busy[native_buffer] = 1'b1;
+	end
+	wire [1:0] present_try0 = present_buffer;
+	wire [1:0] present_try1 = present_buffer + 2'd1;
+	wire [1:0] present_try2 = present_buffer + 2'd2;
+	wire [1:0] present_try3 = present_buffer + 2'd3;
+	wire present_free = ~&present_busy;
+	wire [1:0] present_choice =
+		!present_busy[present_try0] ? present_try0 :
+		!present_busy[present_try1] ? present_try1 :
+		!present_busy[present_try2] ? present_try2 : present_try3;
 
 	function automatic [31:0] additive_blend;
 		input [31:0] src, dst;
@@ -2054,8 +2055,7 @@ module am2r_gpu
 								if (framebuffer_write_present) begin
 									native_buffer <= present_buffer;
 									native_frame <= native_frame + 1'b1;
-									present_buffer <= next_present_buffer(
-										present_buffer, scan_buffer_valid, scan_buffer);
+									present_buffer <= present_buffer + 2'd1;
 									state <= ST_CAPABILITY_WRITE;
 								end else begin
 									command_index <= command_index + 1'b1;
@@ -2492,9 +2492,13 @@ module am2r_gpu
 					end
 				end
 				ST_PRESENT_WAIT: begin
-					// Never overwrite the buffer the video reader has latched for
-					// this raster. Fast/simple game frames may otherwise lap vblank.
-					if (!scan_buffer_valid || present_buffer != scan_buffer) begin
+					// Never overwrite the latest published frame or a buffer either
+					// video reader holds. Fast/simple game frames may otherwise lap
+					// vblank. Readers only ever move to the latest published
+					// frame, so the chosen buffer stays free until it is written.
+					if (present_free) begin
+						present_buffer <= present_choice;
+						framebuffer_write_base <= native_buffer_address(present_choice);
 						state <= ST_FRAMEBUFFER_WRITE_START;
 					end
 				end

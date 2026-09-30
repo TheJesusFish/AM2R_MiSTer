@@ -27,7 +27,6 @@ assign SDRAM_nWE  = 1;
 assign SDRAM_nRAS = 1;
 assign SDRAM_nCAS = 1;
 
-assign VGA_SL         = 0;
 assign VGA_F1         = 0;
 // Keep analog output on the core-owned native 240p raster. VGA_SCALER would
 // route the HDMI/ascal result to VGA and can therefore turn CRT output into
@@ -48,14 +47,21 @@ assign LED_POWER = 0;
 assign BUTTONS   = 0;
 
 wire [1:0] ar = status[5:4];
-assign VIDEO_ARX = (!ar) ? 12'd4 : (ar - 1'd1);
-assign VIDEO_ARY = (!ar) ? 12'd3 : 12'd0;
+// 0: NTSC, 1: PAL60, 2: PAL. NTSC and PAL60 share the 60 Hz raster; the HPS
+// frontend selects their composite/S-Video subcarrier.
+wire [1:0] video_standard = status[28:27];
+wire [2:0] hdmi_scale = status[31:29];
+wire [2:0] sd_fx = status[34:32];
+wire [2:0] scanlines = sd_fx ? sd_fx - 1'd1 : 3'd0;
 
 `include "build_id.v"
 localparam CONF_STR = {
 	"AM2R;;",
 	"-;",
 	"O[5:4],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
+	"O[31:29],Scale,Normal,V-Integer,Narrower HV-Integer,Wider HV-Integer,HV-Integer;",
+	"O[28:27],Video Standard,NTSC,PAL60,PAL;",
+	"H0O[34:32],Scandoubler Fx,None,HQ2x,CRT 25%,CRT 50%,CRT 75%;",
 	"P1,CRT Adjustments;",
 	"P1O[13:10],Analog H Position,0,1,2,3,4,5,6,7,-8,-7,-6,-5,-4,-3,-2,-1;",
 	"P1O[17:14],Analog V Position,0,1,2,3,4,5,6,7,-8,-7,-6,-5,-4,-3,-2,-1;",
@@ -78,6 +84,7 @@ localparam CONF_STR = {
 };
 
 wire         forced_scandoubler;
+wire  [21:0] gamma_bus;
 wire   [1:0] buttons;
 wire [127:0] status;
 
@@ -86,7 +93,8 @@ hps_io #(.CONF_STR(CONF_STR)) hps_io
 	.clk_sys(clk_sys),
 	.HPS_BUS(HPS_BUS),
 	.EXT_BUS(),
-	.gamma_bus(),
+	.gamma_bus(gamma_bus),
+	.status_menumask({15'd0, ~forced_scandoubler}),
 	.forced_scandoubler(forced_scandoubler),
 	.buttons(buttons),
 	.status(status)
@@ -117,7 +125,7 @@ pll_video pll_vid
 	.locked(pll_video_locked)
 );
 
-// Keep the framework's system and native-video domains on the same 25 MHz
+// Keep the framework's system and native-video domains on the same 26.8 MHz
 // core PLL. Besides being ample for hps_io, this lets the untouched upstream
 // OSD infer its normal block RAM rather than becoming a mixed-clock register
 // array. The GPU remains on its independent 88 MHz PLL output.
@@ -136,7 +144,7 @@ always @(posedge clk_gpu) begin
 	gpu_reset <= gpu_reset_meta;
 end
 
-// The framework and native video run at 25 MHz while the renderer remains at
+// The framework and native video run at 26.8 MHz while the renderer remains at
 // 88 MHz. Keep reset deassertion synchronous to scanout.
 reg video_reset_meta = 1;
 reg video_reset = 1;
@@ -153,6 +161,7 @@ wire       ce_pix;
 wire       new_frame;
 wire       new_line;
 wire       pace_tick;
+wire       native_pal;
 
 wire [7:0] gpu_ddr_burstcnt;
 wire [28:0] gpu_ddr_addr;
@@ -168,6 +177,7 @@ wire [1:0] native_frame_buffer;
 wire scan_buffer_valid;
 wire [1:0] scan_buffer_in_use;
 wire scan_underflow_toggle;
+wire [3:0] hdmi_protect;
 
 am2r_gpu gpu
 (
@@ -184,6 +194,7 @@ am2r_gpu gpu
 	.ddram_we(gpu_ddr_we),
 	.scan_buffer_valid(scan_buffer_valid),
 	.scan_buffer(scan_buffer_in_use),
+	.hdmi_protect(hdmi_protect),
 	.scan_underflow_toggle(scan_underflow_toggle),
 	.native_frame(native_frame_number),
 	.native_buffer(native_frame_buffer)
@@ -215,6 +226,7 @@ am2r_native_reader native_reader
 	.ce_pix(ce_pix),
 	.de(~(hblank | vblank)),
 	.vblank(vblank),
+	.pal(native_pal),
 	.new_frame(new_frame),
 	.new_line(new_line),
 	.source_frame(native_frame_number),
@@ -228,6 +240,25 @@ am2r_native_reader native_reader
 	.b_out(native_b),
 	.underflow_toggle(scan_underflow_toggle)
 );
+
+// HDMI reads the latest published native frame directly from DDR, so the
+// analog-only CRT position and horizontal-scale controls never reach it.
+am2r_hdmi_fb hdmi_fb
+(
+	.clk(clk_gpu),
+	.reset(gpu_reset),
+	.fb_vbl(FB_VBL),
+	.native_frame(native_frame_number),
+	.native_buffer(native_frame_buffer),
+	.fb_base(FB_BASE),
+	.fb_force_blank(FB_FORCE_BLANK),
+	.protect(hdmi_protect)
+);
+assign FB_EN     = 1;
+assign FB_FORMAT = 5'b10110;   // 32bpp, B,G,R,X byte order (XRGB8888 words)
+assign FB_WIDTH  = 12'd320;
+assign FB_HEIGHT = 12'd240;
+assign FB_STRIDE = 14'd1280;
 
 assign DDRAM_CLK = clk_gpu;
 am2r_ddr_arbiter ddr_arbiter
@@ -259,6 +290,7 @@ am2r_native_video native_video
 (
 	.clk(clk_video),
 	.reset(video_reset),
+	.standard(video_standard),
 	.frame_ready(native_frame_ready),
 	.frame_r(native_r),
 	.frame_g(native_g),
@@ -271,6 +303,7 @@ am2r_native_video native_video
 	.new_frame(new_frame),
 	.new_line(new_line),
 	.pace_tick(pace_tick),
+	.pal(native_pal),
 	.r(video_r),
 	.g(video_g),
 	.b(video_b)
@@ -300,7 +333,9 @@ am2r_crt_video crt_video
 	.vblank_in(vblank),
 	.h_position($signed({status[13], status[13:10]})),
 	.v_position($signed({status[17], status[17:14]})),
-	.hscale_enable(status[18]),
+	// The line scaler emits one pixel per video clock, which the 2x
+	// scandoubler cannot double. It exists for 15 kHz displays only.
+	.hscale_enable(status[18] & ~forced_scandoubler),
 	.hscale($signed(status[23:19])),
 	.ce_pix_out(crt_ce_pix),
 	.r_out(crt_r),
@@ -314,13 +349,62 @@ am2r_crt_video crt_video
 );
 
 assign CLK_VIDEO = clk_video;
-assign CE_PIXEL  = crt_ce_pix;
-assign VGA_DE    = ~(crt_hblank | crt_vblank);
-assign VGA_HS    = crt_hsync;
-assign VGA_VS    = crt_vsync;
-assign VGA_R     = crt_r;
-assign VGA_G     = crt_g;
-assign VGA_B     = crt_b;
+
+// Framework gamma and, when MiSTer.ini forces it for 31 kHz displays, the
+// scandoubler with optional HQ2x. Without forced_scandoubler this is a
+// registered pass-through of the native or CRT-adjusted 15 kHz raster. The
+// gamma stage accepts the H Scaler's continuous pixel enable as well as the
+// native pulsed one; see rtl/am2r_video_out.sv.
+wire vga_de;
+am2r_video_out #(.LINE_LENGTH(320)) video_out
+(
+	.clk(CLK_VIDEO),
+	.ce_pix(crt_ce_pix),
+	.scandoubler(forced_scandoubler),
+	.hq2x(sd_fx == 3'd1),
+	.freeze(HDMI_FREEZE),
+	.gamma_bus(gamma_bus),
+	.r(crt_r),
+	.g(crt_g),
+	.b(crt_b),
+	.hsync(crt_hsync),
+	.vsync(crt_vsync),
+	.hblank(crt_hblank),
+	.vblank(crt_vblank),
+	.ce_pix_out(CE_PIXEL),
+	.vga_r(VGA_R),
+	.vga_g(VGA_G),
+	.vga_b(VGA_B),
+	.vga_hs(VGA_HS),
+	.vga_vs(VGA_VS),
+	.vga_de(vga_de)
+);
+
+// Scanline effects apply only to the scandoubled 31 kHz output.
+assign VGA_SL = forced_scandoubler ? scanlines[1:0] : 2'd0;
+
+assign VGA_DE = vga_de;
+
+// HDMI aspect ratio and integer scaling. HDMI shows the 320x240 native
+// framebuffer, so measure the unadjusted native raster rather than the
+// analog output, whose width the CRT horizontal scaler can change.
+video_freak video_freak
+(
+	.CLK_VIDEO(CLK_VIDEO),
+	.CE_PIXEL(ce_pix),
+	.VGA_VS(vsync),
+	.HDMI_WIDTH(HDMI_WIDTH),
+	.HDMI_HEIGHT(HDMI_HEIGHT),
+	.VGA_DE(),
+	.VIDEO_ARX(VIDEO_ARX),
+	.VIDEO_ARY(VIDEO_ARY),
+	.VGA_DE_IN(~(hblank | vblank)),
+	.ARX((!ar) ? 12'd4 : (ar - 1'd1)),
+	.ARY((!ar) ? 12'd3 : 12'd0),
+	.CROP_SIZE(12'd0),
+	.CROP_OFF(5'd0),
+	.SCALE(hdmi_scale)
+);
 
 reg [26:0] activity_counter = 0;
 always @(posedge clk_sys) activity_counter <= activity_counter + 1'd1;

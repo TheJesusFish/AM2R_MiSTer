@@ -17,10 +17,13 @@
 #define CONTROL_BYTES 4096u
 #define FRAME_BYTES (320u * 240u * 4u)
 
-static const uint32_t frame_physical[3] = {
+#define NATIVE_BUFFER_COUNT 4u
+
+static const uint32_t frame_physical[NATIVE_BUFFER_COUNT] = {
     UINT32_C(0x3a000100),
     UINT32_C(0x3a04b100),
     UINT32_C(0x3a096100),
+    UINT32_C(0x3a0e1100),
 };
 
 static uint64_t monotonic_ns(void)
@@ -69,10 +72,10 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    void *frame_mapping[3] = { NULL, NULL, NULL };
-    size_t frame_mapping_bytes[3] = { 0, 0, 0 };
-    const uint32_t *frames[3] = { NULL, NULL, NULL };
-    for (unsigned i = 0; i < 3; ++i) {
+    void *frame_mapping[NATIVE_BUFFER_COUNT] = { NULL };
+    size_t frame_mapping_bytes[NATIVE_BUFFER_COUNT] = { 0 };
+    const uint32_t *frames[NATIVE_BUFFER_COUNT] = { NULL };
+    for (unsigned i = 0; i < NATIVE_BUFFER_COUNT; ++i) {
         frames[i] = map_frame(memory_fd, frame_physical[i],
                               &frame_mapping[i], &frame_mapping_bytes[i]);
         if (!frames[i]) {
@@ -93,7 +96,7 @@ int main(int argc, char **argv)
         if (completed != 0 && completed != previous_sequence &&
             submitted == completed) {
             unsigned buffer = completion >> 30;
-            if (buffer < 3) {
+            if (buffer < NATIVE_BUFFER_COUNT) {
                 uint32_t nonblack = 0;
                 uint32_t hud_left = 0;
                 uint32_t hud_right = 0;
@@ -140,7 +143,7 @@ int main(int argc, char **argv)
         usleep(100);
     }
 
-    for (unsigned i = 0; i < 3; ++i)
+    for (unsigned i = 0; i < NATIVE_BUFFER_COUNT; ++i)
         munmap(frame_mapping[i], frame_mapping_bytes[i]);
     munmap((void *)control, CONTROL_BYTES);
     close(memory_fd);

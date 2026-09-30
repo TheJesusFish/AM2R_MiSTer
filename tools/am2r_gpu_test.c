@@ -15,12 +15,12 @@
 #define FRAMEBUFFER_PHYS 0x22001000u
 #define NATIVE_POOL_PHYS 0x3a000000u
 #define NATIVE_BUF0_OFFSET 0x00000100u
-#define NATIVE_BUF1_OFFSET 0x0004b100u
-#define NATIVE_POOL_BYTES 0x00096100u
+#define NATIVE_BUFFER_COUNT 4u
 #define CONTROL_MAGIC 0x50473241u
 #define FB_WIDTH 320u
 #define FB_HEIGHT 240u
 #define FB_BYTES (FB_WIDTH * FB_HEIGHT * 4u)
+#define NATIVE_POOL_BYTES (NATIVE_BUF0_OFFSET + NATIVE_BUFFER_COUNT * FB_BYTES)
 #define COMMAND_BYTES 4096u
 #define TEXTURE_WIDTH 128u
 #define TEXTURE_HEIGHT 64u
@@ -149,7 +149,8 @@ static void command_end(GpuCommand *cmd)
 }
 
 static int submit(volatile uint32_t *control, uint32_t command_count,
-                  uint32_t *sequence, uint32_t *gpu_cycles)
+                  uint32_t *sequence, uint32_t *gpu_cycles,
+                  uint32_t *native_buffer)
 {
     uint32_t next = *sequence + 1;
     if (next == 0) next = 1;
@@ -172,7 +173,10 @@ static int submit(volatile uint32_t *control, uint32_t command_count,
         __sync_synchronize();
         if (control[6] == next) {
             *sequence = next;
-            *gpu_cycles = control[7];
+            // Bits 31:30 name the published native buffer; the rest count cycles.
+            uint32_t completion = control[7];
+            *gpu_cycles = completion & 0x1fffffffu;
+            if (native_buffer) *native_buffer = completion >> 30;
             return 0;
         }
         usleep(100);
@@ -223,10 +227,6 @@ int main(int argc, char **argv)
     if (!control || !commands || !texture || !native_pool) {
         return 1;
     }
-    volatile uint32_t *framebuffer0 =
-        (volatile uint32_t *)(native_pool + NATIVE_BUF0_OFFSET);
-    volatile uint32_t *framebuffer1 =
-        (volatile uint32_t *)(native_pool + NATIVE_BUF1_OFFSET);
 
     for (unsigned y = 0; y < TEXTURE_HEIGHT; ++y) {
         for (unsigned x = 0; x < TEXTURE_WIDTH; ++x) {
@@ -270,13 +270,14 @@ int main(int argc, char **argv)
                  0, 0, 1 << 16, 1 << 16, 1 << 16, 0);
     command_end(&commands[7]);
     __sync_synchronize();
-    if (submit(control, 8, &sequence, &gpu_cycles)) return 1;
+    uint32_t native_buffer = 0;
+    if (submit(control, 8, &sequence, &gpu_cycles, &native_buffer)) return 1;
 
-    // Native scanout is double buffered. Select the buffer just published by
-    // this submission rather than relying on the retired Linux framebuffer.
+    // Read the native buffer this submission published, as reported in the
+    // completion word, rather than the retired Linux framebuffer.
     __sync_synchronize();
-    volatile uint32_t *framebuffer = framebuffer0[0] == clear_xrgb ?
-        framebuffer0 : framebuffer1;
+    volatile uint32_t *framebuffer = (volatile uint32_t *)(native_pool +
+        NATIVE_BUF0_OFFSET + native_buffer * FB_BYTES);
 
     int errors = 0;
     errors += expect_pixel(framebuffer, 0, 0, clear_xrgb);
@@ -340,7 +341,7 @@ int main(int argc, char **argv)
     uint32_t min_cycles = UINT32_MAX, max_cycles = 0;
     const double start = monotonic_seconds();
     for (unsigned frame = 0; frame < stress_frames; ++frame) {
-        if (submit(control, quad_count + 2, &sequence, &gpu_cycles)) return 1;
+        if (submit(control, quad_count + 2, &sequence, &gpu_cycles, NULL)) return 1;
         total_cycles += gpu_cycles;
         if (gpu_cycles < min_cycles) min_cycles = gpu_cycles;
         if (gpu_cycles > max_cycles) max_cycles = gpu_cycles;

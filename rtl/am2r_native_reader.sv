@@ -1,6 +1,6 @@
 // DDR-backed native scanout, adapted to AM2R from the line-on-demand design
 // used by 3s-mister-arm. The GPU publishes complete XRGB8888 frames into one
-// of three DDR buffers. This reader preloads 32 lines at vblank and keeps that
+// of four DDR buffers. This reader preloads 32 lines at vblank and keeps that
 // lead topped up through a dual-clock FIFO. Refilling from FIFO occupancy,
 // rather than from one-shot line pulses, also lets scanout catch up after a
 // delayed DDR burst instead of permanently losing its prefetch margin.
@@ -22,6 +22,8 @@ module am2r_native_reader (
 	input              ce_pix,
 	input              de,
 	input              vblank,
+	// The 50 Hz raster is active (quasi-static, clk_vid domain).
+	input              pal,
 	input              new_frame,
 	input              new_line,
 
@@ -39,6 +41,7 @@ module am2r_native_reader (
 	localparam [28:0] BUF0_ADDR = 29'h07400020; // 0x3a000100 >> 3
 	localparam [28:0] BUF1_ADDR = 29'h07409620; // 0x3a04b100 >> 3
 	localparam [28:0] BUF2_ADDR = 29'h07412c20; // 0x3a096100 >> 3
+	localparam [28:0] BUF3_ADDR = 29'h0741c220; // 0x3a0e1100 >> 3
 	localparam [7:0] LINE_WORDS = 8'd160;
 	// The MiSTer DDRAM top-level contract caps a request at 128 words.
 	// Match 3s-mister-arm's known-good 96-word native-video bursts, then
@@ -54,22 +57,30 @@ module am2r_native_reader (
 	// measured publication jitter while still leaving six complete scanlines
 	// (about 382 us) to discard the speculative FIFO contents and fetch the
 	// 32-line preload from the newly published buffer before active video.
-	localparam [4:0] LATE_LATCH_LINES = 5'd16;
+	// The 50 Hz raster has 72 blank lines, so the same six-line tail allows a
+	// 66-line window; PAL's 60 Hz publication then rarely waits a raster.
+	localparam [6:0] LATE_LATCH_LINES_60 = 7'd16;
+	localparam [6:0] LATE_LATCH_LINES_50 = 7'd66;
 
 	reg [1:0] new_frame_sync = 0;
 	reg [1:0] new_line_sync = 0;
 	reg [1:0] vblank_sync = 0;
+	reg [1:0] pal_sync = 0;
 	always @(posedge ddr_clk) begin
 		if (reset) begin
 			new_frame_sync <= 0;
 			new_line_sync <= 0;
 			vblank_sync <= 0;
+			pal_sync <= 0;
 		end else begin
 			new_frame_sync <= {new_frame_sync[0], new_frame};
 			new_line_sync <= {new_line_sync[0], new_line};
 			vblank_sync <= {vblank_sync[0], vblank};
+			pal_sync <= {pal_sync[0], pal};
 		end
 	end
+	wire [6:0] late_latch_lines = pal_sync[1] ? LATE_LATCH_LINES_50 :
+	                                            LATE_LATCH_LINES_60;
 	wire new_frame_ddr = new_frame_sync[0] & ~new_frame_sync[1];
 	wire new_line_ddr = new_line_sync[0] & ~new_line_sync[1];
 	wire vblank_ddr = vblank_sync[1];
@@ -98,7 +109,7 @@ module am2r_native_reader (
 	reg [7:0] burst_words = 0;
 	reg preloading = 0;
 	reg [31:0] latched_source_frame = 0;
-	reg [4:0] vblank_line_count = 0;
+	reg [6:0] vblank_line_count = 0;
 	reg restart_pending = 0;
 	reg [31:0] pending_source_frame = 0;
 	reg [1:0] pending_source_buffer = 0;
@@ -110,6 +121,7 @@ module am2r_native_reader (
 			case (buffer_index)
 				2'd1: buffer_address = BUF1_ADDR;
 				2'd2: buffer_address = BUF2_ADDR;
+				2'd3: buffer_address = BUF3_ADDR;
 				default: buffer_address = BUF0_ADDR;
 			endcase
 		end
@@ -122,7 +134,7 @@ module am2r_native_reader (
 	reg [3:0] fifo_clear_count = 0;
 	wire fifo_aclr = reset | (fifo_clear_count != 0);
 	wire early_source_update = vblank_ddr &&
-	                           vblank_line_count < LATE_LATCH_LINES &&
+	                           vblank_line_count < late_latch_lines &&
 	                           source_frame != 0 &&
 	                           source_frame != latched_source_frame;
 
@@ -156,7 +168,7 @@ module am2r_native_reader (
 			if (new_frame_ddr)
 				vblank_line_count <= 0;
 			else if (new_line_ddr && vblank_ddr &&
-			         vblank_line_count < LATE_LATCH_LINES)
+			         vblank_line_count < late_latch_lines)
 				vblank_line_count <= vblank_line_count + 1'b1;
 			if (!ddr_busy)
 				ddr_rd <= 0;
