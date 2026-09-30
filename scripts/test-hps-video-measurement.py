@@ -169,10 +169,61 @@ def run(command: list[str], log: Path, timeout: int = 900) -> str:
     return result.stdout
 
 
+def check_simulation_output(text: str, case: str) -> str:
+    """Accept only the production pass or one specifically intended fatal."""
+    messages = re.findall(r"(?m)^\s*(?:#\s*)?\*\*\s+(Fatal|Error):\s*(.*?)\s*$", text)
+    counts = [int(value) for value in re.findall(r"Errors:\s*([0-9]+)", text)]
+    pass_marker = re.search(r"(?m)^\s*(?:#\s*)?PASS: HPS measurement\b", text)
+    if case == "production":
+        if messages or any(counts) or not pass_marker:
+            raise RuntimeError("Production measurement regression did not pass")
+        return "production measurement regression passed"
+    if case not in ("old-mapping-witness", "missing-notification-witness"):
+        raise ValueError(f"Unknown simulation case: {case}")
+    if len(messages) != 1 or messages[0][0] != "Fatal" or pass_marker or any(value > 1 for value in counts):
+        raise RuntimeError(f"{case} did not produce exactly its intended fatal")
+    message = messages[0][1]
+    if case == "old-mapping-witness":
+        accepted = message.startswith(("native active dimensions:", "native frame clocks got"))
+    else:
+        accepted = message == "PAL transition notification missing despite different native periods"
+    if not accepted:
+        raise RuntimeError(f"{case} failed for an unrelated reason: {message}")
+    return message
+
+
+def check_parser_mutations() -> None:
+    """Small, deterministic guard against accepting unrelated errors/mentions."""
+    check_simulation_output("# PASS: HPS measurement fixture\n# Errors: 0\n", "production")
+    for message in ("native active dimensions: got 320x238, expected 320x240",
+                    "native frame clocks got 418500 expected 447496"):
+        check_simulation_output(f"# ** Fatal: {message}\n# Errors: 1\n", "old-mapping-witness")
+    pal = "PAL transition notification missing despite different native periods"
+    check_simulation_output(f"# ** Fatal: {pal}\n# Errors: 1\n", "missing-notification-witness")
+    negatives = [
+        ("# note: native frame clocks got 418500 expected 447496\n", "old-mapping-witness"),
+        ("# note: native frame clocks got 418500 expected 447496\n# ** Fatal: unrelated timeout\n", "old-mapping-witness"),
+        ("# ** Error: native frame clocks got 418500 expected 447496\n", "old-mapping-witness"),
+        ("# ** Fatal: native frame clocks got 418500 expected 447496\n# ** Error: unrelated error\n", "old-mapping-witness"),
+        ("# ** Fatal: native frame clocks got 418500 expected 447496\n# Errors: 2\n", "old-mapping-witness"),
+        (f"# ** Fatal: {pal} plus unrelated text\n", "missing-notification-witness"),
+        (f"# note: {pal}\n# ** Fatal: unrelated timeout\n", "missing-notification-witness"),
+        ("# note: expected PASS: HPS measurement fixture\n", "production"),
+        ("# PASS: HPS measurement fixture\n# ** Fatal: unexpected failure\n", "production"),
+    ]
+    for text, case in negatives:
+        try:
+            check_simulation_output(text, case)
+        except RuntimeError:
+            continue
+        raise AssertionError(f"Parser accepted unrelated failure/mention: {case}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--prepare-only", action="store_true", help="Only create and validate source-derived fixtures")
     args = parser.parse_args()
+    check_parser_mutations()
     top_path = ROOT / "AM2R.sv"
     framework_path = ROOT / "sys/hps_io.sv"
     top = top_path.read_text(encoding="utf-8")
@@ -203,22 +254,21 @@ def main() -> int:
     compile_output = run(["vlog", "-sv", "-work", str(library), *(str(ROOT / p) for p in inputs)], output / "vlog.log")
     if re.search(r"\*\*\s+(Fatal|Error):|Errors:\s*[1-9]", compile_output):
         raise RuntimeError(f"RTL compilation reported an error; see {output / 'vlog.log'}")
-    cases = [("production", [], None),
-             ("old-mapping-witness", ["-gOLD_MAPPING=1"], "native active dimensions"),
-             ("missing-notification-witness", ["-gMISSING_NOTIFICATION=1"], "PAL transition notification")]
-    for name, parameters, expected_failure in cases:
+    cases = [("production", []),
+             ("old-mapping-witness", ["-gOLD_MAPPING=1"]),
+             ("missing-notification-witness", ["-gMISSING_NOTIFICATION=1"])]
+    for name, parameters in cases:
         command = ["vsim", "-c", "-l", str(output / f"{name}-transcript.log"), "-lib", str(library), "am2r_hps_video_measurement_tb", *parameters,
                    "-do", "run -all; quit -code 0"]
         text = run(command, output / f"{name}.log")
-        fatal = re.search(r"\*\*\s+(Fatal|Error):|Errors:\s*[1-9]", text)
-        if expected_failure:
-            if not fatal or expected_failure not in text or "PASS: HPS measurement" in text:
-                raise RuntimeError(f"Mutation witness was not rejected for the expected reason: {name}; see {output}")
-            print(f"PASS: {name} rejected ({expected_failure}).", flush=True)
-        elif fatal or "PASS: HPS measurement" not in text:
-            raise RuntimeError(f"Production regression failed; see {output / (name + '.log')}\n{text[-5000:]}")
-        else:
+        try:
+            result = check_simulation_output(text, name)
+        except RuntimeError as error:
+            raise RuntimeError(f"{error}; see {output / (name + '.log')}\n{text[-5000:]}") from error
+        if name == "production":
             print(text[text.rfind("# PASS:"):].strip(), flush=True)
+        else:
+            print(f"PASS: {name} rejected ({result}).", flush=True)
     if framework_path.read_bytes() != framework_bytes or top_path.read_text(encoding="utf-8") != top:
         raise RuntimeError("Source changed during measurement regression; rerun against stable inputs")
     print(f"PASS: native/direct measurement and mutation witnesses; sys/ unchanged. Logs: {output}")
