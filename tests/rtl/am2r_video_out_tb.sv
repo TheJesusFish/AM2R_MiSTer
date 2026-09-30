@@ -6,6 +6,7 @@
 module am2r_video_out_tb;
 	parameter HSCALE = 0;
 	parameter GAMMA_EN = 0;
+	parameter integer HSCALE_VALUE = 4;
 
 	reg clk = 0;
 	always #20 clk = ~clk;
@@ -56,7 +57,7 @@ module am2r_video_out_tb;
 		.h_position(5'sd0),
 		.v_position(5'sd0),
 		.hscale_enable(HSCALE != 0),
-		.hscale(5'sd4),
+		.hscale(HSCALE_VALUE[4:0]),
 		.ce_pix_out(crt_ce),
 		.r_out(crt_r),
 		.g_out(crt_g),
@@ -119,6 +120,8 @@ module am2r_video_out_tb;
 	reg [7:0] expect_r, expect_g, expect_b;
 
 	initial begin
+		if (HSCALE_VALUE < -16 || HSCALE_VALUE > 15)
+			$fatal(1, "H Scale setting is outside the signed five-bit menu range");
 		// Inverting curve: output = 255 - input on every channel.
 		for (i = 0; i < 768; i = i + 1) begin
 			@(posedge clk_sys);
@@ -166,8 +169,8 @@ module am2r_video_out_tb;
 		if (good_pixels * 10 < de_pixels * 9)
 			$fatal(1, "Only %0d of %0d active pixels carry the expected colour", good_pixels, de_pixels);
 
-		$display("PASS am2r_video_out_tb HSCALE=%0d GAMMA_EN=%0d lines=%0d active=%0d pixels=%0d",
-			HSCALE, GAMMA_EN, hs_edges, de_edges, de_pixels);
+		$display("PASS am2r_video_out_tb HSCALE=%0d GAMMA_EN=%0d HSCALE_VALUE=%0d lines=%0d active=%0d pixels=%0d (scandoubler disabled)",
+			HSCALE, GAMMA_EN, HSCALE_VALUE, hs_edges, de_edges, de_pixels);
 		$finish;
 	end
 

@@ -117,17 +117,21 @@ the executable or Linux process image. Empty, corrupt, foreign-game, and
 unsupported states leave the process alive. Normal AM2R saves remain separately
 persistent under `/media/fat/saves/AM2R`.
 
-The FPGA increments a shared-DDR heartbeat at each native vblank. Ordinary
-60 Hz game rooms wait on that edge so ARM game ticks and frame publication are
-phase-locked to the actual 59.94 Hz scanout, rather than merely using the same
-nominal period on an independent HPS clock. Older RBFs, lower room rates, and
+The FPGA increments a shared-DDR heartbeat at each native vblank in NTSC and
+PAL60. Ordinary 60 Hz game rooms wait on that edge so ARM game ticks and frame
+publication are phase-locked to the actual 59.94 Hz scanout, rather than merely
+using the same nominal period on an independent HPS clock. PAL uses a separate
+59.94 Hz heartbeat while presenting at approximately 50 Hz, dropping some
+complete frames without slowing gameplay. Older RBFs, lower room rates, and
 explicit speed overrides retain an absolute timer derived from the raster
 period. The GPU runs at 88 MHz. Its paired-pixel
 fast path resolves two adjacent opaque or transparent pixels per common
 textured draw cycle. Completed frames rotate among four HPS-DDR buffers so the
 GPU can avoid the latest frame and the frames held by the native scanout and
-HDMI framebuffer readers without waiting a full raster; scanout still adopts
-only the newest complete buffer at a frame boundary. It prefetches each line
+HDMI framebuffer readers. If all four are protected, presentation waits for
+a free buffer; the extra buffer does not guarantee stall-free publication.
+Each scanout adopts a complete buffer at its own frame boundary. Native
+scanout prefetches each line
 through a show-ahead dual-clock FIFO. A dedicated 26.8229 MHz video PLL with
 pixel enable divided by four produces a 427×262 total raster: 320×240 active
 in 47.7 µs per line, 15.704 kHz and 59.94 Hz (429×312 at 50.10 Hz for PAL).
@@ -142,8 +146,9 @@ path explicitly synchronize/fall back to the CPU shadow and increment a
 per-reason counter; only the documented optional tile hook uses its ordinary
 sprite-part fallback.
 
-An on-hardware paired-marker test isolates the renderer/publication portion of
-latency: ten of twelve sampled input edges reached the normal rendered marker
+Before the independent HDMI framebuffer path was introduced, an on-hardware
+paired-marker test isolated the renderer/publication portion of latency:
+ten of twelve sampled input edges reached the normal rendered marker
 one captured frame after the immediate scanout marker, and two took two frames,
 for a mean of 1.17 frames (about 19.4 ms). The game still samples input once per
 60 Hz step, and controller polling, game animation/subpixel response, raster
@@ -153,7 +158,9 @@ would trade latency variance for tearing. There is no frame scaler queue,
 CRT-safe frame buffer, or intentional input delay in the core. The optional
 CRT horizontal-size adjustment uses a one-scanline DDA buffer and is an exact
 bypass when disabled. A controller-to-photodiode test is still required to
-establish end-to-end latency.
+establish end-to-end latency. Those historical measurements do not validate
+the new independent HDMI path; its buffering and relative cadence must be
+measured again.
 
 ## Evidence policy
 

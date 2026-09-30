@@ -64,10 +64,10 @@ static int snapshot(volatile const uint32_t *control, uint32_t previous,
     __sync_synchronize();
     // Submission invalidates magic and clears completion before republishing.
     // Reject a read that straddled submission or another GPU completion.
+    // Both high bits are the native-buffer index; all four values are valid.
     if (control[6] != completed || control[1] != submitted ||
         control[7] != completion || control[3] != commands ||
-        control[2] != command_phys || control[0] != GPU_MAGIC ||
-        (completion >> 30) >= 3u) return 0;
+        control[2] != command_phys || control[0] != GPU_MAGIC) return 0;
     sample->sequence = completed;
     sample->completion = completion;
     sample->commands = commands & UINT32_C(0xffff);

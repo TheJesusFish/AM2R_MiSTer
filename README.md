@@ -82,9 +82,10 @@ runtime and returns to `menu.rbf`.
 | PAL60 | 427×262 | 15.704 kHz | 59.94 Hz | PAL (4.43 MHz) |
 | PAL | 429×312 | 15.631 kHz | 50.10 Hz | PAL (4.43 MHz) |
 
-The 320 active pixels span 47.7 µs per line, the same width as the Mega
-Drive's 320-pixel mode, so the image fits inside the visible area of typical
-15 kHz televisions without the horizontal scaler. NTSC and PAL60 have
+The 320 active pixels span 47.7 µs per line, approximately 6.8% narrower than
+the previous 51.2 µs raster without resampling the artwork. This provides
+more horizontal overscan margin; actual fit still depends on the CRT and
+does not change the 240 active lines or vertical overscan. NTSC and PAL60 have
 identical RGB timing; PAL60 only changes the colour
 subcarrier for composite and S-Video. PAL centres the 240 active lines in the
 taller 50 Hz frame. The game still runs at full 60 Hz speed in PAL mode, so
@@ -105,8 +106,9 @@ of periodically repeating or dropping a frame.
 The core's **CRT Adjustments** submenu provides signed horizontal and vertical
 sync positioning plus an optional 75–123% horizontal line scaler. The scaler
 is intended for 15 kHz analog displays whose visible raster clips the native
-image. All controls default to zero/off; in that state the RTL is an exact
-clock, RGB, blanking, and sync bypass and adds no buffering.
+image. All controls default to zero/off; in that state the CRT-adjustment
+block bypasses scaling and positioning. The downstream gamma/video output
+pipeline still adds registered pixel delay, but no additional frame buffer.
 
 The **CRT UI V Inset** option moves the complete in-game HUD as one layer,
 keeping numbers, tanks, weapon icons and minimap aligned. It also adjusts
@@ -119,9 +121,10 @@ safe-area trial. The option is off by default.
 
 HDMI reads the GPU's published 320×240 frames directly from DDR through the
 framework framebuffer interface, so the position and horizontal-scale
-controls affect only the analog output. Two configurations still route the
-adjusted analog stream to HDMI: `direct_video=1`, which sends the native raster
-over HDMI, and `vga_scaler=1`, which instead sends the HDMI image to analog.
+controls affect only the analog output in the normal configuration.
+`direct_video=1` instead sends the adjusted native raster over HDMI.
+Conversely, `vga_scaler=1` (or `vga_fb`) routes the HDMI/scaler image to analog,
+bypassing the native analog positioning, H Scale and gamma path.
 The CRT UI V Inset is the exception: it changes where the runner draws the
 HUD and edge text inside the published frame, so HDMI shows the same small
 shift. Horizontal scaling buffers one scanline, not a frame. The

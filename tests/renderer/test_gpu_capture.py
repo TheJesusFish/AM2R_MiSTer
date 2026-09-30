@@ -10,6 +10,8 @@ import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "tools"))
+import replay_gpu_capture as replay
 
 
 def main():
@@ -43,7 +45,9 @@ def main():
                         "-o", str(binary)], check=True, env=env)
         capture = directory / "capture"
         capture.mkdir()
-        subprocess.run([str(binary), str(capture)], check=True)
+        fourth = directory / "fourth-buffer"
+        fourth.mkdir()
+        subprocess.run([str(binary), str(capture), str(fourth)], check=True)
         result = subprocess.run([sys.executable, str(ROOT / "tools/am2r_gpu_reference.py"),
                                  str(capture / "manifest.json")], check=True, capture_output=True, text=True)
         report = json.loads(result.stdout)
@@ -53,9 +57,25 @@ def main():
         assert all(entry["matching"] for entry in report["exports"].values())
         assert not report["presented"]
         print("C capture producer -> scalar replay: op10/11/12/13/14 narrow known-semantics fixture matched raw RGBA and both strided exports")
+        result = subprocess.run([sys.executable, str(ROOT / "tools/am2r_gpu_reference.py"),
+                                 str(fourth / "manifest.json")], check=True, capture_output=True, text=True)
+        report = json.loads(result.stdout)
+        manifest = json.loads((fourth / "manifest.json").read_text())
+        assert manifest["native_source_base"] == 0x3A0E1100
+        assert (fourth / "native-3.bin").stat().st_size == 320 * 240 * 4
+        assert report["framebuffer"]["matching"]
+        assert report["comparison_coverage"]["complete"]
+        assert report["presented"]
+        prepared = directory / "fourth-buffer-prepared"
+        prepared.mkdir()
+        replay.prepare(fourth / "manifest.json", prepared)
+        assert (prepared / "mapping.txt").read_text().splitlines()[0].split()[3] == "3"
+        print("C capture producer -> scalar/RTL preparation: native-water reads buffer3 exactly and presents buffer0; all four native inputs captured")
         if args.rtl:
-            subprocess.run([sys.executable, str(ROOT / "tools/replay_gpu_capture.py"),
-                            str(capture / "manifest.json"), "--output", str(directory / "rtl")], check=True)
+            for fixture in (capture, fourth):
+                subprocess.run([sys.executable, str(ROOT / "tools/replay_gpu_capture.py"),
+                                str(fixture / "manifest.json"), "--output",
+                                str(directory / (fixture.name + "-rtl"))], check=True)
 
 
 if __name__ == "__main__":

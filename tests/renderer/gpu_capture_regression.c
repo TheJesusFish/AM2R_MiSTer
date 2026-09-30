@@ -20,7 +20,7 @@ typedef long long ssize_t;
 #define GPU_NATIVE_WINDOW_PHYS 0x3a000000u
 #define GPU_NATIVE_BUFFER_OFFSET 0x100u
 #define GPU_NATIVE_BUFFER_BYTES MISTER_FB_BYTES
-#define GPU_NATIVE_BUFFER_COUNT 3u
+#define GPU_NATIVE_BUFFER_COUNT 4u
 #define GPU_COMMAND_BYTES 65536u
 #define GPU_COMMAND_CAPACITY 1024u
 #define GPU_COMMAND_BUFFER_COUNT 2u
@@ -55,8 +55,10 @@ static uint32_t g_gpu_sequence,g_gpu_pending_sequence,g_gpu_write_buffer;
 static bool g_gpu_pending_presents;
 static uint8_t textures[4u * 1024u * 1024u];
 static uint8_t* g_gpu_textures = textures;
-static uint32_t native[3][320 * 240];
-static uint32_t* g_gpu_native_buffers[3] = {native[0], native[1], native[2]};
+static uint32_t native[GPU_NATIVE_BUFFER_COUNT][320 * 240];
+static uint32_t* g_gpu_native_buffers[GPU_NATIVE_BUFFER_COUNT] = {
+    native[0], native[1], native[2], native[3]
+};
 static uint32_t control[32];
 static uint32_t* g_gpu_control = control;
 static struct { int frameCount, currentRoomIndex; void* renderer; } runner = {42, 160, NULL};
@@ -310,8 +312,38 @@ static void knownSemanticFixture(const char* directory) {
     assert(observerFences==2&&findFile("manifest.json"));
     exportFixture(directory);
 }
+static void fourthBufferWaterFixture(const char* directory) {
+    reset();memset(commands,0,sizeof(commands));
+    g_gpu_command_count=3;g_gpu_last_presented_buffer=3;
+    const uint32_t tableAddress=GPU_TEXTURE_PHYS+0x10000u;
+    // Four distinct native images make accidental index truncation observable.
+    for(unsigned buffer=0;buffer<GPU_NATIVE_BUFFER_COUNT;buffer++)
+        for(unsigned i=0;i<320u*240u;i++)
+            native[buffer][i]=((buffer+1u)<<20)|(i&0xffffu);
+    const uint16_t row[4]={7,11,13,17};
+    memcpy(textures+tableAddress-GPU_TEXTURE_PHYS,row,sizeof(row));
+    commands[0].word[0]=1;commands[0].word[1]=0xff000000u;
+    commands[1].word[0]=8u|(1ull<<16);
+    commands[1].word[1]=0xdeadbeefu; // Native water must ignore this pointer.
+    commands[1].word[2]=tableAddress|(23ull<<32);
+    commands[1].word[6]=UINT32_MAX;
+    assert(gpuCapturePrepare(44,GPU_COMMAND_PHYS));
+    File* fourth=findFile("native-3.bin");
+    assert(fourth&&fourth->size==MISTER_FB_BYTES);
+    assert(!memcmp(fourth->data,native[3],MISTER_FB_BYTES));
+    // Narrow independent result for one opaque native-water row. Presentation
+    // wraps from prior buffer3 to buffer0; captured native3 stays immutable.
+    memset(native[0],0,sizeof(native[0]));
+    for(unsigned x=0;x<row[1];x++)
+        native[0][23u*320u+row[0]+x]=native[3][row[3]*320u+row[2]+x];
+    g_gpu_last_presented_buffer=0;control[6]=44;
+    gpuCaptureComplete();
+    assert(findFile("manifest.json")&&findFile("expected.bin"));
+    assert(!memcmp(fourth->data,native[3],MISTER_FB_BYTES));
+    exportFixture(directory);
+}
 int main(int argc,char** argv) {
-    assert(argc<=2);
+    assert(argc<=3);
     reset();
     enabled = false;
     reject();
@@ -346,8 +378,8 @@ int main(int argc,char** argv) {
     assert(findFile("textures.bin")->data[0] == 11);
     assert(findFile("native-1.bin")->data[0] == 22);
     memset(textures, 33, sizeof(textures));
-    memset(native[2], 44, sizeof(native[2]));
-    g_gpu_last_presented_buffer = 2;
+    memset(native[3], 44, sizeof(native[3]));
+    g_gpu_last_presented_buffer = 3;
     control[6] = 19;
     gpuCaptureComplete();
     assert(g_gpu_capture.directory == -1);
@@ -443,7 +475,8 @@ int main(int argc,char** argv) {
     }
     commands[5].word[0]=12;assert(!gpuCapturePlanUnified(&g_gpu_capture));
     assert(observerFences==0&&fileCount==0);
-    knownSemanticFixture(argc==2?argv[1]:NULL);
+    knownSemanticFixture(argc>=2?argv[1]:NULL);
+    fourthBufferWaterFixture(argc>=3?argv[2]:NULL);
     puts("GPU capture: legacy boundaries, sparse targets/generic dependencies, exact raw BRAM observer fences, immutable descriptors/native buffers, partial exports, timeout/rejection and no-overwrite passed");
     return 0;
 }

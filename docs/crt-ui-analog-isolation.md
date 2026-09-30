@@ -16,7 +16,10 @@ interface (`rtl/am2r_hdmi_fb.sv`), so the CRT position and horizontal-scale
 controls no longer reach HDMI. `am2r_hdmi_fb` selects the latest published
 buffer at each HDMI vblank, before ascal copies `FB_BASE` at the falling edge
 of HDMI VSync, and reports the buffers ascal may hold so the GPU never
-overwrites them. Four native buffers keep publication non-blocking.
+overwrites them. Four native buffers reduce contention, but do not guarantee
+non-blocking publication: if all four are protected, the GPU waits until a
+reader releases one. Frame pacing and latency require measurement for both
+outputs.
 
 The UI inset still changes rendering coordinates before publication, so both
 outputs receive the moved HUD. Making it analog-only requires the second final

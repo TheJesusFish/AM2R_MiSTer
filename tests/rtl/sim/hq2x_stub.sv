@@ -5,7 +5,7 @@ module Hq2x #(parameter LENGTH = 320, parameter HALF_DEPTH = 0)
 (
 	input             clk,
 	input             ce_in,
-	input  [DWIDTH:0] inputpixel,
+	input  [(HALF_DEPTH ? 11 : 23):0] inputpixel,
 	input             mono,
 	input             disable_hq2x,
 	input             reset_frame,
@@ -13,8 +13,7 @@ module Hq2x #(parameter LENGTH = 320, parameter HALF_DEPTH = 0)
 	input             ce_out,
 	input       [1:0] read_y,
 	input             hblank,
-	output [DWIDTH:0] outpixel
+	output [(HALF_DEPTH ? 11 : 23):0] outpixel
 );
-	localparam DWIDTH = HALF_DEPTH ? 11 : 23;
 	assign outpixel = '0;
 endmodule
