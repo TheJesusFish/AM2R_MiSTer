@@ -17,6 +17,8 @@ module am2r_gpu_blend_pipeline_tb;
 	always #5 clk = ~clk;
 	integer cases_run = 0;
 	integer mode, lane, a, b, s, d, i, channel;
+	integer divisor_input;
+	reg [16:0] divisor_reference;
 	reg [31:0] random_state = 32'h461fee29;
 	reg [31:0] source0, source1, destination0, destination1;
 	reg [31:0] got, expected;
@@ -88,6 +90,17 @@ module am2r_gpu_blend_pipeline_tb;
 	endtask
 
 	initial begin
+		// Preserve the previous shift/add expression over its ENTIRE input
+		// domain, including bit16 and wraparound outside legal blend sums.
+		// The divider's public return value is the low byte after shifting.
+		for (divisor_input = 0; divisor_input < 131072; divisor_input = divisor_input + 1) begin
+			divisor_reference = 17'(divisor_input) + 17'd1 + (17'(divisor_input) >> 8);
+			if (dut.div255_floor(17'(divisor_input)) !== divisor_reference[15:8])
+				$fatal(1, "DIV255 exact 17-bit mismatch at input %0d", divisor_input);
+			if (divisor_input <= 65025 && dut.div255_floor(17'(divisor_input)) != divisor_input / 255)
+				$fatal(1, "DIV255 native floor mismatch at input %0d", divisor_input);
+		end
+		$display("PASS DIV255: all 131072 inputs preserve exact 17-bit arithmetic; legal blend range matches integer floor");
 		alphas[0] = 0; alphas[1] = 1; alphas[2] = 2; alphas[3] = 127;
 		alphas[4] = 128; alphas[5] = 253; alphas[6] = 254; alphas[7] = 255;
 		repeat (3) @(posedge clk);

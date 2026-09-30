@@ -157,7 +157,11 @@ Required external projects are deliberately not vendored. Their pinned
 revisions and roles are documented in [sources.md](docs/sources.md).
 
 - Quartus Prime Lite 17.0 builds the FPGA project with
-  `scripts/build-fpga.ps1`.
+  `scripts/build-fpga.ps1`. Before sealing the RBF, the build checks setup,
+  hold, recovery, removal and pulse-width timing at every installed operating
+  condition. Reports go under `data/build/timing-*`; ignored and unconstrained
+  paths still require separate review. The same post-fit check can be run with
+  `scripts/check-fpga-timing.ps1` after compilation has stopped.
 - ModelSim exercises the command, timing, scanout, framebuffer, and arbiter
   contracts with `scripts/test-rtl.ps1`.
 - Main_MiSTer commit `915ca3395aa5a26322007974faa757299a56b856`

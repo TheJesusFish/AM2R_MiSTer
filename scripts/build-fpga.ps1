@@ -28,6 +28,10 @@ try {
         throw 'Quartus produced an RBF, but TimeQuest reports unmet timing requirements.'
     }
 
+    # The normal Quartus report covers only its selected analysis corner.
+    # Require all installed operating conditions before sealing a release RBF.
+    & (Join-Path $PSScriptRoot 'check-fpga-timing.ps1') -QuartusSta (Join-Path (Split-Path -Parent $quartusPath) 'quartus_sta.exe')
+
     & python $provenance seal $token $rbfPath "$rbfPath.provenance.json"
     if ($LASTEXITCODE -ne 0) { throw 'FPGA artifact provenance could not be sealed.' }
 

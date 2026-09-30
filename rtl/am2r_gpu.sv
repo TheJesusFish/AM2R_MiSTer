@@ -379,8 +379,16 @@ module am2r_gpu
 
 	function automatic [7:0] div255_floor;
 		input [16:0] value;
+		reg [7:0] high_byte, low_byte;
+		reg [1:0] bump;
 		begin
-			div255_floor = (value + 17'd1 + (value >> 8)) >> 8;
+			// Exact low byte of (value + 1 + (value >> 8)) >> 8.
+			// Fold the correction into a byte comparison instead of two
+			// wide carry chains. Keep bit 16, including overflow cases.
+			high_byte = value[15:8];
+			low_byte = value[7:0];
+			bump = {1'b0, value[16]} + {1'b0, (low_byte >= ~high_byte)};
+			div255_floor = high_byte + {6'b0, bump};
 		end
 	endfunction
 
