@@ -116,8 +116,12 @@ module am2r_gpu
 	// and DDR request enable, exceeding the GPU clock budget.
 	(* preserve *) reg [31:0] source_row_addr;
 	reg [31:0] source_byte_addr, source_byte_addr_1, tint_color;
-	reg [15:0] source_row_index_stage;
-	reg [31:0] source_stride_stage, tint_color_stage;
+	// Split the row multiply across the existing setup/address boundary.
+	// Independent 16x16 products avoid a serial two-DSP multiply plus base add
+	// in one GPU clock. Preserve their output registers against retiming.
+	(* preserve *) reg [31:0] source_row_product_low;
+	(* preserve *) reg [15:0] source_row_product_high;
+	reg [31:0] tint_color_stage;
 	reg signed [24:0] tint_r_current, tint_g_current, tint_b_current, tint_a_current;
 	reg signed [15:0] tint_r_step, tint_g_step, tint_b_step, tint_a_step;
 	reg texture_cache_valid;
@@ -342,6 +346,13 @@ module am2r_gpu
 	wire [7:0] surface_burst_words = surface_words_remaining > 9'd64 ?
 		8'd64 : surface_words_remaining[7:0];
 	wire [31:0] generic_source_address = source_row_addr + {14'b0, generic_texture_x, 2'b0};
+	// Keep the original unsigned16 truncation of signed 16.16 UV coordinates.
+	// The generic path instead clamps its signed 32.32 coordinate first.
+	wire [15:0] source_row_index_now = state == ST_GENERIC ?
+		generic_clamp_texel(generic_uv[1], generic_texture_height) :
+		(state == ST_BLIT_PIXEL ? v_current[31:16] : v_start[31:16]);
+	wire [31:0] source_row_address_next = src_base + source_row_product_low +
+		{source_row_product_high, 16'd0};
 
 	always @(posedge clk) begin
 		reset_meta <= reset;
@@ -664,6 +675,14 @@ module am2r_gpu
 			subtract_factor0 <= ~tinted_pixel;
 			subtract_factor1 <= ~tinted_pixel_1;
 			state <= ST_SUBTRACT_PRODUCT;
+		end
+	endtask
+
+	task automatic stage_source_row;
+		begin
+			source_row_product_low <= source_row_index_now * src_stride[15:0];
+			// Only these low16 bits contribute to the final modulo-32 address.
+			source_row_product_high <= source_row_index_now * src_stride[31:16];
 		end
 	endtask
 
@@ -1254,6 +1273,7 @@ module am2r_gpu
 				end
 				ST_BLIT_ROW: begin
 					axis_stream_setup <= 0;
+					stage_source_row();
 					if (blit_y >= blit_height) begin
 						command_index <= command_index + 1'b1;
 						command_word <= 0;
@@ -1265,30 +1285,25 @@ module am2r_gpu
 						v_current <= v_start;
 						tint_color <= {clamp_tint(tint_a_current), clamp_tint(tint_b_current),
 						               clamp_tint(tint_g_current), clamp_tint(tint_r_current)};
-						// Register both multiplier operands before calculating the row
-						// address. This isolates the high-fanout UV/descriptor registers
-						// from the DSP input path at the GPU clock.
-						source_row_index_stage <= v_start >>> 16;
-						source_stride_stage <= src_stride;
 						state <= ST_ROW_SOURCE_ADDRESS;
 					end
 				end
 				ST_ROW_SOURCE_ADDRESS: begin
-					source_row_addr <= src_base + source_row_index_stage * source_stride_stage;
+					source_row_addr <= source_row_address_next;
 					state <= ST_BLIT_PIXEL;
 				end
 				ST_BLIT_PIXEL: begin
 					destination_linear <= destination_linear_calc;
+					// Speculate outside clipping/mode guards so their predicates do
+					// not enter a multiplier enable. Only affine setup consumes it.
+					stage_source_row();
 					// Speculatively stage the solid color before clipping/pair tests.
 					// Only the solid-pair shortcut consumes it directly; texture and
 					// affine paths replace it before blending. Keep coordinate logic
 					// out of the tint register/DSP enable without adding a clock.
 					tinted_pixel <= tint_color;
 					tinted_pixel_1 <= tint_color;
-					if (affine_mode) begin
-						source_row_index_stage <= v_current >>> 16;
-						source_stride_stage <= src_stride;
-					end else begin
+					if (!affine_mode) begin
 						source_byte_addr <= axis_source_addr0;
 						source_byte_addr_1 <= axis_source_addr1;
 					end
@@ -1400,7 +1415,7 @@ module am2r_gpu
 					end
 				end
 				ST_AFFINE_ROW_ADDRESS: begin
-					source_row_addr <= src_base + source_row_index_stage * source_stride_stage;
+					source_row_addr <= source_row_address_next;
 					state <= ST_AFFINE_SOURCE_ADDRESS;
 				end
 				ST_AFFINE_SOURCE_ADDRESS: begin
@@ -1802,6 +1817,7 @@ module am2r_gpu
 							end
 						end
 						GP_PIXEL: begin
+							stage_source_row();
 							if (generic_triangle && (generic_edge[0][63] || generic_edge[1][63] || generic_edge[2][63]))
 								advance_generic_pixel();
 							else begin
@@ -1809,8 +1825,6 @@ module am2r_gpu
 								fb_odd_read_address <= generic_linear[16:1];
 								if (generic_textured) begin
 									generic_texture_x <= generic_clamp_texel(generic_uv[0], generic_texture_width);
-									source_row_index_stage <= generic_clamp_texel(generic_uv[1], generic_texture_height);
-									source_stride_stage <= src_stride;
 									generic_state <= GP_ADDRESS;
 								end else begin
 									source_pixel <= 32'hffffffff;
@@ -1819,7 +1833,7 @@ module am2r_gpu
 							end
 						end
 						GP_ADDRESS: begin
-							source_row_addr <= src_base + source_row_index_stage * source_stride_stage;
+								source_row_addr <= source_row_address_next;
 							generic_state <= GP_TEXTURE;
 						end
 						GP_TEXTURE: begin
@@ -2122,9 +2136,7 @@ module am2r_gpu
 					end
 				end
 				ST_TILED_ROW_ADDRESS: begin
-					// Register the row multiply separately from the DDR address.
-					source_row_index_stage <= v_start >>> 16;
-					source_stride_stage <= src_stride;
+					stage_source_row();
 					water_destination_base <=
 						((water_destination_start_y + water_row_index) << 8) +
 						((water_destination_start_y + water_row_index) << 6) +
@@ -2132,8 +2144,7 @@ module am2r_gpu
 					state <= ST_TILED_SOURCE_ADDRESS;
 				end
 				ST_TILED_SOURCE_ADDRESS: begin
-					source_row_addr <= src_base +
-						source_row_index_stage * source_stride_stage;
+					source_row_addr <= source_row_address_next;
 					state <= ST_TILED_SOURCE_ACCEPT;
 				end
 				ST_TILED_SOURCE_ACCEPT: begin
