@@ -136,7 +136,8 @@ def main() -> None:
         "if (sw->surfaceCount == 0)",
         "swEnsureSurfaceCapacity(sw, 1);",
         "sw->surfaceCount = 1;",
-        "for (id = 1; id < sw->surfaceCount; ++id)",
+        "uint32_t id = sw->surfaceCount;",
+        "if (id >= SW_SURFACE_ID_LIMIT) return -1;",
     ):
         require(source, contract)
 

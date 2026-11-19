@@ -98,7 +98,7 @@ module am2r_hps_video_measurement_tb;
         reg [15:0] repeat_count;
         integer expected_h, expected_v;
         begin
-            expected_h = 4 * (pal_mode ? 429 : 427);
+            expected_h = 4 * (pal_mode ? 400 : 398);
             expected_v = expected_h * (pal_mode ? 312 : 262);
             dword(2, width); dword(4, height);
             dword(6, hperiod); dword(8, vperiod); dword(19, frame_clocks);

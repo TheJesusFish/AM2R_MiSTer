@@ -25,7 +25,7 @@ class CrtUiComposition(unittest.TestCase):
         names = (
             "swCrtUiHudSurface", "swCrtUiHudCompositeOffset", "swApplyCrtUiTextOffset",
             "swGpuIntersectSurfaceContentBounds",
-            "rasterizeQuad", "swBeginView", "worldToScreen", "swSurfaceExists",
+            "rasterizeQuad", "swSetViewTransform", "swBeginView", "worldToScreen", "swSurfaceExists",
             "swDrawPixelBuffer", "swDrawSurfaceColor",
         )
         zig = ROOT / "third_party/zig/zig-x86_64-windows-0.16.0/zig.exe"

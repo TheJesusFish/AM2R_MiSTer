@@ -1,0 +1,57 @@
+diff --git a/src/sw_renderer.c b/src/sw_renderer.c
+--- a/src/sw_renderer.c
++++ b/src/sw_renderer.c
+@@ -24,2 +24,3 @@
+ #include <math.h>
++#include <limits.h>
+ 
+@@ -2055,2 +2056,42 @@
+ #ifdef USE_MISTER
++// Decode/upload bounded small PNG atlas sets before gameplay, not on the
++// first beam/effect draw. Header-only preflight allocates no texture pixels
++// and preserves lazy-file position. Larger/other-format games remain lazy.
++static void swPrewarmTexturePages(SWRenderer* sw) {
++    if (!sw->unifiedEnabled || sw->textureCount == 0 || sw->textureCount > 32) return;
++    DataWin* dw = sw->base.dataWin;
++    const size_t budget = 96u * 1024u * 1024u;
++    size_t total = 0;
++    for (uint32_t i = 0; i < sw->textureCount; ++i) {
++        Texture* texture = &dw->txtr.textures[i];
++        uint8_t header[24];
++        if (texture->blobSize < sizeof(header) || texture->blobOffset == 0) return;
++        if (texture->blobData != nullptr) memcpy(header, texture->blobData, sizeof(header));
++        else if (dw->mappedFile != nullptr) memcpy(header, dw->mappedFile + texture->blobOffset, sizeof(header));
++        else {
++            if (dw->lazyLoadFile == nullptr || (uint64_t)texture->blobOffset > (uint64_t)LONG_MAX) return;
++            long position = ftell(dw->lazyLoadFile);
++            if (position < 0) return;
++            bool read = fseek(dw->lazyLoadFile, (long)texture->blobOffset, SEEK_SET) == 0 &&
++                fread(header, 1, sizeof(header), dw->lazyLoadFile) == sizeof(header);
++            if (fseek(dw->lazyLoadFile, position, SEEK_SET) != 0 || !read) return;
++        }
++        if (memcmp(header, "\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR", 16) != 0) return;
++        uint32_t width = (uint32_t)header[16] << 24 | (uint32_t)header[17] << 16 |
++            (uint32_t)header[18] << 8 | header[19];
++        uint32_t height = (uint32_t)header[20] << 24 | (uint32_t)header[21] << 16 |
++            (uint32_t)header[22] << 8 | header[23];
++        if (width == 0 || height == 0 || width > 8192 || height > 8192 ||
++            width > (budget - total) / (4u * height)) return;
++        total += (size_t)width * height * 4u;
++    }
++    for (uint32_t i = 0; i < sw->textureCount; ++i) {
++        if (!swEnsureTextureLoaded(sw, i) || sw->gpuTextureAddresses[i] == 0) {
++            logWarn("MiSTer texture prewarm stopped at page %u\n", i);
++            return;
++        }
++    }
++    logInfo("MiSTer prewarmed %u texture pages (%zu RGBA bytes) before gameplay\n", sw->textureCount, total);
++}
++
+ static bool swOffscreenEnabledFromSetting(const char* setting, bool floorTint) {
+@@ -2110,2 +2152,5 @@
+     logInfo("SW: software renderer initialized (%u lazy texture pages)\n", sw->textureCount);
++#ifdef USE_MISTER
++    swPrewarmTexturePages(sw);
++#endif
+ }
+

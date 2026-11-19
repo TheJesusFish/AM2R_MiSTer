@@ -1,0 +1,106 @@
+diff --git a/src/vm_builtins.c b/src/vm_builtins.c
+index a6cb0c2..d9b6093 100644
+--- a/src/vm_builtins.c
++++ b/src/vm_builtins.c
+@@ -6357,8 +6357,14 @@ static RValue builtin_place_free(VMContext* ctx, RValue* args, int32_t argCount)
+     return RValue_makeBool(free);
+ }
+ 
+-// place_empty(x, y) - returns true if no instance overlaps at position (x, y), checking ALL instances (not just solid)
+-static bool placeEmptyAt(Runner* runner, Instance* caller, GMLReal testX, GMLReal testY) {
++// Synchronize at the real caller position, not at the temporary probe. Keep
++// the original instance order and exact mask test, but reject distant objects
++// with their validated grid bounds before recomputing rotated sprite bounds.
++// Bounce/contact helpers make many such probes per particle and per frame.
++static bool placeUnoccupiedAt(Runner* runner, Instance* caller,
++                               GMLReal testX, GMLReal testY, bool solidOnly) {
++    if (runner->spatialGrid != nullptr)
++        SpatialGrid_syncGrid(runner, runner->spatialGrid);
+     GMLReal savedX = caller->x;
+     GMLReal savedY = caller->y;
+     caller->x = testX;
+@@ -6371,7 +6377,14 @@ static bool placeEmptyAt(Runner* runner, Instance* caller, GMLReal testX, GMLRea
+         int32_t instanceCount = (int32_t) arrlen(runner->instances);
+         repeat(instanceCount, i) {
+             Instance* other = runner->instances[i];
+-            if (!other->active || other == caller) continue;
++            if (!other->active || (solidOnly && !other->solid) || other == caller) continue;
++
++            if (runner->spatialGrid != nullptr && other->collisionGridBBoxValid &&
++                (other->collisionGridRight < callerBBox.left ||
++                 other->collisionGridLeft > callerBBox.right ||
++                 other->collisionGridBottom < callerBBox.top ||
++                 other->collisionGridTop > callerBBox.bottom))
++                continue;
+ 
+             InstanceBBox otherBBox = Collision_computeBBox(runner, other);
+             if (!otherBBox.valid) continue;
+@@ -6388,35 +6401,14 @@ static bool placeEmptyAt(Runner* runner, Instance* caller, GMLReal testX, GMLRea
+     return empty;
+ }
+ 
++// place_empty probes all active instances, not only solids.
++static bool placeEmptyAt(Runner* runner, Instance* caller, GMLReal testX, GMLReal testY) {
++    return placeUnoccupiedAt(runner, caller, testX, testY, false);
++}
++
+ // placeFreeAt - returns true if no SOLID instance overlaps at position (x, y)
+ static bool placeFreeAt(Runner* runner, Instance* caller, GMLReal testX, GMLReal testY) {
+-    GMLReal savedX = caller->x;
+-    GMLReal savedY = caller->y;
+-    caller->x = testX;
+-    caller->y = testY;
+-
+-    InstanceBBox callerBBox = Collision_computeBBox(runner, caller);
+-    bool free = true;
+-
+-    if (callerBBox.valid) {
+-        int32_t instanceCount = (int32_t) arrlen(runner->instances);
+-        repeat(instanceCount, i) {
+-            Instance* other = runner->instances[i];
+-            if (!other->active || !other->solid || other == caller) continue;
+-
+-            InstanceBBox otherBBox = Collision_computeBBox(runner, other);
+-            if (!otherBBox.valid) continue;
+-
+-            if (Collision_instancesOverlapPrecise(runner, caller, other, callerBBox, otherBBox)) {
+-                free = false;
+-                break;
+-            }
+-        }
+-    }
+-
+-    caller->x = savedX;
+-    caller->y = savedY;
+-    return free;
++    return placeUnoccupiedAt(runner, caller, testX, testY, true);
+ }
+ 
+ // noCollisionWithObject - returns true if no instance of the given object overlaps at position (x, y)
+@@ -11651,7 +11643,7 @@ static RValue builtin_sprite_set_bbox_mode(VMContext* ctx, RValue* args, int32_t
+     int32_t instanceCount = (int32_t)arrlen(runner->instances);
+     for (int32_t i = 0; i < instanceCount; i++) {
+         Instance* inst = runner->instances[i];
+-        if (!inst->active || inst->destroyed) continue;
++        if (inst->destroyed) continue;
+ 
+         int32_t activeMask = (inst->maskIndex >= 0) ? inst->maskIndex : inst->spriteIndex;
+         if (activeMask == spriteIndex) {
+@@ -11668,6 +11660,17 @@ static RValue builtin_sprite_set_offset(VMContext* ctx, RValue* args, MAYBE_UNUS
+     if (0 > spriteIndex || (uint32_t) spriteIndex >= ctx->dataWin->sprt.count) return RValue_makeReal(0.0);
+     ctx->dataWin->sprt.sprites[spriteIndex].originX = (int32_t) RValue_toReal(args[1]);
+     ctx->dataWin->sprt.sprites[spriteIndex].originY = (int32_t) RValue_toReal(args[2]);
++    // Origin changes also move collision bounds. Inactive instances retain
++    // grid cells for activation queries, so invalidate those as well.
++    Runner* runner = ctx->runner;
++    int32_t instanceCount = (int32_t)arrlen(runner->instances);
++    for (int32_t i = 0; i < instanceCount; ++i) {
++        Instance* inst = runner->instances[i];
++        if (inst->destroyed) continue;
++        int32_t activeMask = inst->maskIndex >= 0 ? inst->maskIndex : inst->spriteIndex;
++        if (activeMask == spriteIndex)
++            SpatialGrid_markInstanceAsDirty(runner->spatialGrid, inst);
++    }
+     return RValue_makeReal(0.0);
+ }
+ 

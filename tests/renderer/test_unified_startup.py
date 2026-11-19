@@ -26,6 +26,7 @@ def main():
         extract(sw, "swOffscreenEnabledFromSetting"),
         extract(sw, "swUnifiedEnabledFromSetting"),
         extract(bridge, "swUnifiedFatal"),
+        "static void swPrewarmTexturePages(SWRenderer* sw) { assert(sw->textureLoaded && sw->gpuTextureAddresses && sw->hostFramebuffer); }",
         extract(sw, "swInit"),
         extract(backend, "gpuRestoreUnifiedModeAfterProbe"),
     ])

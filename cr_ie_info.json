@@ -1,0 +1,22 @@
+{
+	"system" : {
+		"platform" : "windows64",
+		"os_name" : "Windows 10",
+		"os_version" : "10.0"
+	},
+	"error" : {
+		"executable" : "quartus_fit",
+		"comment" : "not_applicable",
+		"error_message" : "DBM_PDB<CDB_ATOM_NETLIST>::write_file(cdb_atom_netlist, cdb_filename.c_str(), \"\")",
+		"source_file" : "/quartus/db/csyn/csyn_atom_save_restore.cpp",
+		"line" : "163",
+		"stack_trace" : "\t0x7ffe02b6b506: DB_CSYN + 0xb506 (?save_atom_netlist@CSYN_ATOM_SAVE_RESTORE@@QEAA_NH@Z + 0x1e6)\n\t0x7ffe02b9f95d: DB_CSYN + 0x3f95d (?save_state@CSYN_ENV@@UEAAHXZ + 0x10d)\n\t0x7ffe7c5f2da6: fitter_fsyn + 0x2da6 (?save_state@FSYN_ENV@@UEAAHXZ + 0x26)\n\t0x7ffe02b731f4: DB_CSYN + 0x131f4 (?save_netlist@CSYN_API@@QEAAHXZ + 0x64)\n\t0x7ffe02b675c1: DB_CSYN + 0x75c1 (?init_and_save_netlist@CSYN_ALGORITHM_BASE@@AEAAXXZ + 0x11)\n\t0x7ffe02b658a6: DB_CSYN + 0x58a6 (?work@CSYN_ALGORITHM_BASE@@QEAA_NXZ + 0x406)\n\t0x7ffe02ba7c18: DB_CSYN + 0x47c18 (?run_single_algorithm@CSYN_EXPERT@@IEAA_NPEAVCSYN_ALGORITHM_BASE@@@Z + 0x278)\n\t0x7ffe02ba69da: DB_CSYN + 0x469da (?run_flow@CSYN_EXPERT@@IEAAXXZ + 0x10a)\n\t0x7ffe02ba3ea1: DB_CSYN + 0x43ea1 (?early_fsyn_flow@CSYN_EXPERT@@IEAA_NW4e_fsyn_flow@@@Z + 0x361)\n\t0x7ffe02ba28d7: DB_CSYN + 0x428d7 (?do_physical_synthesis@CSYN_EXPERT@@UEAA_NW4e_fsyn_flow@@@Z + 0x607)\n\t0x7ffe04b64566: fitter_fsv + 0x24566 (?fitter_preparation_post_fpp@FSV_EXPERT@@QEAA_N_N@Z + 0xc56)\n\t0x7ffe04b5dfff: fitter_fsv + 0x1dfff (?fitter_preparation_run_family_fitter_preparation@FSV_EXPERT_BASE@@QEBA_N_N@Z + 0x4f)\n\t0x7ffe04b5daf8: fitter_fsv + 0x1daf8 (?fitter_preparation@FSV_EXPERT_BASE@@QEBA_NXZ + 0x68)\n\t0x7ffe04b5e750: fitter_fsv + 0x1e750 (?invoke_fitter@FSV_EXPERT_BASE@@QEBA_NXZ + 0x3b0)\n\t0x7ffe04b5c872: fitter_fsv + 0x1c872 (fsv_execute + 0x22)\n\t0x7ffe055fe900: FITTER_FMAIN + 0xe900 (?fmain_start@@YA_NPEAVCMP_FACADE@@@Z + 0x900)\n\t0x7ffdff0e41b1: comp_qfit_legacy_flow + 0x41b1 (qfit_execute_fit + 0x1bd)\n\t0x7ffdff0e5384: comp_qfit_legacy_flow + 0x5384 (QFIT_FRAMEWORK::execute + 0x2a0)\n\t0x7ffdff0e267f: comp_qfit_legacy_flow + 0x267f (qfit_legacy_flow_run_legacy_fitter_flow + 0x1c7)\n\t 0x670a4410: tcl86 + 0x14410 (TclInvokeStringCommand + 0xf0)\n\t 0x670a61e2: tcl86 + 0x161e2 (TclNRRunCallbacks + 0x62)\n\t 0x670a7a65: tcl86 + 0x17a65 (TclEvalEx + 0xa65)\n\t 0x67136f8b: tcl86 + 0xa6f8b (Tcl_FSEvalFileEx + 0x22b)\n\t 0x67135646: tcl86 + 0xa5646 (Tcl_EvalFile + 0x36)\n\t0x7ffe62192606: comp_qexe + 0x12606 (?qexe_evaluate_tcl_script@@YA_NAEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@@Z + 0x376)\n\t0x7ffe62191864: comp_qexe + 0x11864 (qexe_do_tcl + 0x334)\n\t0x7ffe62196755: comp_qexe + 0x16755 (?qexe_run_tcl_option@@YA_NPEAVQEXE_FRAMEWORK@@PEBDPEAV?$list@V?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@V?$allocator@V?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@@2@@std@@_N@Z + 0x585)\n\t0x7ffe3e6a80c3: comp_qcu + 0x380c3 (?qcu_run_tcl_option@@YA_NPEAVQCU_FRAMEWORK@@PEBDPEAV?$list@V?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@V?$allocator@V?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@@2@@std@@_N@Z + 0x1003)\n\t0x7ffe621960aa: comp_qexe + 0x160aa (qexe_run + 0x39a)\n\t0x7ffe62196e51: comp_qexe + 0x16e51 (?qexe_standard_main@@YAHPEAVQEXE_FRAMEWORK@@PEAPEBUQEXE_OPTION_DEFINITION@@HPEAPEBD@Z + 0xc1)\n\t0x7ff68bb32233: quartus_fit + 0x2233 (?qfit2_main@@YAHHPEAPEBD@Z + 0x73)\n\t0x7ffe79ed2d68: CCL_MSG + 0x12d68 (?msg_main_thread@@YAPEAXPEAX@Z + 0x18)\n\t0x7ffe79ed454e: CCL_MSG + 0x1454e (?msg_thread_wrapper@@YAPEAXP6APEAXPEAX@Z0@Z + 0x6e)\n\t0x7ffe79fd5b00: ccl_mem + 0x15b00 (?mem_thread_wrapper@@YAPEAXP6APEAXPEAX@Z0@Z + 0x70)\n\t0x7ffe79ed2631: CCL_MSG + 0x12631 (?msg_exe_main@@YAHHPEAPEBDP6AHH0@Z@Z + 0xa1)\n\t0x7ff68bb3287e: quartus_fit + 0x287e (__tmainCRTStartup + 0x10e)\n\t0x7ffe8f9acd86: KERNEL32 + 0x2cd86 (BaseThreadInitThunk + 0x16)\n\t0x7ffe9096caeb: ntdll + 0xacaeb (RtlUserThreadStart + 0x2b)\n",
+		"subsystem" : "CSYN"
+	},
+	"quartus" : {
+		"quartus_bits" : "64",
+		"version" : "17.0.2",
+		"build" : "602",
+		"edition" : "Lite Edition"
+	}
+}

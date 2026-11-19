@@ -1,0 +1,233 @@
+--- a/src/sw_renderer.c
++++ b/src/sw_renderer.c
+@@ -2157,6 +2157,7 @@
+ 
+ static void swBeginFrame(Renderer* renderer, int32_t gameW, int32_t gameH, int32_t windowW, int32_t windowH) {
+     SWRenderer* sw = (SWRenderer*) renderer;
++    sw->applicationViewValid = false;
+     sw->gameW = gameW;
+     sw->gameH = gameH;
+ #ifdef USE_MISTER
+@@ -2268,7 +2269,7 @@
+                (size_t)copyW * 4);
+ }
+ 
+-static void swBeginView(Renderer* renderer, int32_t viewX, int32_t viewY, int32_t viewW, int32_t viewH, int32_t portX, int32_t portY, int32_t portW, int32_t portH, float viewAngle) {
++static void swSetViewTransform(Renderer* renderer, int32_t viewX, int32_t viewY, int32_t viewW, int32_t viewH, int32_t portX, int32_t portY, int32_t portW, int32_t portH, float viewAngle) {
+     SWRenderer* sw = (SWRenderer*) renderer;
+     // Set scissor to port rectangle
+     sw->scissorX = portX;
+@@ -2308,6 +2309,20 @@
+     Matrix4f_multiply(&sw->worldToScreen, &viewport, &projection);
+ }
+ 
++static void swBeginView(Renderer* renderer, int32_t viewX, int32_t viewY, int32_t viewW, int32_t viewH, int32_t portX, int32_t portY, int32_t portW, int32_t portH, float viewAngle) {
++    SWRenderer* sw = (SWRenderer*)renderer;
++    swSetViewTransform(renderer, viewX, viewY, viewW, viewH, portX, portY, portW, portH, viewAngle);
++    if (sw->currentSurface == renderer->runner->applicationSurfaceId &&
++        !renderer->runner->inGuiPass) {
++        sw->applicationViewTransform = sw->worldToScreen;
++        sw->applicationScissorX = sw->scissorX;
++        sw->applicationScissorY = sw->scissorY;
++        sw->applicationScissorW = sw->scissorW;
++        sw->applicationScissorH = sw->scissorH;
++        sw->applicationViewValid = true;
++    }
++}
++
+ static void swEndView(Renderer* renderer) {
+     (void) renderer;
+     // Nothing to flush in immediate mode
+@@ -2322,12 +2337,12 @@
+     SWRenderer* sw = (SWRenderer*)renderer;
+     if (targetSurfaceId == RENDER_TARGET_HOST_FRAMEBUFFER) swUseHostTarget(sw);
+     else if (!swUseSurfaceTarget(sw, targetSurfaceId)) swUseHostTarget(sw);
+-    swBeginView(renderer, 0, 0, guiW, guiH, portX, portY, portW, portH, 0.0f);
++    swSetViewTransform(renderer, 0, 0, guiW, guiH, portX, portY, portW, portH, 0.0f);
+ }
+ 
+ static void swSetGuiProjection(Renderer* renderer, int32_t guiW, int32_t guiH, int32_t portW, int32_t portH, bool renderingToUserSurface) {
+     (void)renderingToUserSurface;
+-    swBeginView(renderer, 0, 0, guiW, guiH, 0, 0, portW, portH, 0.0f);
++    swSetViewTransform(renderer, 0, 0, guiW, guiH, 0, 0, portW, portH, 0.0f);
+ }
+ 
+ static void swEndGUI(Renderer* renderer) {
+@@ -3227,12 +3242,14 @@
+         swEnsureSurfaceCapacity(sw, 1);
+         sw->surfaceCount = 1;
+     }
+-    uint32_t id;
+-    for (id = 1; id < sw->surfaceCount; ++id) if (!sw->surfaceExistsFlags[id]) break;
+-    if (id == sw->surfaceCount) {
+-        swEnsureSurfaceCapacity(sw, id + 1);
+-        sw->surfaceCount = id + 1;
+-    }
++    // Native AM2R 1.1 advances its public surface ID after every allocation.
++    // Reusing a hole aliases stale script handles: transition cleanup can
++    // otherwise free a newly-created boss image on every Step. Pixel storage
++    // and GPU arena records still recycle; only logical identities retire.
++    uint32_t id = sw->surfaceCount;
++    if (id >= SW_SURFACE_ID_LIMIT) return -1;
++    swEnsureSurfaceCapacity(sw, id + 1);
++    sw->surfaceCount = id + 1;
+ #ifdef USE_MISTER
+     swUnifiedRelease(sw, (int32_t)id);
+     swOffscreenDiscard(sw, (int32_t)id);
+@@ -3281,11 +3298,21 @@
+ }
+ 
+ static bool swSetRenderTarget(Renderer* renderer, int32_t id, bool implicitApplicationSurface) {
+-    (void)implicitApplicationSurface;
+     SWRenderer* sw = (SWRenderer*)renderer;
+     if (!swUseSurfaceTarget(sw, id)) return false;
+-    sw->scissorX=0; sw->scissorY=0; sw->scissorW=sw->fbWidth; sw->scissorH=sw->fbHeight;
+-    swBeginView(renderer, 0, 0, sw->fbWidth, sw->fbHeight, 0, 0, sw->fbWidth, sw->fbHeight, 0.0f);
++    if (implicitApplicationSurface && id == renderer->runner->applicationSurfaceId &&
++        sw->applicationViewValid) {
++        // A Draw event can build a surface and return to the room midway
++        // through the draw list. Preserve the actual rotated/scaled viewport,
++        // not a zero-origin view or a guessed camera translation.
++        sw->worldToScreen = sw->applicationViewTransform;
++        sw->scissorX = sw->applicationScissorX;
++        sw->scissorY = sw->applicationScissorY;
++        sw->scissorW = sw->applicationScissorW;
++        sw->scissorH = sw->applicationScissorH;
++    } else {
++        swSetViewTransform(renderer, 0, 0, sw->fbWidth, sw->fbHeight, 0, 0, sw->fbWidth, sw->fbHeight, 0.0f);
++    }
+     return true;
+ }
+ 
+@@ -3331,6 +3358,8 @@
+ #ifdef USE_MISTER
+     swUnifiedRelease(sw, id);
+     swOffscreenDiscard(sw, id);
++    free(sw->offscreenJournals[id]);
++    sw->offscreenJournals[id] = nullptr;
+     MisterGpu_releaseTexture(sw->surfacePixels[id]);
+ #endif
+     free(sw->surfacePixels[id]); sw->surfacePixels[id]=nullptr;
+@@ -3508,6 +3537,7 @@
+ void SWRenderer_fastStateResetSurfaces(Renderer* renderer) {
+     SWRenderer* sw = (SWRenderer*)renderer;
+     if (sw == nullptr) return;
++    sw->applicationViewValid = false;
+     VM_surfaceTraceResetRecords();
+     Am2rOrphanSurfaceReset();
+     if (sw->unifiedEnabled) {
+@@ -3519,6 +3549,8 @@
+     swUseHostTarget(sw);
+     for (uint32_t id = 0; id < sw->surfaceCount; ++id) {
+         swOffscreenDiscard(sw, (int32_t)id);
++        free(sw->offscreenJournals[id]);
++        sw->offscreenJournals[id] = nullptr;
+         if (sw->surfacePixels[id] != nullptr)
+             MisterGpu_releaseTexture(sw->surfacePixels[id]);
+         free(sw->surfacePixels[id]);
+@@ -3539,12 +3571,22 @@
+     sw->am2rMapSurfaceDiscoveryHash = 0;
+ }
+ 
++bool SWRenderer_fastStateReserveSurfaceIds(Renderer* renderer, uint32_t count) {
++    SWRenderer* sw = (SWRenderer*)renderer;
++    if (sw == nullptr || count == 0 || count > SW_SURFACE_ID_LIMIT) return false;
++    // Freed trailing IDs are still retired identities. Restore the serialized
++    // high-water mark, not merely the maximum currently-live surface ID.
++    swEnsureSurfaceCapacity(sw, count);
++    sw->surfaceCount = count;
++    return true;
++}
++
+ bool SWRenderer_fastStateRestoreSurface(Renderer* renderer, uint32_t id,
+                                         int32_t width, int32_t height,
+                                         uint32_t revision,
+                                         const uint8_t* rgba) {
+     SWRenderer* sw = (SWRenderer*)renderer;
+-    if (sw == nullptr || id == 0 || width <= 0 || height <= 0 ||
++    if (sw == nullptr || id == 0 || id >= SW_SURFACE_ID_LIMIT || width <= 0 || height <= 0 ||
+         width > 4096 || height > 4096 || rgba == nullptr)
+         return false;
+     swEnsureSurfaceCapacity(sw, id + 1);
+--- a/src/sw_renderer.h
++++ b/src/sw_renderer.h
+@@ -3,6 +3,9 @@
+ #include "common.h"
+ #include "renderer.h"
+ #include "matrix_math.h"
++
++// Bound logical-ID metadata independently of live pixel/GPU allocations.
++#define SW_SURFACE_ID_LIMIT 65536u
+ 
+ #ifdef USE_MISTER
+ typedef struct SWOffscreenJournal SWOffscreenJournal;
+@@ -66,6 +69,8 @@
+     bool unifiedEnabled;
+     bool unifiedStrict;
+     uint32_t* unifiedSurfaceHandles;
++    uint32_t unifiedSourceIds[16]; // Validated pointer lookup, never ownership.
++    uint32_t unifiedSourceCursor;
+     uint32_t unifiedHostHandle;
+     uint32_t unifiedCpuDepth;
+     uint64_t unifiedGpuDraws;
+@@ -78,6 +83,10 @@
+ 
+     // View transform: world coords -> framebuffer pixel coords
+     Matrix4f worldToScreen;
++    Matrix4f applicationViewTransform;
++    int32_t applicationScissorX, applicationScissorY;
++    int32_t applicationScissorW, applicationScissorH;
++    bool applicationViewValid;
+ 
+     // Scissor rect (framebuffer pixel coords)
+     int32_t scissorX, scissorY, scissorW, scissorH;
+@@ -181,6 +190,7 @@
+ // Exact-ID dynamic-surface access used by AM2R logical save states. Static
+ // texture pages and FPGA-derived caches are intentionally outside the format.
+ void SWRenderer_fastStateResetSurfaces(Renderer* renderer);
++bool SWRenderer_fastStateReserveSurfaceIds(Renderer* renderer, uint32_t count);
+ void SWRenderer_materializeSurfaces(Renderer* renderer);
+ #if defined(MISTER_RENDER_DIAGNOSTICS)
+ bool SWRenderer_misterOffscreenReference(Renderer* renderer, uint32_t address,
+--- a/src/am2r_fast_state.c
++++ b/src/am2r_fast_state.c
+@@ -990,8 +990,13 @@
+ static bool readSurfaces(FastReader* reader, Runner* runner) {
+     uint32_t count = readerU32(reader);
+     int32_t current = readerI32(reader);
+-    if (!countOkay(reader, count) || count > 4096) return false;
++    if (!countOkay(reader, count) || count == 0 || count > SW_SURFACE_ID_LIMIT) {
++        reader->error = EBADMSG; return false;
++    }
+     SWRenderer_fastStateResetSurfaces(runner->renderer);
++    if (!SWRenderer_fastStateReserveSurfaceIds(runner->renderer, count)) {
++        reader->error = ENOMEM; return false;
++    }
+     repeat(count, id) {
+         if (!readerU8(reader)) continue;
+         int32_t width = readerI32(reader), height = readerI32(reader);
+--- a/src/sw_unified_renderer.h
++++ b/src/sw_unified_renderer.h
+@@ -91,8 +91,20 @@
+ 
+ static int32_t swUnifiedSourceId(SWRenderer* sw, const uint8_t* source) {
+     if (source == sw->hostFramebuffer) return RENDER_TARGET_HOST_FRAMEBUFFER;
+-    for (uint32_t id = 1; id < sw->surfaceCount; ++id)
+-        if (sw->surfaceExistsFlags[id] && source == sw->surfacePixels[id]) return (int32_t)id;
++    // Hot surfaces must not scan every retired ID after a long play session.
++    // Fully associative avoids allocator-alignment collisions between HUD,
++    // Samus and boss buffers. Validate every hit across free/restore/reuse.
++    for (unsigned i = 0; i < 16; ++i) {
++        uint32_t cached = sw->unifiedSourceIds[i];
++        if (cached > 0 && cached < sw->surfaceCount && sw->surfaceExistsFlags[cached] &&
++            source == sw->surfacePixels[cached]) return (int32_t)cached;
++    }
++    for (uint32_t id = 1; id < sw->surfaceCount; ++id) {
++        if (sw->surfaceExistsFlags[id] && source == sw->surfacePixels[id]) {
++            sw->unifiedSourceIds[sw->unifiedSourceCursor++ & 15u] = id;
++            return (int32_t)id;
++        }
++    }
+     return -2;
+ }
+ 

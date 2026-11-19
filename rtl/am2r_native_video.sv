@@ -1,14 +1,14 @@
 //============================================================================
 // AM2R native 320x240p scanout
 //
-// CLK_VIDEO is a dedicated 26.8229 MHz PLL output (50 MHz x 103 / 4 / 48).
-// CE_PIXEL divides it by four for a 6.7057 MHz pixel clock, so the 320 active
-// pixels span 47.7 us: the same active width as the Mega Drive's H40 mode,
-// inside the visible area of typical 15 kHz televisions. Two rasters are
-// available:
+// CLK_VIDEO is a dedicated 25 MHz PLL output. CE_PIXEL divides it by four for
+// a 6.25 MHz pixel clock, restoring the original 51.2 us active line without
+// an unconditional horizontal squeeze. Optional CRT width compensation is
+// handled by am2r_video_hscale; it must not alter this default raster.
+// Two rasters are available:
 //
-//   60 Hz (NTSC and PAL60): 427x262, 15.704 kHz / 59.94 Hz
-//   50 Hz (PAL):            429x312, 15.631 kHz / 50.10 Hz
+//   60 Hz (NTSC and PAL60): 398x262, 15.704 kHz / 59.94 Hz
+//   50 Hz (PAL):            400x312, 15.625 kHz / 50.08 Hz
 //
 // NTSC and PAL60 share one raster; they differ only in the composite/S-Video
 // colour subcarrier, which Main_MiSTer selects. The 50 Hz raster centres the
@@ -17,7 +17,7 @@
 // clock for HDMI/ascal.
 //
 // AM2R is a 60 Hz game. In PAL mode the pacing heartbeat therefore stays on
-// the 59.94 Hz raster period from a free-running counter; the GPU's triple
+// the 59.94 Hz raster period from a free-running counter; the GPU's four
 // buffering and the reader's vblank latch drop one published frame in six.
 //
 // SPDX-License-Identifier: GPL-2.0-or-later
@@ -39,6 +39,9 @@ module am2r_native_video
 	output reg         vblank = 0,
 	output reg         vsync = 0,
 	output reg         new_frame = 0,
+	// Diagnostic edge after the reader's vblank late-latch window, at the
+	// first active pixel. Does not drive pacing, buffer selection or video.
+	output reg         active_frame = 0,
 	output reg         new_line = 0,
 	output reg         pace_tick = 0,
 	// The raster currently being generated is the 50 Hz PAL raster.
@@ -49,21 +52,21 @@ module am2r_native_video
 );
 
 	localparam integer H_ACTIVE = 320;
-	// 4.2 us front porch and 4.8 us sync; the remaining 7.0 us back porch
-	// centres the 47.7 us image in the standard 52.6 us active window.
-	localparam integer H_FP = 28;
-	localparam integer H_SYNC = 32;
+	// Original 2.56 us front porch and 4.8 us sync; 5.12 us back porch at
+	// 60 Hz (5.44 us for PAL). Keep 320 pixels / 6.25 MHz = 51.2 us active.
+	localparam integer H_FP = 16;
+	localparam integer H_SYNC = 30;
 	localparam integer V_ACTIVE = 240;
 	localparam integer V_SYNC = 3;
 	localparam integer CE_DIV = 4;
 
-	localparam integer H_TOTAL_60 = 427;
+	localparam integer H_TOTAL_60 = 398;
 	localparam integer V_FP_60 = 5;
 	localparam integer V_TOTAL_60 = 262;
 
-	// 429 pixels is the closest line to PAL's 15.625 kHz. The 50 extra lines
-	// are split around the 60 Hz porches so the image stays centred.
-	localparam integer H_TOTAL_50 = 429;
+	// 6.25 MHz / 400 is exactly PAL's 15.625 kHz. The 50 extra lines are
+	// split around the 60 Hz porches so the image stays centred.
+	localparam integer H_TOTAL_50 = 400;
 	localparam integer V_FP_50 = 30;
 	localparam integer V_TOTAL_50 = 312;
 
@@ -84,6 +87,7 @@ module am2r_native_video
 	always @(posedge clk) begin
 		ce_pix <= 0;
 		new_frame <= 0;
+		active_frame <= 0;
 		new_line <= 0;
 		pace_tick <= 0;
 		if (reset) begin
@@ -97,6 +101,7 @@ module am2r_native_video
 			vblank <= 0;
 			vsync <= 0;
 			new_frame <= 0;
+			active_frame <= 0;
 			new_line <= 0;
 			pace_tick <= 0;
 			r <= 0;
@@ -115,6 +120,8 @@ module am2r_native_video
 			if (ce_count == CE_DIV - 1) begin
 				ce_count <= 0;
 				ce_pix <= 1;
+				if (h_count == 0 && v_count == 0)
+					active_frame <= 1;
 				hblank <= (h_count >= H_ACTIVE);
 				hsync <= (h_count >= H_ACTIVE + H_FP) &&
 				         (h_count < H_ACTIVE + H_FP + H_SYNC);

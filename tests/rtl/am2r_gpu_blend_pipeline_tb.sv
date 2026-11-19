@@ -21,6 +21,7 @@ module am2r_gpu_blend_pipeline_tb;
 	integer mode, lane, a, b, s, d, i, channel;
 	integer divisor_input;
 	reg [16:0] divisor_reference;
+	reg [15:0] rounded_reference, round_sum_reference;
 	reg [8:0] additive_reference;
 	reg [7:0] additive_got, additive_expected;
 	reg [31:0] random_state = 32'h461fee29;
@@ -94,6 +95,19 @@ module am2r_gpu_blend_pipeline_tb;
 	endtask
 
 	initial begin
+		// Independent historical 16-bit expression, not integer division:
+		// verify rounding and both tint modes across even unreachable products.
+		for (divisor_input = 0; divisor_input < 65536; divisor_input = divisor_input + 1) begin
+			rounded_reference = 16'(divisor_input) + 16'd128;
+			round_sum_reference = rounded_reference + (rounded_reference >> 8);
+			if (dut.round_mul255_product(16'(divisor_input)) !== round_sum_reference[15:8] ||
+			    dut.tint_mul255_product(16'(divisor_input), 1'b0) !== round_sum_reference[15:8])
+				$fatal(1, "ROUND255 exact 16-bit mismatch at input %0d", divisor_input);
+			divisor_reference = 17'(divisor_input) + 17'd1 + (17'(divisor_input) >> 8);
+			if (dut.tint_mul255_product(16'(divisor_input), 1'b1) !== divisor_reference[15:8])
+				$fatal(1, "TINT255 floor mismatch at input %0d", divisor_input);
+		end
+		$display("PASS ROUND255: all 65536 products preserve bias, rounding, wrap and both tint modes");
 		// Preserve the previous shift/add expression over its ENTIRE input
 		// domain, including bit16 and wraparound outside legal blend sums.
 		// The divider's public return value is the low byte after shifting.

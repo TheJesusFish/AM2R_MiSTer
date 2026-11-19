@@ -415,7 +415,10 @@ module am2r_gpu_surface_tb;
 			rectangle(0,2,3,1,SOURCE_BASE,1280,x,239);
 			commands[0][8]=mode==1;commands[0][9]=mode==2;commands[0][10]=floor_mode!=0;
 			commands[4]=64'h00000000_001f3039;
-			commands[5]=64'h00010000_00010000;
+			// This one-row fixture specifically exercises legacy source-line
+			// crossing/destination-only prefetch. A zero (unused) V step keeps
+			// it outside guarded narrow streaming; that route has its own suite.
+			commands[5]=64'h00000000_00010000;
 			commands[6]=tint;commands[8]=12;
 			old_reads=source_reads;old_prefetches=cross_line_prefetches;
 			submit(2);

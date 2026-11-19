@@ -9,6 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 PATCH = ROOT / "patches" / "butterscotch-logical-savestates.patch"
 WRAPPER = ROOT / "src" / "hps-wrapper" / "am2r_wrapper.cpp"
+METADATA_PATCH = ROOT / "patches" / "butterscotch-fast-room-metadata.patch"
 
 
 def require(source: str, marker: str) -> None:
@@ -19,6 +20,16 @@ def require(source: str, marker: str) -> None:
 def main() -> None:
     patch = PATCH.read_text(encoding="utf-8")
     wrapper = WRAPPER.read_text(encoding="utf-8")
+    metadata = METADATA_PATCH.read_text(encoding="utf-8")
+    for contract in (
+        "+#define FAST_STATE_VERSION 5u",
+        "+#define FAST_STATE_LEGACY_VERSION 4u",
+        "+    if (!writeRoomMetadata(writer, runner)) return false;",
+        "readRoomMetadata(reader, runner, false)",
+        "resetFastStateRoomMetadata(runner);",
+        "recoverLegacyRoomPersistence(runner);",
+    ):
+        require(metadata, contract)
 
     for contract in (
         "#define FAST_STATE_VERSION 4u",

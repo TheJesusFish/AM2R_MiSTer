@@ -65,6 +65,13 @@ The command ABI is implemented in `rtl/am2r_gpu.sv` and
 - control block `0x23ff0000` (`A2GP` magic);
 - native-vblank counter and `VBLK` capability word at control-block offsets
   `0x40` and `0x44`;
+- diagnostic native active-start frame IDs at `0x48`; read-only presentation
+  seqlock at `0x58..0x6f` (words22..27): `NPRS` magic/generation, raster/scanout
+  IDs, repeat/skipped-publication counts. Odd generation marks an in-flight
+  frozen record; readers require matching even generations with barriers.
+  Cumulative FPGA counters retain events across missed CPU polls. Startup ID0
+  is excluded from repeat/skip counting; reset restarts the counters. This
+  diagnostic does not measure HDMI adoption or input latency;
 - alternating 64 KiB descriptor buffers at `0x23fe0000` and `0x23fd0000`;
 - texture pool beginning at `0x24000000`;
 - four 320×240 XRGB8888 native presentation buffers beginning at
@@ -72,7 +79,14 @@ The command ABI is implemented in `rtl/am2r_gpu.sv` and
 - opcodes: end/present, clear, axis blit, solid/vertical-gradient fill, and
   affine blit.
 
-Textures are uploaded lazily in 4 MiB pages. Mutable GameMaker surface uploads
+Bounded small PNG atlas sets are prewarmed before gameplay (at most 32 pages
+and 96 MiB RGBA; AM2R 1.1 uses 20 pages/72 MiB). Larger or other-format sets
+retain lazy decoding and upload. Large affine draws reuse the pipelined
+FPGA tint/blend engine and an eight-way, 32-set, 64-byte-line texture cache
+(16 KiB). Registered lookahead overlaps pixel emission with next-coordinate
+preparation. Per-command/reset invalidation preserves render-target writes;
+small affine draws retain the short scalar beat-cache path. No game effects
+or asset coordinates are changed. Mutable GameMaker surface uploads
 alternate two DDR allocations so the ARM can update frame N+1 while the FPGA
 still samples frame N; the HPS copy remains available for the rare
 application-surface readbacks. At each frame boundary the software bridge
@@ -96,14 +110,20 @@ generated cache beside the archive,
 starts the runner, services MiSTer OSD save/load triggers, and returns to the
 stock menu after the runner exits.
 
-Save states are version-4 logical GameMaker snapshots retained as four `.fast`
+Save states are version-5 logical GameMaker snapshots retained as four `.fast`
 files under `/media/fat/savestates/AM2R`. Capture occurs only at a frame
 boundary. The serializer records global and instance variables, the exact
-current and persistent-room objects, mutable tiles and views, GameMaker data
+current and persistent-room objects, mutable room dimensions/speed/persistence,
+tiles and views, GameMaker data
 structures and buffers, particles, callbacks, open text/enumeration state,
 dynamic software-renderer surfaces, PRNG/time fields, and active audio
 instances. Immutable decoded resources and derived FPGA texture caches are not
-stored; they remain process-local or are reconstructed.
+stored; they remain process-local or are reconstructed. Room headers reset to
+immutable authored baselines before the captured timeline replaces them,
+including rooms whose payloads have not yet loaded. Version-4 files remain
+readable: populated parked-room object lists recover the omitted persistence
+flag; empty visited-room records do not. Other omitted v4 room scalars use
+authored baselines. Older runtimes cannot read new v5 files.
 
 The header carries a format version, ABI/resource counts, data-file size,
 GameMaker game/license/GUID identity, and code/sprite counts. A CRC32 covers the
@@ -117,8 +137,8 @@ the executable or Linux process image. Empty, corrupt, foreign-game, and
 unsupported states leave the process alive. Normal AM2R saves remain separately
 persistent under `/media/fat/saves/AM2R`.
 
-The FPGA increments a shared-DDR heartbeat at each native vblank in NTSC and
-PAL60. Ordinary 60 Hz game rooms wait on that edge so ARM game ticks and frame
+The FPGA increments a shared-DDR pacing heartbeat48 scanlines before native
+vblank in NTSC and PAL60. Ordinary 60 Hz game rooms wait on that edge so ARM game ticks and frame
 publication are phase-locked to the actual 59.94 Hz scanout, rather than merely
 using the same nominal period on an independent HPS clock. PAL uses a separate
 59.94 Hz heartbeat while presenting at approximately 50 Hz, dropping some
@@ -132,9 +152,11 @@ HDMI framebuffer readers. If all four are protected, presentation waits for
 a free buffer; the extra buffer does not guarantee stall-free publication.
 Each scanout adopts a complete buffer at its own frame boundary. Native
 scanout prefetches each line
-through a show-ahead dual-clock FIFO. A dedicated 26.8229 MHz video PLL with
-pixel enable divided by four produces a 427×262 total raster: 320×240 active
-in 47.7 µs per line, 15.704 kHz and 59.94 Hz (429×312 at 50.10 Hz for PAL).
+through a show-ahead dual-clock FIFO. A dedicated 25 MHz video PLL with
+pixel enable divided by four produces a 398×262 total raster: 320×240 active
+in 51.2 µs per line, 15.704 kHz and 59.94 Hz (400×312 at 50.08 Hz for PAL).
+The default retains the original horizontal width; optional H Scale handles
+CRT fit instead of unconditionally squeezing the artwork horizontally.
 `VGA_SCALER=0` keeps the core-owned 15 kHz raster on analog VGA, while HDMI
 reads the published frames directly through the framework framebuffer
 interface (`rtl/am2r_hdmi_fb.sv`). ALSA feeds MiSTer's normal

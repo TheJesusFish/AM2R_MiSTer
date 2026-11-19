@@ -66,9 +66,14 @@ git apply ../../patches/butterscotch-offscreen-rendering.patch
 git apply ../../patches/butterscotch-unified-renderer.patch
 git apply ../../patches/butterscotch-crt-ui-composition.patch
 git apply ../../patches/butterscotch-four-native-buffers.patch
+git apply ../../patches/butterscotch-surface-id-lifetime.patch
+git apply ../../patches/butterscotch-fast-room-metadata.patch
+git apply ../../patches/butterscotch-texture-cache-hit.patch
+git apply ../../patches/butterscotch-occupancy-broadphase.patch
+git apply ../../patches/butterscotch-texture-prewarm.patch
 ```
 
-The fifty-five files preserve the working tree, including the native-lighting
+The fifty-nine files preserve the working tree, including the native-lighting
 correction described below. Each applies in the order above; applying them to a fresh
 detached clone at the base commit reconstructs the current runner source after
 normalizing checkout line endings. See the final hardware and save-state
@@ -338,6 +343,10 @@ stage tracing found no frame longer than 20 ms across 603 cycles.
 | `butterscotch-unified-renderer.patch` | `1d26a90fde435b34161c18dec55b249839d82e738711388c74910e21bc24dea6` |
 | `butterscotch-crt-ui-composition.patch` | `ebf4b31b16fa44b4152300b397b127ffa9928688d6fe1de594a4a850973a03d2` |
 | `butterscotch-four-native-buffers.patch` | `b3b8e74d338f8b3ee9d160203b66dad0806270878642dd1e5eeaa844517fd41b` |
+| `butterscotch-surface-id-lifetime.patch` | `46f1d5a04736a7a03af581674cce76924a8547a0c9a36e259b0658e6245df5ad` |
+| `butterscotch-fast-room-metadata.patch` | `0b7bd090bacebf9deff24339896e6b346fce736ca6633a72f625a0840e83bf03` |
+| `butterscotch-texture-cache-hit.patch` | `5438da3247933462c0b36195f6e987f2e231c0b3ff690bd9271709b0f7a0dbb9` |
+| `butterscotch-occupancy-broadphase.patch` | `264de4b58c2d4d42a51348b2ad7036dd1550f64072353a825d3c31d75d7d7c66` |
 
 ## General FPGA rendering experiment
 
@@ -567,3 +576,109 @@ different frames at once. The fourth buffer at `0x3a0e1100` lets the GPU always
 publish without overwriting either held frame or the latest published frame.
 An older runner rejects buffer index 3, so the runner and RBF must be deployed
 together.
+
+## Native surface identities and target projection
+
+Patch 56, `butterscotch-surface-id-lifetime.patch`, retires freed public surface
+IDs instead of assigning them to unrelated new images. The AM2R 1.1 Windows
+runner advances its ID counter monotonically; stale transition-image cleanup
+must not delete a subsequently created boss image. Pixel storage and GPU
+allocations still release immediately, including legacy offscreen journals.
+The existing retained-map optimization keeps its previous lifetime rules.
+The native evidence is AM2R.exe SHA-256
+`fe6e75f402235e126eb75a16d2a918dc2aef1b1e3f41e5c36d198d277bc94267`:
+`surface_create` at `0x4b4360` requests a new ID from `0x425280`, whose counter
+at `0x6d964c` advances; the free path at `0x4254c0` does not rewind it. This
+claim is specific to that Windows runtime, not modern GameMaker platforms.
+
+Version-4 logical states already contain the surface high-water mark and hole
+flags. Restore now preserves that high-water mark even when trailing IDs were
+freed, without changing the file format. A defensive limit of 65,536 slots
+bounds metadata to about 2.56 MiB on ARM; exhaustion fails allocation rather
+than wrapping or reusing IDs. A validated 16-entry source cache avoids repeated
+scans through retired IDs for active images.
+
+Resetting an offscreen target during Draw also restores the current room's
+camera matrix and clipping rectangle. Frame/reset invalidation and explicit
+GUI projections prevent old room transforms from leaking into other passes.
+No game data, gameplay bytecode, FPGA interface, or framework files change.
+
+Run `tests/renderer/test_surface_id_lifetime.py`, `test_surface_projection.py`,
+and `test_surface_source_cache.py` with Python. They extract the production
+helpers, cover backing-store reclamation, stale handles, restored identities,
+camera/GUI targets and cached lookup invalidation, and reject the former
+ID-reuse and zero-origin behaviors. These are host regressions; hardware
+acceptance is recorded separately.
+
+## Logical state room metadata
+
+Patch 57, `butterscotch-fast-room-metadata.patch`, writes version-5 logical
+states with each room's exact mutable width, height, speed, and persistence.
+The explicit scalar table is CRC-covered and completely bounds-checked before
+resetting the live runner. Immutable authored header values are captured when
+parsing every room, including lazy/unloaded rooms, and replace mutations from
+the abandoned timeline before applying the saved metadata.
+
+Version-4 states remain readable. They omitted room persistence, which AM2R
+temporarily enables while visiting its map, logbook, and pickup screens.
+Legacy restore recovers this flag only for populated parked-room actor lists:
+parking requires persistence, returning consumes the list, and this AM2R
+release does not remotely change other rooms' persistence. Empty initialized
+records are historical visited markers, not evidence of parked rooms. Legacy
+files cannot recover arbitrary omitted scalar mutations; they use authored
+dimensions/speed. New v5 states require the updated runtime to load.
+
+Run `python tests/runtime/test_fast_room_metadata.py` for production stream,
+metadata preflight, timeline reset, and one-time parked-room restoration
+regressions. VM/audio/actor auxiliary pools are bounded mocks; this fixture
+does not establish hardware or full-game compatibility.
+
+## Unchanged dynamic-texture dispatch
+
+Patch 58, `butterscotch-texture-cache-hit.patch`, checks an unversioned dynamic
+texture's validated CPU shadow before draining the unified GPU queue. A live,
+non-sparse record with identical bytes reuses its current physical allocation
+without writing pixels. Changed content, misses and released records retain
+the existing flush-before-upload path. Unified backend health is checked first;
+unversioned hits clear the old revision memo just like the existing uploader.
+There is no cached raw address across backend reset and no game/effect change.
+
+Run `python tests/renderer/test_texture_cache_hit.py` for extracted-production
+lookup and dispatch tests. Bounded backend mocks cover repeated white-pixel
+primitives, same-frame write ordering, release/reset, mixed revision callers,
+invalid records, failure and legacy dispatch. Mutation controls reject the old
+fence-first wrapper and omitted revision bookkeeping. Hardware measurements
+are recorded separately; these fixtures alone do not establish GPU pixels or
+frame rate.
+
+## Boolean occupancy broad phase
+
+Patch 59, `butterscotch-occupancy-broadphase.patch`, synchronizes the existing
+spatial-grid bounds before temporarily positioning the caller for bounce,
+contact and movement occupancy probes. It retains the original instance-list
+order and precise mask predicate, rejecting only objects with validated
+cached bounds disjoint from the caller. Missing grid/cache data follows the
+original exact test. Both all-instance and solid-only filters are unchanged.
+No collision events, bounce math, game code or particles are removed.
+
+## Bounded texture prewarm
+
+`butterscotch-texture-prewarm.patch` moves first-use PNG decoding and FPGA
+texture uploads before gameplay when the unified renderer has at most 32
+embedded PNG pages totaling at most 96 MiB of RGBA pixels. Header-only
+preflight preserves the lazy file position; larger/other-format sets retain
+lazy loading. AM2R 1.1's 20 pages total 72 MiB. Immutable texture ownership,
+save-state format, game assets and authored effects are unchanged.
+
+Run `python tests/renderer/test_texture_prewarm.py` and
+`python tests/renderer/test_unified_startup.py` for budget/format guards,
+mapped and file-backed headers, position preservation, startup capability
+guards and decode/upload failure behavior. These mock-boundary tests do not
+establish hardware memory usage or frame pacing.
+
+Sprite origin and bbox-mode changes invalidate affected active and inactive
+actors' cached bounds; inactive cells are also needed by activation queries.
+Run `python tests/runtime/test_place_occupancy.py` for extracted-production
+dispatch/oracle cases and mutation controls. Ordinary-RAM fixtures do not
+establish native mask implementation or full-game compatibility; hardware
+acceptance and limitations are recorded separately.

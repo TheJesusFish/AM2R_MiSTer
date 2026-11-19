@@ -1,0 +1,202 @@
+--- a/src/am2r_fast_state.c
++++ b/src/am2r_fast_state.c
+@@ -21,9 +21,12 @@
+ #include <sys/stat.h>
+ #include <unistd.h>
+ 
+-#define FAST_STATE_VERSION 4u
++#define FAST_STATE_VERSION 5u
++#define FAST_STATE_LEGACY_VERSION 4u
+ #define FAST_STATE_MAX_BYTES (128u * 1024u * 1024u)
+ #define FAST_STATE_MAX_COUNT 1000000u
++#define FAST_STATE_MAX_ROOM_DIMENSION 32768u
++#define FAST_STATE_MAX_ROOM_SPEED 1000u
+ #define FAST_STATE_ARRAY_DEPTH 64u
+ #define FAST_STATE_PATH "/media/fat/savestates/AM2R"
+ 
+@@ -200,6 +203,80 @@
+     if (count <= FAST_STATE_MAX_COUNT) return true;
+     reader->error = EBADMSG;
+     return false;
++}
++
++static bool roomMetadataOkay(const Room* room, uint32_t width, uint32_t height,
++                             uint32_t speed, uint8_t persistent) {
++    if (persistent > 1u) return false;
++    if (!room->present)
++        return width == 0u && height == 0u && speed == 0u && persistent == 0u;
++    return width > 0u && width <= FAST_STATE_MAX_ROOM_DIMENSION &&
++           height > 0u && height <= FAST_STATE_MAX_ROOM_DIMENSION &&
++           speed > 0u && speed <= FAST_STATE_MAX_ROOM_SPEED;
++}
++
++static bool writeRoomMetadata(FastWriter* writer, const Runner* runner) {
++    if (!writerU32(writer, runner->dataWin->room.count)) return false;
++    repeat(runner->dataWin->room.count, i) {
++        const Room* room = &runner->dataWin->room.rooms[i];
++        if (!roomMetadataOkay(room, room->width, room->height, room->speed,
++                              (uint8_t)room->persistent)) {
++            writer->error = ENOTSUP;
++            return false;
++        }
++        // Explicit scalar fields avoid adding host struct padding to v5.
++        if (!writerU32(writer, room->width) || !writerU32(writer, room->height) ||
++            !writerU32(writer, room->speed) ||
++            !writerU8(writer, (uint8_t)room->persistent)) return false;
++    }
++    return true;
++}
++
++static bool readRoomMetadata(FastReader* reader, Runner* runner, bool apply) {
++    uint32_t count = readerU32(reader);
++    if (reader->error || count != runner->dataWin->room.count ||
++        !countOkay(reader, count)) {
++        reader->error = EBADMSG;
++        return false;
++    }
++    // Validate the complete bounded table before touching any Room header.
++    FastReader check = *reader;
++    repeat(count, i) {
++        uint32_t width = readerU32(&check);
++        uint32_t height = readerU32(&check);
++        uint32_t speed = readerU32(&check);
++        uint8_t persistent = readerU8(&check);
++        if (check.error || !roomMetadataOkay(&runner->dataWin->room.rooms[i],
++                                             width, height, speed, persistent)) {
++            reader->error = EBADMSG;
++            return false;
++        }
++    }
++    if (!apply) {
++        reader->offset = check.offset;
++        return true;
++    }
++    repeat(count, i) {
++        Room* room = &runner->dataWin->room.rooms[i];
++        room->width = readerU32(reader);
++        room->height = readerU32(reader);
++        room->speed = readerU32(reader);
++        room->persistent = readerU8(reader) != 0;
++    }
++    return !reader->error;
++}
++
++static void recoverLegacyRoomPersistence(Runner* runner) {
++    // AM2R's v4 files omitted mutable ROOM-header flags. A populated parked
++    // actor list is produced only by persistRoomState, while successful room
++    // restore consumes it. Empty initialized records also mark visited rooms
++    // and must never be mistaken for a parked room. AM2R changes persistence
++    // only for its current room, so an unconsumed actor list recovers the flag.
++    repeat(runner->dataWin->room.count, i) {
++        SavedRoomState* state = &runner->savedRoomStates[i];
++        if (state->initialized && arrlen(state->instances) > 0)
++            runner->dataWin->room.rooms[i].persistent = true;
++    }
+ }
+ 
+ static bool writeString(FastWriter* writer, const char* string) {
+@@ -1168,6 +1245,7 @@
+     header.codeCount = runner->dataWin->code.count;
+     header.spriteCount = runner->dataWin->sprt.count;
+     if (!writerBytes(writer, &header, sizeof(header))) return false;
++    if (!writeRoomMetadata(writer, runner)) return false;
+ 
+     FastRunnerFields fields = captureRunnerFields(runner);
+     if (!writerI32(writer, runner->currentRoomIndex) ||
+@@ -1209,7 +1287,9 @@
+     FastStateHeader header = {0};
+     if (!readerBytes(reader, &header, sizeof(header)) ||
+         memcmp(header.magic, "AM2RFST", 7) != 0 ||
+-        header.version != FAST_STATE_VERSION || header.headerSize != sizeof(header) ||
++        (header.version != FAST_STATE_VERSION &&
++         header.version != FAST_STATE_LEGACY_VERSION) ||
++        header.headerSize != sizeof(header) ||
+         header.payloadSize != reader->size - sizeof(header) ||
+         header.roomCount != runner->dataWin->room.count ||
+         header.objectCount != runner->dataWin->objt.count ||
+@@ -1226,12 +1306,22 @@
+         reader->error = EBADMSG;
+         return false;
+     }
++    size_t metadataOffset = reader->offset;
++    if (header.version >= 5u && !readRoomMetadata(reader, runner, false)) return false;
+     int32_t roomIndex = readerI32(reader);
+     FastRunnerFields fields = {0};
+     if (!readerBytes(reader, &fields, sizeof(fields)) ||
+         !Runner_beginFastStateRestore(runner, roomIndex)) {
+         reader->error = EBADMSG;
+         return false;
++    }
++    if (header.version >= 5u) {
++        FastReader metadataReader = *reader;
++        metadataReader.offset = metadataOffset;
++        if (!readRoomMetadata(&metadataReader, runner, true)) {
++            reader->error = metadataReader.error;
++            return false;
++        }
+     }
+     if (!readVarMap(reader, runner, runner->vmContext->globalScopeInstance) ||
+         !readerBytes(reader, runner->views, sizeof(runner->views)) ||
+@@ -1264,6 +1354,8 @@
+                             &state->viewsEnabled, state->defaultCameras) ||
+             !readInstances(reader, runner, &state->instances, false)) return false;
+     }
++    if (header.version == FAST_STATE_LEGACY_VERSION)
++        recoverLegacyRoomPersistence(runner);
+     if (!readDataStructures(reader, runner) || !readAuxiliaryPools(reader, runner) ||
+         !readOpenTextFiles(reader, runner) || !readFileFindState(reader, runner) ||
+         !readSurfaces(reader, runner) || !readAudio(reader, runner)) return false;
+--- a/src/data_win.h
++++ b/src/data_win.h
+@@ -682,6 +682,9 @@
+     uint32_t height;
+     uint32_t speed;
+     bool persistent;
++    // Immutable ROOM-header values for replacing a logical state's timeline.
++    uint32_t initialWidth, initialHeight, initialSpeed;
++    bool initialPersistent;
+     uint32_t backgroundColor;
+     bool drawBackgroundColor;
+     int32_t creationCodeId;
+--- a/src/data_win.c
++++ b/src/data_win.c
+@@ -2151,6 +2151,10 @@
+         room->height = BinaryReader_readUint32(reader);
+         room->speed = BinaryReader_readUint32(reader);
+         room->persistent = BinaryReader_readBool32(reader);
++        room->initialWidth = room->width;
++        room->initialHeight = room->height;
++        room->initialSpeed = room->speed;
++        room->initialPersistent = room->persistent;
+         room->backgroundColor = BinaryReader_readUint32(reader);
+         room->drawBackgroundColor = BinaryReader_readBool32(reader);
+         room->creationCodeId = BinaryReader_readInt32(reader);
+--- a/src/runner.c
++++ b/src/runner.c
+@@ -1902,6 +1902,18 @@
+     runtimeView->portHeight = roomView->portHeight;
+ }
+ 
++static void resetFastStateRoomMetadata(Runner* runner) {
++    // Parsed rooms survive Runner_reset, including lazy/unloaded headers.
++    // Remove mutations from the replaced timeline before restoring its state.
++    repeat(runner->dataWin->room.count, i) {
++        Room* room = &runner->dataWin->room.rooms[i];
++        room->width = room->initialWidth;
++        room->height = room->initialHeight;
++        room->speed = room->initialSpeed;
++        room->persistent = room->initialPersistent;
++    }
++}
++
+ bool Runner_beginFastStateRestore(Runner* runner, int32_t roomIndex) {
+     if (runner == nullptr || roomIndex < 0 ||
+         (uint32_t)roomIndex >= runner->dataWin->room.count)
+@@ -1912,6 +1924,7 @@
+     // the audio backend allocated, which are exactly the process-local pieces
+     // a logical state must retain.
+     Runner_reset(runner);
++    resetFastStateRoomMetadata(runner);
+ 
+     // A logical restore can happen after the player visited and mutated rooms
+     // which had not yet been touched when the snapshot was taken. Reset every

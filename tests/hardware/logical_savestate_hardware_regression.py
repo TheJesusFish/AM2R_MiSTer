@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Self-restoring logical save/load regression for the USB-1 MiSTer.
+"""Self-restoring logical save/load regression for a selected MiSTer.
 
 The selected .fast slot is moved aside and restored in a finally block. The
 test never writes AM2R's ordinary saves or the legacy .dmtcp files.
@@ -38,7 +38,7 @@ def run(client, command: str, *, check: bool = True, timeout: int = 30) -> str:
     status = stdout.channel.recv_exit_status()
     if check and status != 0:
         raise RuntimeError(
-            f"USB-1 command failed ({status}): {command}\n{error.strip()}"
+            f"MiSTer command failed ({status}): {command}\n{error.strip()}"
         )
     return output
 
@@ -106,6 +106,7 @@ def request_and_wait(
 
 def main() -> int:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--device", choices=("USB-1", "USB-2"), default="USB-1")
     parser.add_argument("--slot", type=int, choices=range(1, 5), default=4)
     parser.add_argument(
         "--helper",
@@ -131,12 +132,12 @@ def main() -> int:
     remote_helper = f"/tmp/am2r-logical-state-request-{token}"
     moved_state = False
 
-    client = mister_ssh.connect("USB-1")
+    client = mister_ssh.connect(args.device)
     sftp = client.open_sftp()
     try:
         core = run(client, "tr -d '\\r\\n' < /tmp/CORENAME").strip()
         if core != "AM2R":
-            raise RuntimeError(f"USB-1 must already be running AM2R, found {core!r}")
+            raise RuntimeError(f"{args.device} must already be running AM2R, found {core!r}")
         if not exists(sftp, "/tmp/am2r-state-runner.sock"):
             raise RuntimeError("logical save-state runner socket is unavailable")
         if exists(sftp, temporary):

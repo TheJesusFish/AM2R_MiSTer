@@ -42,6 +42,14 @@ module am2r_gpu_replay_tb;
     reg started = 0;
     reg [28:0] completed_base;
     integer capability_stall_cycles = 0;
+    // Simulation-only attribution; never changes the DUT or memory schedule.
+    integer state_cycles [0:127];
+    integer generic_cycles [0:13];
+    integer command_cycles [0:1023];
+    integer command_texture_reads [0:1023];
+    integer command_fb_writes [0:1023];
+    integer previous_command_index = 0;
+    integer profile_index, profile_fd;
 
     am2r_gpu dut (
         .clk(clk), .reset(reset), .ddram_busy(ddram_busy),
@@ -114,6 +122,18 @@ module am2r_gpu_replay_tb;
     // enables are checked instead of silently returning zero for missing data.
     always @(posedge clk) begin
         cycles <= cycles + 1;
+        if (started && !reset) begin
+            state_cycles[dut.state] = state_cycles[dut.state] + 1;
+            if (dut.state == dut.ST_GENERIC)
+                generic_cycles[dut.generic_state] = generic_cycles[dut.generic_state] + 1;
+            if (dut.command_index < command_count)
+                command_cycles[dut.command_index] = command_cycles[dut.command_index] + 1;
+            // Registered BRAM write enables are consumed one edge after their
+            // issuing state, possibly after next_command changed the index.
+            if (previous_command_index < command_count && (dut.fb_even_we || dut.fb_odd_we))
+                command_fb_writes[previous_command_index] = command_fb_writes[previous_command_index] + 1;
+        end
+        previous_command_index = dut.command_index;
         if (STALL_PERIOD > 0) ddram_busy <= ((cycles % STALL_PERIOD) == STALL_PERIOD - 1);
         else ddram_busy <= 0;
         // Deliberately stall the new feature write, checking its accepted-
@@ -146,6 +166,11 @@ module am2r_gpu_replay_tb;
             end
         end
         if (ddram_rd && !ddram_busy && !pending_read) begin
+            // Synthetic generic regression textures occupy this named region.
+            // Attribution only: no accepted request or DUT timing is changed.
+            if (started && !reset && dut.command_index < command_count &&
+                {ddram_addr, 3'b0} >= 32'h24000000 && {ddram_addr, 3'b0} < 32'h25000000)
+                command_texture_reads[dut.command_index] = command_texture_reads[dut.command_index] + 1;
             if (ddram_burstcnt == 0 || ddram_burstcnt > 128)
                 $fatal(1, "Invalid DDR read burst length");
             pending_read <= 1;
@@ -168,6 +193,15 @@ module am2r_gpu_replay_tb;
     end
 
     initial begin
+        for (profile_index = 0; profile_index < 128; profile_index = profile_index + 1)
+            state_cycles[profile_index] = 0;
+        for (profile_index = 0; profile_index < 14; profile_index = profile_index + 1)
+            generic_cycles[profile_index] = 0;
+        for (profile_index = 0; profile_index < 1024; profile_index = profile_index + 1) begin
+            command_cycles[profile_index] = 0;
+            command_texture_reads[profile_index] = 0;
+            command_fb_writes[profile_index] = 0;
+        end
         if (MEMORY_WORDS <= 0 || MEMORY_WORDS > 18000000 || MAX_CYCLES <= 0 ||
             READ_LATENCY < 0 || STALL_PERIOD < 0 || RESPONSE_GAP < 0)
             $fatal(1, "Invalid bounded replay parameters");
@@ -245,6 +279,20 @@ module am2r_gpu_replay_tb;
         output_fd = $fopen("rtl-status.txt", "w");
         $fdisplay(output_fd, "%0d %0d %0d", cycles, control[3][63:32] & 32'h1fffffff, native_buffer);
         $fclose(output_fd);
+        profile_fd = $fopen("rtl-profile.csv", "w");
+        if (!profile_fd) $fatal(1, "Cannot create replay profile");
+        $fdisplay(profile_fd, "kind,index,cycles");
+        for (profile_index = 0; profile_index < 128; profile_index = profile_index + 1)
+            $fdisplay(profile_fd, "state,%0d,%0d", profile_index, state_cycles[profile_index]);
+        for (profile_index = 0; profile_index < 14; profile_index = profile_index + 1)
+            $fdisplay(profile_fd, "generic,%0d,%0d", profile_index, generic_cycles[profile_index]);
+        for (profile_index = 0; profile_index < command_count; profile_index = profile_index + 1)
+            $fdisplay(profile_fd, "command,%0d,%0d", profile_index, command_cycles[profile_index]);
+        for (profile_index = 0; profile_index < command_count; profile_index = profile_index + 1) begin
+            $fdisplay(profile_fd, "texture_reads,%0d,%0d", profile_index, command_texture_reads[profile_index]);
+            $fdisplay(profile_fd, "fb_writes,%0d,%0d", profile_index, command_fb_writes[profile_index]);
+        end
+        $fclose(profile_fd);
         $display("PASS: captured GPU job completed; compare pixels with scalar reference");
         $finish;
     end

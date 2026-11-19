@@ -48,6 +48,10 @@ final file is published by an atomic same-filesystem rename, so an interrupted
 write cannot replace the previous slot. Wait for the **Save state written**
 message before loading or copying a slot.
 
+The current runtime writes version-5 states and still loads version-4 states.
+Paused-state restore preserves the parked gameplay room rather than recreating
+it at ordinary-save coordinates. New v5 states cannot load in older runtimes.
+
 Save/load time depends on snapshot size and storage. Earlier USB-1 tests of
 1.53 MB gameplay states took 0.28–0.68 seconds to save and 0.40–0.49 seconds
 to load. Final September 30 tests of a 10.54 MB late-game state took 1.84–1.92
@@ -82,14 +86,17 @@ runtime and returns to `menu.rbf`.
 
 | Setting | Raster | Line rate | Refresh | Composite/S-Video subcarrier |
 | --- | --- | --- | --- | --- |
-| NTSC | 427×262 | 15.704 kHz | 59.94 Hz | from `ntsc_mode` in MiSTer.ini |
-| PAL60 | 427×262 | 15.704 kHz | 59.94 Hz | PAL (4.43 MHz) |
-| PAL | 429×312 | 15.631 kHz | 50.10 Hz | PAL (4.43 MHz) |
+| NTSC | 398×262 | 15.704 kHz | 59.94 Hz | from `ntsc_mode` in MiSTer.ini |
+| PAL60 | 398×262 | 15.704 kHz | 59.94 Hz | PAL (4.43 MHz) |
+| PAL | 400×312 | 15.625 kHz | 50.08 Hz | PAL (4.43 MHz) |
 
-The 320 active pixels span 47.7 µs per line, approximately 6.8% narrower than
-the previous 51.2 µs raster without resampling the artwork. This provides
-more horizontal overscan margin; actual fit still depends on the CRT and
-does not change the 240 active lines or vertical overscan. NTSC and PAL60 have
+The default restores the original 51.2 µs active line at a 6.25 MHz pixel
+clock. The unconditional 47.7 µs horizontal squeeze has been removed; use
+**Analog H Scaler / Analog H Scale** only if your CRT needs width adjustment.
+No additional Narrow mode is necessary. Existing saved H Scale settings are
+preserved; turn the scaler off to evaluate the restored baseline. Actual
+geometry still depends on the CRT; this does not change the 240 active lines
+or vertical overscan. NTSC and PAL60 have
 identical RGB timing; PAL60 only changes the colour
 subcarrier for composite and S-Video. PAL centres the 240 active lines in the
 taller 50 Hz frame. The game still runs at full 60 Hz speed in PAL mode, so
@@ -105,14 +112,19 @@ and **Scandoubler Fx** offers HQ2x or scanlines. For HDMI, `vsync_adjust=1` or
 `vsync_adjust=2` in MiSTer.ini matches the output refresh to the core instead
 of periodically repeating or dropping a frame.
 
-PAL requests synced HDMI at approximately 50.10 Hz. In hardware testing,
-`video_mode=8` with `vsync_adjust=2` produced a black UGREEN capture during
+PAL requests synced HDMI at approximately 50.08 Hz. The user confirmed PAL
+video works on their display with the preceding 50.10 Hz build. That build's
+UGREEN capture test with
+`video_mode=8` and `vsync_adjust=2` produced a black UGREEN capture during
 gameplay, although native rendering continued; opening the OSD restored the
 capture until the menu was closed. Keeping HDMI at its configured
 refresh with `vsync_adjust=0` restored capture without changing the PAL analog
-raster. If this combination loses the HDMI picture on your setup, use
-`vsync_adjust=0` in the `[AM2R]` section, or select NTSC/PAL60. The 50.10 Hz
-HDMI output still needs independent display/signal validation; a black capture
+raster. This observed capture issue is not evidence that PAL
+fails on every display; the adapter is suspected but not independently
+isolated as the cause. The restored-width build reproduced the black capture
+with synchronized HDMI and visible gameplay with fixed-refresh HDMI. If this
+combination loses the HDMI picture, use
+`vsync_adjust=0` in the `[AM2R]` section, or select NTSC/PAL60. A black capture
 alone does not establish whether the source timing or receiver is responsible.
 
 ## CRT adjustments

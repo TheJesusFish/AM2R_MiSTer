@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Replay a captured GPU job through unmodified RTL and compare every pixel.
+"""Replay a captured GPU job through a selected RTL snapshot and compare every pixel.
 
 Requires ModelSim vlib/vlog/vsim on PATH. The generated mapping is a bounded
 simulated DDR image, not real /dev/mem access. There is no MiSTer deployment.
@@ -161,6 +161,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("manifest", type=Path)
     parser.add_argument("--output", type=Path, required=True, help="parent for a new isolated replay directory")
+    parser.add_argument("--rtl", type=Path, default=ROOT / "rtl/am2r_gpu.sv",
+                        help="RTL source to replay; permits private experiments without modifying a live FPGA build")
     parser.add_argument("--read-latency", type=int, default=2)
     parser.add_argument("--stall-period", type=int, default=11, help="0 disables request stalls")
     parser.add_argument("--response-gap", type=int, default=0, help="0 disables response gaps; N pauses after N returned beats")
@@ -177,6 +179,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         executables = {name: shutil.which(name) for name in ("vlib", "vlog", "vsim")}
         if not all(executables.values()):
             raise reference.CaptureError("ModelSim vlib/vlog/vsim must be available on PATH")
+        rtl_source = args.rtl.resolve(strict=True)
+        rtl_bytes = rtl_source.read_bytes()
         args.output.mkdir(parents=True, exist_ok=True)
         directory = Path(tempfile.mkdtemp(prefix="gpu-replay-", dir=args.output)).resolve()
         print(f"Preparing isolated RTL replay: {directory}", flush=True)
@@ -187,7 +191,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         cpu_comparisons, cpu_coverage = reference.compare_cpu_captured_exports(
             manifest, args.manifest.parent, result.exports)
         _run([executables["vlib"], "work"], directory, "vlib", args.timeout)
-        _run([executables["vlog"], "-sv", "-work", "work", str(ROOT / "rtl/am2r_gpu.sv"),
+        # Compile the attested snapshot, not a file that can change under vlog.
+        rtl_snapshot = directory / "am2r_gpu.sv"
+        rtl_snapshot.write_bytes(rtl_bytes)
+        _run([executables["vlog"], "-sv", "-work", "work", str(rtl_snapshot),
               str(ROOT / "tests/rtl/am2r_gpu_replay_tb.sv")], directory, "vlog", args.timeout)
         output = _run([executables["vsim"], "-c", "-lib", "work", "am2r_gpu_replay_tb",
                        f"-gMEMORY_WORDS={memory_words}", f"-gREAD_LATENCY={args.read_latency}",
@@ -200,7 +207,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         reference_frame = result.xrgb_pixels if result.presented else result.pixels
         cycles, operation_cycles, output_buffer = map(int, (directory / "rtl-status.txt").read_text().split())
         report = {"format": "am2r-gpu-rtl-replay-v1", "directory": str(directory),
-                  "rtl_sha256": hashlib.sha256((ROOT / "rtl/am2r_gpu.sv").read_bytes()).hexdigest(),
+                  "rtl_sha256": hashlib.sha256(rtl_bytes).hexdigest(),
                   "commands_sha256": hashlib.sha256(reference._blob(args.manifest.parent, manifest["commands"], reference.MAX_COMMANDS * 64)).hexdigest(),
                   "ddr_model": {"read_latency": args.read_latency, "stall_period": args.stall_period,
                                 "response_gap": args.response_gap},

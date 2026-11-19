@@ -49,7 +49,7 @@ module am2r_gpu_tb;
 	integer prefetched_solid_pairs = 0;
 	integer alpha_white_pairs = 0;
 	integer noncontiguous_pairs = 0;
-	reg [5:0] previous_gpu_state = 0;
+	reg [6:0] previous_gpu_state = 0;
 
 	am2r_gpu dut
 	(

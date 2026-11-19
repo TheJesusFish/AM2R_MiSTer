@@ -55,7 +55,7 @@ module am2r_gpu
 	localparam [7:0] GPU_READ_BURST_WORDS = 8'd96;
 	localparam integer WRITE_FIFO_DEPTH = 8;
 
-	localparam [5:0]
+	localparam [6:0]
 		ST_RESET = 0, ST_POLL_DELAY = 1, ST_POLL_ACCEPT = 2,
 		ST_POLL_DATA = 3, ST_CFG1_ACCEPT = 4, ST_CFG1_DATA = 5,
 		ST_CFG2_ACCEPT = 6, ST_CFG2_DATA = 7, ST_CMD_ACCEPT = 8,
@@ -71,7 +71,7 @@ module am2r_gpu
 		ST_EXPORT_WRITE = 30, ST_WATER_TABLE_ACCEPT = 31,
 		ST_WATER_TABLE_DATA = 32, ST_WATER_SOURCE_ACCEPT = 33,
 		ST_WATER_SOURCE_DATA = 34, ST_WATER_SOURCE_ADDRESS = 35;
-	localparam [5:0] ST_AFFINE_SOURCE_ADDRESS = 36,
+	localparam [6:0] ST_AFFINE_SOURCE_ADDRESS = 36,
 		ST_ROW_SOURCE_ADDRESS = 37, ST_AFFINE_ROW_ADDRESS = 38,
 		ST_TINT_PRODUCT_READY = 39, ST_FRAMEBUFFER_WRITE_START = 40,
 		ST_FRAMEBUFFER_WRITE_FILL = 41, ST_FRAMEBUFFER_WRITE_STREAM = 42,
@@ -84,7 +84,11 @@ module am2r_gpu
 		ST_SURFACE_BURST = 55, ST_SURFACE_LOAD_ACCEPT = 56,
 		ST_SURFACE_LOAD_DATA = 57, ST_SURFACE_STORE_FILL = 58,
 		ST_SURFACE_STORE_STREAM = 59, ST_SURFACE_NEXT_ROW = 60,
-		ST_GENERIC = 61, ST_BLEND_CALCULATE = 62, ST_RECT_CLEAR = 63;
+		ST_GENERIC = 61, ST_BLEND_CALCULATE = 62, ST_RECT_CLEAR = 63,
+		ST_TEX_PAIR_ADVANCE = 64, ST_AFFINE_FLOW = 65;
+	localparam [3:0] AF_PREP = 0, AF_ROW = 1, AF_ADDRESS = 2,
+		AF_RAM = 3, AF_SELECT = 4, AF_EMIT = 5, AF_ACCEPT = 6,
+		AF_DATA = 7, AF_DRAIN = 8;
 	localparam [3:0] GP_PACKET_ACCEPT = 0, GP_PACKET_DATA = 1,
 		GP_INIT = 2, GP_PIXEL = 3, GP_ADDRESS = 4, GP_TEXTURE = 5,
 		GP_TEXTURE_ACCEPT = 6, GP_TEXTURE_DATA = 7, GP_TINT = 8,
@@ -94,7 +98,7 @@ module am2r_gpu
 	(* ramstyle = "M10K, no_rw_check" *) reg [31:0] fb_even [0:FB_WORDS-1];
 	(* ramstyle = "M10K, no_rw_check" *) reg [31:0] fb_odd  [0:FB_WORDS-1];
 
-	reg [5:0] state;
+	reg [6:0] state;
 	reg [15:0] poll_delay;
 	reg [31:0] last_sequence, active_sequence;
 	reg [31:0] command_addr, framebuffer_addr;
@@ -121,7 +125,7 @@ module am2r_gpu
 	// in one GPU clock. Preserve their output registers against retiming.
 	(* preserve *) reg [31:0] source_row_product_low;
 	(* preserve *) reg [15:0] source_row_product_high;
-	reg [31:0] tint_color_stage;
+	(* preserve, dont_retime *) reg [31:0] tint_color_stage;
 	reg signed [24:0] tint_r_current, tint_g_current, tint_b_current, tint_a_current;
 	reg signed [15:0] tint_r_step, tint_g_step, tint_b_step, tint_a_step;
 	reg texture_cache_valid;
@@ -131,7 +135,99 @@ module am2r_gpu
 	// 32 pixels instead of refetching every eight pixels.
 	reg [63:0] texture_cache_data [0:15];
 	reg [3:0] texture_cache_fill;
-	reg [31:0] source_pixel, source_pixel_1, tinted_pixel;
+	// Rotated sprites visit several source rows within one destination row.
+	// Fetching a full128-byte scanline on every row change wastes most beats.
+	// Keep16 exact64-bit texel beats for affine commands instead. This cache
+	// is command-local: each affine decode invalidates every tag, so surface
+	// stores/HPS texture updates can never be hidden by a later command hit.
+	reg [15:0] affine_cache_valid;
+	reg [28:0] affine_cache_tag [0:15];
+	reg [63:0] affine_cache_data [0:15];
+	(* preserve *) reg [3:0] affine_cache_index;
+	reg [3:0] affine_cache_next;
+	reg affine_cache_hit;
+	reg [3:0] affine_cache_hit_index;
+	integer affine_cache_lookup;
+	reg reset_meta, reset_sync;
+	// Large rotated draws need spatial reuse across source rows, not just
+	// the last few64-bit beats. Eight ways x32 sets of64-byte lines =16KiB.
+	// Hash high row-address bits into the set so power-of-two atlas strides
+	// do not alias every vertical texel. Data uses synchronous M10Ks; tags
+	// are registered logic. Only eight tags enter the select stage. Invalidate at
+	// each command: prior target writes must never be hidden by this cache.
+	reg affine_flow_enabled;
+	reg [3:0] affine_flow_phase;
+	(* preserve, dont_retime *) reg [31:0] affine_pixel_bias;
+	(* preserve, dont_retime *) reg signed [31:0] affine_u_lookahead, affine_v_lookahead;
+	(* preserve, dont_retime *) reg signed [31:0] affine_u_next_lookahead;
+	(* preserve, dont_retime *) reg [15:0] affine_x_lookahead;
+	(* preserve, dont_retime *) reg [16:0] affine_destination_lookahead;
+	(* preserve, dont_retime *) reg affine_last_lookahead;
+	reg [31:0] affine_line_valid [0:7];
+	reg [2:0] affine_line_next [0:31];
+	reg [2:0] affine_line_way, affine_line_fill;
+	// Start the synchronous lookup in AF_ROW, using the newly calculated
+	// address rather than spending two cycles registering then rereading it.
+	// Miss refills retain the registered address until all eight beats arrive.
+	wire [31:0] affine_row_pixel_address;
+	wire [31:0] affine_lookup_address = affine_flow_phase == AF_ROW ?
+		affine_row_pixel_address : source_byte_addr;
+	wire [4:0] affine_lookup_set = affine_lookup_address[10:6] ^ affine_lookup_address[16:12];
+	wire [4:0] affine_line_set = source_byte_addr[10:6] ^ source_byte_addr[16:12];
+	wire [25:0] affine_line_tag_q [0:7];
+	wire [63:0] affine_line_data_q [0:7];
+	wire [7:0] affine_line_valid_q;
+	reg affine_line_hit;
+	reg [2:0] affine_line_hit_way;
+	integer affine_line_lookup, affine_line_reset;
+	genvar affine_line_bank;
+	generate for (affine_line_bank = 0; affine_line_bank < 8;
+	              affine_line_bank = affine_line_bank + 1) begin: affine_lines
+		(* ramstyle = "M10K, no_rw_check" *) reg [25:0] tags [0:31];
+		(* ramstyle = "M10K, no_rw_check" *) reg [63:0] data [0:255];
+		reg [25:0] tag_q;
+		reg [63:0] data_q;
+		reg valid_q;
+		assign affine_line_tag_q[affine_line_bank] = tag_q;
+		assign affine_line_data_q[affine_line_bank] = data_q;
+		assign affine_line_valid_q[affine_line_bank] = valid_q;
+		always @(posedge clk) begin
+			tag_q <= tags[affine_lookup_set];
+			data_q <= data[{affine_lookup_set, affine_lookup_address[5:3]}];
+			valid_q <= affine_line_valid[affine_line_bank][affine_lookup_set];
+			if (!reset_sync && state == ST_AFFINE_FLOW &&
+			    affine_flow_phase == AF_DATA && ddram_dout_ready &&
+			    affine_line_way == affine_line_bank) begin
+				data[{affine_line_set, affine_line_fill}] <= ddram_dout;
+				if (affine_line_fill == 3'd7)
+					tags[affine_line_set] <= source_byte_addr[31:6];
+			end
+		end
+	end endgenerate
+	always @* begin
+		affine_line_hit = 0;
+		affine_line_hit_way = 0;
+		for (affine_line_lookup = 0; affine_line_lookup < 8; affine_line_lookup = affine_line_lookup + 1)
+			if (affine_line_valid_q[affine_line_lookup] &&
+			    affine_line_tag_q[affine_line_lookup] == source_byte_addr[31:6]) begin
+				affine_line_hit = 1;
+				affine_line_hit_way = affine_line_lookup[2:0];
+			end
+	end
+	always @(*) begin
+		affine_cache_hit = 0;
+		affine_cache_hit_index = 0;
+		for (affine_cache_lookup = 0; affine_cache_lookup < 16; affine_cache_lookup = affine_cache_lookup + 1)
+			if (affine_cache_valid[affine_cache_lookup] &&
+			    affine_cache_tag[affine_cache_lookup] == source_byte_addr[31:3]) begin
+				affine_cache_hit = 1;
+				affine_cache_hit_index = affine_cache_lookup[3:0];
+			end
+	end
+	// Keep the cache-select/tint boundary. Stage unconditionally in
+	// ST_TEX_READY so binary-alpha shortcuts do not control these enables.
+	(* preserve, dont_retime *) reg [31:0] source_pixel, source_pixel_1;
+	reg [31:0] tinted_pixel;
 	reg [31:0] tinted_pixel_1;
 	reg [31:0] blended_pixel_result0, blended_pixel_result1;
 	(* preserve *) reg [31:0] blend_destination0, blend_destination1;
@@ -232,13 +328,18 @@ module am2r_gpu
 	reg [16:0] gather_destination, gather_pair_destination;
 	// 0=first visible sample needs setup,1=decision ready,2=legacy rest of row.
 	reg [1:0] axis_stream_setup;
+	// Narrow strips benefit from streaming only when successive rows cannot
+	// reuse the legacy128-byte texture line. Registered at descriptor decode,
+	// outside the row-address/stream-decision timing path.
+	reg axis_stream_narrow;
 	reg [7:0] water_tint_alpha;
 	reg [15:0] tiled_x;
 	reg [4:0] tiled_phase;
 	reg [31:0] tiled_solid_pixel;
 	reg [1:0] water_pipe0_valid, water_pipe1_valid, water_pipe2_valid;
 	reg [1:0] water_pipe3_valid, water_pipe4_valid;
-	reg [31:0] water_pipe0_pixel0, water_pipe0_pixel1;
+	(* preserve, dont_retime *) reg [31:0] water_pipe0_pixel0;
+	reg [31:0] water_pipe0_pixel1;
 	reg [31:0] water_pipe2_pixel0, water_pipe2_pixel1;
 	reg [31:0] water_pipe2_background0, water_pipe2_background1;
 	reg [15:0] water_pipe0_destination0, water_pipe0_destination1;
@@ -262,7 +363,6 @@ module am2r_gpu
 	reg [15:0] water_pipe4_destination [0:1];
 	reg water_pipe4_odd [0:1];
 	reg [31:0] operation_cycles;
-	reg reset_meta, reset_sync;
 	reg [15:0] fb_even_read_address, fb_odd_read_address;
 	reg [15:0] fb_even_write_address, fb_odd_write_address;
 	reg [31:0] fb_even_q, fb_odd_q;
@@ -297,10 +397,11 @@ module am2r_gpu
 	// Tested after destination clipping. Positive unit U preserves fractional
 	// nearest-neighbour starts, but a signed16.16 wrap is not contiguous DDR.
 	wire axis_stream_eligible = axis_stream_setup == 2'd1 &&
-		axis_stream_width_stage >= 17'd32 && axis_stream_width_stage <= 17'd320 &&
+		axis_stream_width_stage >= (axis_stream_narrow ? 17'd2 : 17'd32) &&
+		axis_stream_width_stage <= 17'd320 &&
 		axis_source_addr0[1:0] == 0 && !u_current[31] &&
 		{1'b0, u_current[31:16]} + axis_stream_width_stage <= 17'd32768;
-	wire [31:0] water_pipeline_tint = (axis_stream_mode || axis_gather_mode) ? tint_color :
+	wire [31:0] water_pipeline_tint = (axis_stream_mode || axis_gather_mode || affine_flow_enabled) ? tint_color :
 		{water_tint_alpha, 24'hffffff};
 	wire water_pipeline_floor = (axis_stream_mode || axis_gather_mode) && floor_tint_mode;
 	wire gather_pair = gather_remaining > 9'd1 &&
@@ -354,9 +455,20 @@ module am2r_gpu
 	// The generic path instead clamps its signed 32.32 coordinate first.
 	wire [15:0] source_row_index_now = state == ST_GENERIC ?
 		generic_clamp_texel(generic_uv[1], generic_texture_height) :
-		(state == ST_BLIT_PIXEL ? v_current[31:16] : v_start[31:16]);
+		(state == ST_AFFINE_FLOW && affine_flow_phase == AF_EMIT ? affine_v_lookahead[31:16] :
+		((state == ST_BLIT_PIXEL || state == ST_AFFINE_FLOW) ? v_current[31:16] : v_start[31:16]));
+	wire signed [31:0] affine_stage_u = affine_flow_phase == AF_EMIT ? affine_u_lookahead : u_current;
 	wire [31:0] source_row_address_next = src_base + source_row_product_low +
 		{source_row_product_high, 16'd0};
+	// Add the horizontal displacement in parallel with the row multiply.
+	// Three row-stage operands use a carry-save fold and one final carry
+	// chain, preserving exact modulo-32 addresses without a cascaded adder
+	// path into the synchronous texture RAM.
+	wire [31:0] affine_row_high = {source_row_product_high, 16'd0};
+	wire [31:0] affine_address_sum = affine_pixel_bias ^ source_row_product_low ^ affine_row_high;
+	wire [31:0] affine_address_carry = ((affine_pixel_bias & source_row_product_low) |
+		(affine_pixel_bias & affine_row_high) | (source_row_product_low & affine_row_high)) << 1;
+	assign affine_row_pixel_address = affine_address_sum + affine_address_carry;
 
 	always @(posedge clk) begin
 		reset_meta <= reset;
@@ -385,10 +497,16 @@ module am2r_gpu
 
 	function automatic [7:0] round_mul255_product;
 		input [15:0] product;
-		reg [15:0] rounded;
+		reg [7:0] rounded_high, rounded_low;
 		begin
-			rounded = product + 16'd128;
-			round_mul255_product = (rounded + (rounded >> 8)) >> 8;
+			// Preserve the original 16-bit bias/add/shift, including wrap,
+			// without cascading two wide carry chains out of the tint DSP.
+			// Adding 128 flips bit 7 and carries only into the high byte;
+			// adding that high byte back carries iff low + high >= 256.
+			rounded_high = product[15:8] + {7'b0, product[7]};
+			rounded_low = {~product[7], product[6:0]};
+			round_mul255_product = rounded_high +
+				{7'b0, (rounded_low > ~rounded_high)};
 		end
 	endfunction
 
@@ -709,6 +827,14 @@ module am2r_gpu
 		end
 	endtask
 
+	task automatic stage_affine_row;
+		begin
+			stage_source_row();
+			// Explicit sign extension survives the unsigned base-add context.
+			affine_pixel_bias <= src_base + {{14{affine_stage_u[31]}}, affine_stage_u[31:16], 2'b00};
+		end
+	endtask
+
 	task automatic start_read;
 		input [31:0] byte_address;
 		input [7:0] burst_count;
@@ -831,6 +957,24 @@ module am2r_gpu
 		end
 	endtask
 
+	// Coordinates retain the scalar descriptor's signed16.16 wrap and row
+	// restart. No accumulated source address approximations or angle snapping.
+	task automatic advance_affine_flow(input prefetched);
+		begin
+			if (prefetched ? affine_last_lookahead : (blit_x + 1'b1 >= blit_width))
+				affine_flow_phase <= AF_DRAIN;
+			else begin
+				// A hit copies ROW-stage metadata. Its late tag comparison must
+				// not also control a full-width coordinate carry chain.
+				blit_x <= prefetched ? affine_x_lookahead : blit_x + 1'b1;
+				u_current <= prefetched ? affine_u_lookahead : u_current + u_step;
+				u_next <= prefetched ? affine_u_next_lookahead : u_next + u_step;
+				v_current <= prefetched ? affine_v_lookahead : v_current + v_x_step;
+				affine_flow_phase <= prefetched ? AF_ROW : AF_PREP;
+			end
+		end
+	endtask
+
 	always @(posedge clk) begin
 		if (reset_sync) begin
 			state <= ST_RESET;
@@ -844,6 +988,24 @@ module am2r_gpu
 			poll_delay <= 0;
 			operation_cycles <= 0;
 			texture_cache_valid <= 0;
+			affine_cache_valid <= 0;
+			affine_cache_index <= 0;
+			affine_cache_next <= 0;
+			affine_flow_enabled <= 0;
+			affine_flow_phase <= AF_PREP;
+			affine_pixel_bias <= 0;
+			affine_u_lookahead <= 0;
+			affine_v_lookahead <= 0;
+			affine_u_next_lookahead <= 0;
+			affine_x_lookahead <= 0;
+			affine_destination_lookahead <= 0;
+			affine_last_lookahead <= 0;
+			affine_line_way <= 0;
+			affine_line_fill <= 0;
+			for (affine_line_reset = 0; affine_line_reset < 8; affine_line_reset = affine_line_reset + 1)
+				affine_line_valid[affine_line_reset] <= 0;
+			for (affine_line_reset = 0; affine_line_reset < 32; affine_line_reset = affine_line_reset + 1)
+				affine_line_next[affine_line_reset] <= 0;
 			water_pipe0_valid <= 0;
 			water_pipe1_valid <= 0;
 			water_pipe2_valid <= 0;
@@ -859,6 +1021,7 @@ module am2r_gpu
 			gather_refilling <= 0;
 			gather_lookup <= 0;
 			axis_stream_setup <= 0;
+			axis_stream_narrow <= 0;
 			water_subtract_mode <= 0;
 			water_tint_alpha <= 8'hff;
 			fb_even_we <= 0;
@@ -943,6 +1106,7 @@ module am2r_gpu
 					else command_word <= command_word + 1'b1;
 				end
 				ST_CMD_DECODE: begin
+					affine_flow_enabled <= 0;
 					// This is per-descriptor state, never inherited by fill, affine,
 					// water, or a subsequent ordinary axis blit.
 					floor_tint_mode <= descriptor[0][7:0] == 8'd2 && descriptor[0][10];
@@ -961,6 +1125,9 @@ module am2r_gpu
 							state <= ST_CLEAR;
 						end
 						8'd2: begin
+							axis_stream_narrow <= descriptor[1][63:32] >= 32'd256 &&
+								($signed(descriptor[5][63:32]) >= 32'sd65536 ||
+								 $signed(descriptor[5][63:32]) <= -32'sd65536);
 							solid_mode <= 0;
 							additive_mode <= descriptor[0][8];
 							subtract_mode <= descriptor[0][9];
@@ -994,13 +1161,13 @@ module am2r_gpu
 						end
 						8'd3: begin
 							if (descriptor[0][8] && !descriptor[0][9] &&
-							    descriptor[1][31:24] == 8'hff &&
 							    descriptor[2][31:0] == 0 &&
 							    descriptor[0][31:16] == FB_WIDTH &&
 							    descriptor[0][47:32] == FB_HEIGHT &&
 							    descriptor[7] == 0) begin
-								// AM2R's underwater colour wash is a full-screen opaque
-								// additive fill. Stream it through both framebuffer banks
+								// Constant full-screen additive fills (including translucent
+								// flashes) retain their raw RGBA and exact floor blend.
+								// Stream them through both framebuffer banks
 								// at one pair per clock instead of re-entering the generic
 								// four-state read/modify/write loop for every pair.
 								tiled_mode <= 1;
@@ -1061,6 +1228,16 @@ module am2r_gpu
 							additive_mode <= affine_additive_config;
 							subtract_mode <= affine_subtract_config;
 							affine_mode <= 1;
+							affine_cache_valid <= 0;
+							affine_cache_next <= 0;
+							// Small sprites keep the short scalar path; larger draws
+							// amortize line fills and overlap sampling with blending.
+							affine_flow_enabled <= descriptor[0][31:16] >= 16'd32 &&
+								descriptor[0][47:32] >= 16'd32;
+							for (affine_line_reset = 0; affine_line_reset < 8; affine_line_reset = affine_line_reset + 1)
+								affine_line_valid[affine_line_reset] <= 0;
+							for (affine_line_reset = 0; affine_line_reset < 32; affine_line_reset = affine_line_reset + 1)
+								affine_line_next[affine_line_reset] <= 0;
 							src_base <= descriptor[1][31:0];
 							src_stride <= descriptor[1][63:32];
 							dst_x <= descriptor[2][15:0];
@@ -1313,7 +1490,17 @@ module am2r_gpu
 				end
 				ST_ROW_SOURCE_ADDRESS: begin
 					source_row_addr <= source_row_address_next;
-					state <= ST_BLIT_PIXEL;
+					if (affine_flow_enabled) begin
+						affine_flow_phase <= AF_PREP;
+						water_subtract_mode <= subtract_mode;
+						water_additive_mode <= additive_mode;
+						water_pipe0_valid <= 0;
+						water_pipe1_valid <= 0;
+						water_pipe2_valid <= 0;
+						water_pipe3_valid <= 0;
+						water_pipe4_valid <= 0;
+						state <= ST_AFFINE_FLOW;
+					end else state <= ST_BLIT_PIXEL;
 				end
 				ST_BLIT_PIXEL: begin
 					destination_linear <= destination_linear_calc;
@@ -1442,16 +1629,19 @@ module am2r_gpu
 					state <= ST_AFFINE_SOURCE_ADDRESS;
 				end
 				ST_AFFINE_SOURCE_ADDRESS: begin
-					source_byte_addr <= source_row_addr + (u_current >>> 16) * 4;
+					source_byte_addr <= source_row_addr + {{14{u_current[31]}}, u_current[31:16], 2'b00};
 					state <= ST_AFFINE_ADDRESS;
 				end
 				ST_AFFINE_ADDRESS: begin
-					if (texture_cache_valid &&
-					    texture_cache_addr == ((source_byte_addr >> 3) & 29'h1fff_fff0)) begin
+					if (affine_cache_hit) begin
+						affine_cache_index <= affine_cache_hit_index;
 						state <= ST_TEX_READY;
 					end else begin
-						texture_cache_fill <= 0;
-						start_read(source_byte_addr & 32'hffff_ff80, 16);
+						affine_cache_index <= affine_cache_next;
+						affine_cache_tag[affine_cache_next] <= source_byte_addr[31:3];
+						affine_cache_valid[affine_cache_next] <= 0;
+						affine_cache_next <= affine_cache_next + 1'b1;
+						start_read(source_byte_addr & 32'hffff_fff8, 1);
 						state <= ST_TEX_ACCEPT;
 					end
 				end
@@ -1460,12 +1650,18 @@ module am2r_gpu
 					state <= ST_TEX_DATA;
 				end
 				ST_TEX_DATA: if (ddram_dout_ready) begin
+					if (affine_mode) begin
+						affine_cache_data[affine_cache_index] <= ddram_dout;
+						affine_cache_valid[affine_cache_index] <= 1;
+						state <= ST_TEX_READY;
+					end else begin
 					texture_cache_data[texture_cache_fill] <= ddram_dout;
 					if (texture_cache_fill == 15) begin
 						texture_cache_valid <= 1;
 						texture_cache_addr <= source_byte_addr[31:3] & 29'h1fff_fff0;
 						state <= ST_TEX_READY;
 					end else texture_cache_fill <= texture_cache_fill + 1'b1;
+					end
 					end
 					ST_SOLID_READY: begin
 						destination_word <= destination_linear[16:1];
@@ -1510,6 +1706,15 @@ module am2r_gpu
 						end
 					end
 				ST_TEX_READY: begin
+					if (affine_mode)
+						source_pixel <= source_byte_addr[2] ? affine_cache_data[affine_cache_index][63:32] :
+							affine_cache_data[affine_cache_index][31:0];
+					else
+						source_pixel <= source_byte_addr[2] ? texture_cache_data[source_byte_addr[6:3]][63:32] :
+							texture_cache_data[source_byte_addr[6:3]][31:0];
+					source_pixel_1 <= source_byte_addr_1[2] ? texture_cache_data[source_byte_addr_1[6:3]][63:32] :
+						texture_cache_data[source_byte_addr_1[6:3]][31:0];
+					tint_color_stage <= tint_color;
 					if (pair_mode) begin
 						destination_word <= destination_linear[16:1];
 						destination_odd <= destination_linear[0];
@@ -1547,8 +1752,7 @@ module am2r_gpu
 							if (blit_x + 3 < blit_width &&
 							    u_current[31:16] != 16'h7ffe &&
 							    ($signed(dst_x) + $signed({1'b0, blit_x}) + 3) < FB_WIDTH &&
-							    texture_cache_addr ==
-							        ((((source_byte_addr + 32'd8) >> 3)) & 29'h1fff_fff0)) begin
+							    source_byte_addr[6:3] != 4'd15) begin
 								blit_x <= blit_x + 2;
 								u_current <= u_current + (u_step <<< 1);
 								u_next <= u_next + (u_step <<< 1);
@@ -1558,7 +1762,10 @@ module am2r_gpu
 								source_byte_addr_1 <= source_byte_addr_1 + 8;
 								state <= ST_TEX_READY;
 							end else begin
-								advance_blit_pair();
+								// Do not put the cache mux/binary-alpha decision and
+								// row-step register enables in the same timing path.
+								// Interior pairs still stream one pair per GPU clock.
+								state <= ST_TEX_PAIR_ADVANCE;
 							end
 						end else if (contiguous_pair_mode && !additive_mode && !subtract_mode && tint_color[23:0] == 24'hffffff &&
 						             (texture_cache_data[source_byte_addr[6:3]][31:24] == 0 ||
@@ -1579,13 +1786,7 @@ module am2r_gpu
 								texture_cache_data[source_byte_addr[6:3]][55:32]};
 							state <= ST_PAIR_BLEND_READ;
 						end else begin
-							// Register cache selection before the optional four-channel tint.
-							// Keeping the mux and DSP multiplies in one cycle has no route margin.
-							source_pixel <= source_byte_addr[2] ? texture_cache_data[source_byte_addr[6:3]][63:32] :
-								texture_cache_data[source_byte_addr[6:3]][31:0];
-							source_pixel_1 <= source_byte_addr_1[2] ? texture_cache_data[source_byte_addr_1[6:3]][63:32] :
-								texture_cache_data[source_byte_addr_1[6:3]][31:0];
-							tint_color_stage <= tint_color;
+							// The unconditional staging above also serves this tint path.
 							if (destination_linear[0]) begin
 								fb_odd_read_address <= destination_linear[16:1];
 								fb_even_read_address <= destination_linear[16:1] + 1'b1;
@@ -1596,9 +1797,6 @@ module am2r_gpu
 							state <= ST_PAIR_TINT_READY;
 						end
 					end else begin
-						source_pixel <= source_byte_addr[2] ? texture_cache_data[source_byte_addr[6:3]][63:32] :
-							texture_cache_data[source_byte_addr[6:3]][31:0];
-						tint_color_stage <= tint_color;
 						state <= ST_PIXEL_READY;
 					end
 				end
@@ -1622,6 +1820,7 @@ module am2r_gpu
 						state <= ST_TINT_PRODUCT_READY;
 					end
 				end
+				ST_TEX_PAIR_ADVANCE: advance_blit_pair();
 				ST_PIXEL_READY: begin
 					destination_word <= destination_linear[16:1];
 					destination_odd <= destination_linear[0];
@@ -1805,6 +2004,18 @@ module am2r_gpu
 							      generic_packet[3][15:8] < 1 || generic_packet[3][15:8] > 11 ||
 							      generic_packet[3][23:16] < 1 || generic_packet[3][23:16] > 11 ||
 							      generic_packet[3][31:24] < 1 || generic_packet[3][31:24] > 11))) next_command();
+							else if (generic_packet[2][58:56] == 3'b100 &&
+							         generic_packet[2][39:32] == 8'd1 &&
+							         (generic_packet[35][63] || generic_packet[35] == 64'd0) &&
+							         generic_packet[36] == 64'd0 && generic_packet[37] == 64'd0 &&
+							         generic_packet[38] == 64'd0) begin
+								// Constant nonpositive 32.32 alpha clamps to zero everywhere.
+								// Named additive blending then preserves ALL destination RGBA
+								// lanes, irrespective of RGB, texture, coverage or write mask.
+								// Validate first; do not extend this to replacement/custom/
+								// subtractive blending or any nonconstant alpha plane.
+								next_command();
+							end
 							else begin
 								generic_textured <= generic_packet[0][32];
 								generic_triangle <= generic_packet[0][33];
@@ -1891,17 +2102,13 @@ module am2r_gpu
 							generic_state <= GP_TINT_RESULT;
 						end
 						GP_TINT_RESULT: begin
-							// Stage tint independently of alpha rejection. Rejected
-							// pixels skip its consumers, so the comparison need not
-							// be on the shared tint/DSP register-enable path.
+							// Register the exact tint before alpha rejection. A
+							// rejected last pixel can start the next DDR command;
+							// that control must not depend on the DSP/carry output.
 							tinted_pixel <= {generic_tint_product[3][39:32],
 								generic_fog ? generic_fog_color[23:0] :
 								{generic_tint_product[2][39:32], generic_tint_product[1][39:32], generic_tint_product[0][39:32]}};
-							if (generic_alpha_test && generic_tint_product[3][39:32] < generic_alpha_ref)
-								advance_generic_pixel();
-							else begin
-								generic_state <= GP_FACTORS;
-							end
+							generic_state <= GP_FACTORS;
 						end
 						GP_FACTORS: begin
 							generic_destination <= generic_linear[0] ? fb_odd_q : fb_even_q;
@@ -1915,7 +2122,9 @@ module am2r_gpu
 									generic_named_factor(generic_blend_mode, 1'b0, generic_channel == 3),
 									tinted_pixel, generic_linear[0] ? fb_odd_q : fb_even_q, generic_channel);
 							end
-							generic_state <= GP_PRODUCTS;
+							if (generic_alpha_test && tinted_pixel[31:24] < generic_alpha_ref)
+								advance_generic_pixel();
+							else generic_state <= GP_PRODUCTS;
 						end
 						GP_PRODUCTS: begin
 							for (generic_channel = 0; generic_channel < 4; generic_channel = generic_channel + 1) begin
@@ -2247,7 +2456,7 @@ module am2r_gpu
 					state <= ST_WATER_SOURCE_ADDRESS;
 				end
 				ST_WATER_SOURCE_ADDRESS, ST_WATER_SOURCE_ACCEPT,
-				ST_WATER_SOURCE_DATA: begin
+				ST_WATER_SOURCE_DATA, ST_AFFINE_FLOW: begin
 					if (state == ST_WATER_SOURCE_ADDRESS) begin
 					if (axis_gather_mode) begin
 						texture_cache_fill <= 0;
@@ -2426,7 +2635,91 @@ module am2r_gpu
 						end
 					end
 
-					if (state == ST_WATER_SOURCE_DATA && axis_gather_mode && !water_source_done) begin
+					if (state == ST_AFFINE_FLOW) begin
+						case (affine_flow_phase)
+							AF_PREP: begin
+								stage_affine_row();
+								destination_linear <= destination_linear_calc;
+								if (($signed(dst_x) + $signed({1'b0, blit_x})) < 0 ||
+								    ($signed(dst_x) + $signed({1'b0, blit_x})) >= FB_WIDTH ||
+								    ($signed(dst_y) + $signed({1'b0, blit_y})) < 0 ||
+								    ($signed(dst_y) + $signed({1'b0, blit_y})) >= FB_HEIGHT ||
+								    u_current < u_min || u_current >= u_max ||
+								    v_current < v_min || v_current >= v_max)
+									advance_affine_flow(1'b0);
+								else affine_flow_phase <= AF_ROW;
+							end
+							AF_ROW: begin
+								source_row_addr <= source_row_address_next;
+								source_byte_addr <= affine_row_pixel_address;
+								// Register next UV before the emit-stage multiply/bias.
+								// A miss freezes both current and lookahead metadata.
+								affine_u_lookahead <= u_current + u_step;
+								affine_v_lookahead <= v_current + v_x_step;
+								affine_u_next_lookahead <= u_next + u_step;
+								affine_x_lookahead <= blit_x + 1'b1;
+								affine_last_lookahead <= blit_x + 1'b1 >= blit_width;
+								affine_destination_lookahead <= destination_linear + 1'b1;
+								if (($signed(dst_x) + $signed({1'b0, blit_x})) < 0 ||
+								    ($signed(dst_x) + $signed({1'b0, blit_x})) >= FB_WIDTH ||
+								    ($signed(dst_y) + $signed({1'b0, blit_y})) < 0 ||
+								    ($signed(dst_y) + $signed({1'b0, blit_y})) >= FB_HEIGHT ||
+								    u_current < u_min || u_current >= u_max ||
+								    v_current < v_min || v_current >= v_max)
+									advance_affine_flow(1'b0);
+								else affine_flow_phase <= AF_EMIT;
+							end
+							AF_RAM: affine_flow_phase <= AF_EMIT;
+							AF_EMIT: begin
+								// Stage speculatively even on misses: the frozen current
+								// source address owns refill/retry. Keep tag-hit logic
+								// off the shared multiplier/address-register enables.
+								stage_affine_row();
+								// Only valid publishes a texel. Stage data on misses too,
+								// keeping tag-hit selection off the blend-register enable.
+								water_pipe0_pixel0 <= source_byte_addr[2] ? affine_line_data_q[affine_line_hit_way][63:32] :
+									affine_line_data_q[affine_line_hit_way][31:0];
+								if (affine_line_hit) begin
+									water_pipe0_valid <= 2'b01;
+									water_pipe0_pixel1 <= 0;
+									water_pipe0_destination0 <= destination_linear[16:1];
+									water_pipe0_odd0 <= destination_linear[0];
+									if (destination_linear[0]) fb_odd_read_address <= destination_linear[16:1];
+									else fb_even_read_address <= destination_linear[16:1];
+									// Prepare the following texel while this one enters the
+									// unchanged blend pipeline. Preserve unsigned V-row
+									// truncation and signed U displacement/modulo32.
+									destination_linear <= affine_destination_lookahead;
+									advance_affine_flow(1'b1);
+								end else begin
+									affine_line_way <= affine_line_next[affine_line_set];
+									affine_line_valid[affine_line_next[affine_line_set]][affine_line_set] <= 0;
+									affine_line_next[affine_line_set] <= affine_line_next[affine_line_set] + 1'b1;
+									affine_line_fill <= 0;
+									start_read(source_byte_addr & 32'hffff_ffc0, 8);
+									affine_flow_phase <= AF_ACCEPT;
+								end
+							end
+							AF_ACCEPT: if (!ddram_busy) begin
+								ddram_rd <= 0;
+								affine_flow_phase <= AF_DATA;
+							end
+							AF_DATA: if (ddram_dout_ready) begin
+								if (affine_line_fill == 3'd7) begin
+									affine_line_valid[affine_line_way][affine_line_set] <= 1;
+									affine_flow_phase <= AF_RAM;
+								end else affine_line_fill <= affine_line_fill + 1'b1;
+							end
+							AF_DRAIN: if (water_pipe0_valid == 0 && water_pipe1_valid == 0 &&
+							              water_pipe2_valid == 0 && water_pipe3_valid == 0 && water_pipe4_valid == 0) begin
+								blit_x <= 0;
+								blit_y <= blit_y + 1'b1;
+								u_start <= u_start + u_y_step;
+								v_start <= v_start + v_step;
+								state <= ST_BLIT_ROW;
+							end
+						endcase
+					end else if (state == ST_WATER_SOURCE_DATA && axis_gather_mode && !water_source_done) begin
 						if (gather_refilling) begin
 							if (ddram_dout_ready) begin
 								texture_cache_data[texture_cache_fill] <= ddram_dout;

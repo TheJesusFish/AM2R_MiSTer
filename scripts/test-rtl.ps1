@@ -27,12 +27,20 @@ function Invoke-VideoSimulation {
 
 Push-Location $projectRoot
 try {
+    & python tests\runtime\test_native_raster_contract.py
+    if ($LASTEXITCODE -ne 0) { throw 'Native raster clock/physical-width contract failed.' }
+    & python tests\runtime\test_presentation_counter.py
+    if ($LASTEXITCODE -ne 0) { throw 'Presentation-counter contract/mutation regression failed.' }
+
     if (-not $VideoOnly) {
     & python tests\renderer\audit_sw_renderer.py
     if ($LASTEXITCODE -ne 0) { throw "renderer operation audit failed with exit code $LASTEXITCODE." }
 
     & python tests\renderer\test_gpu_sample.py
     if ($LASTEXITCODE -ne 0) { throw "GPU diagnostic sampler regression failed with exit code $LASTEXITCODE." }
+
+    & python tests\renderer\test_texture_prewarm.py
+    if ($LASTEXITCODE -ne 0) { throw 'Bounded texture prewarm regression failed.' }
 
     & python tests\renderer\test_subtractive_blend.py
     if ($LASTEXITCODE -ne 0) { throw "native blend regression failed with exit code $LASTEXITCODE." }
@@ -99,6 +107,10 @@ try {
 	if ($LASTEXITCODE -ne 0) { throw "CRT UI inset test failed with exit code $LASTEXITCODE." }
 	& python tests\renderer\test_crt_ui_composition.py
 	if ($LASTEXITCODE -ne 0) { throw "CRT UI composition regression failed with exit code $LASTEXITCODE." }
+	foreach ($surfaceTest in @('test_surface_id_lifetime.py', 'test_surface_projection.py', 'test_surface_source_cache.py')) {
+		& python (Join-Path 'tests\renderer' $surfaceTest)
+		if ($LASTEXITCODE -ne 0) { throw "$surfaceTest failed with exit code $LASTEXITCODE." }
+	}
 
     $alsaSource = Get-Content -Raw -LiteralPath (Join-Path $projectRoot 'sys\alsa.sv')
 	if (-not $alsaSource.Contains('if(len[18:14] && (hurryup < 1)) hurryup <= 1;') -or
@@ -201,6 +213,9 @@ try {
 	if ($LASTEXITCODE -ne 0) { throw "DDR-arbiter vlog failed with exit code $LASTEXITCODE." }
 
 	Invoke-VideoSimulation -Name am2r_ddr_arbiter_tb
+	& vlog -sv -work $library rtl\am2r_ddr_arbiter.sv tests\rtl\am2r_presentation_counter_tb.sv
+	if ($LASTEXITCODE -ne 0) { throw 'Presentation-counter compile failed.' }
+	Invoke-VideoSimulation -Name am2r_presentation_counter_tb
 
 	& vlog -sv -work $library rtl\am2r_native_video.sv rtl\am2r_native_reader.sv tests\rtl\am2r_native_reader_tb.sv
 	if ($LASTEXITCODE -ne 0) { throw "native-reader vlog failed with exit code $LASTEXITCODE." }
@@ -224,10 +239,29 @@ try {
     & vsim -c -lib $library am2r_framebuffer_config_tb -do 'onerror {quit -code 1}; run -all; quit -code 0'
     if ($LASTEXITCODE -ne 0) { throw "framebuffer vsim failed with exit code $LASTEXITCODE." }
 
+    & python tests\renderer\test_affine_texture_cache.py --mutation-check
+    if ($LASTEXITCODE -ne 0) { throw 'Affine texture-cache regression failed.' }
+
     & vlog -sv -work $library rtl\am2r_gpu.sv tests\rtl\am2r_gpu_blend_pipeline_tb.sv
     if ($LASTEXITCODE -ne 0) { throw "GPU blend pipeline vlog failed with exit code $LASTEXITCODE." }
 
     Invoke-VideoSimulation 'am2r_gpu_blend_pipeline_tb'
+
+    & python tests\renderer\test_tint_rounding.py
+    if ($LASTEXITCODE -ne 0) { throw 'Exhaustive tint rounding/mutation regression failed.' }
+
+    & python tests\renderer\test_solid_stream.py --mutation-check --replay-ordering
+    if ($LASTEXITCODE -ne 0) { throw 'Constant additive-fill pipeline regression failed.' }
+    & python tests\renderer\test_generic_noop.py --mutation-check
+    if ($LASTEXITCODE -ne 0) { throw 'Generic no-op regression failed.' }
+    $oldNarrowRtl = $env:AM2R_TEST_RTL
+    try {
+        $env:AM2R_TEST_RTL = '1'
+        & python tests\renderer\test_narrow_axis_stream.py
+        if ($LASTEXITCODE -ne 0) { throw 'Guarded narrow-axis stream regression failed.' }
+    } finally {
+        $env:AM2R_TEST_RTL = $oldNarrowRtl
+    }
 
     & vlog -sv -work $library rtl\am2r_gpu.sv tests\rtl\am2r_gpu_row_pipeline_tb.sv
     if ($LASTEXITCODE -ne 0) { throw 'GPU row pipeline vlog failed.' }

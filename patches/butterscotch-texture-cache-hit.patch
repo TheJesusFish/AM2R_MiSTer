@@ -1,0 +1,43 @@
+diff --git a/src/backends/mister.c b/src/backends/mister.c
+index ce8dfaa..cf3b3b3 100644
+--- a/src/backends/mister.c
++++ b/src/backends/mister.c
+@@ -1342,9 +1342,37 @@ static uint32_t uploadDynamicTexture(const void* rgbaPixels, size_t bytes,
+     return physical0;
+ }
+ 
++// A verified CPU-shadow hit does not write texture memory, so queued GPU
++// readers can safely retain the existing allocation. In particular, affine
++// solid-colour primitives repeatedly use the same one-pixel white texture.
++// Check before flushing; misses and changed content keep the write barrier.
++static uint32_t gpuUnchangedDynamicTexture(const void* rgbaPixels, size_t bytes) {
++    if (!g_gpu_available || rgbaPixels == NULL || bytes == 0) return 0;
++    for (uint32_t i = 0; i < g_gpu_texture_record_count; ++i) {
++        MisterGpuTexture* record = &g_gpu_texture_records[i];
++        if (record->released || record->source != rgbaPixels ||
++            record->bytes != bytes || record->sparse || !record->shadow_valid ||
++            record->shadow == NULL || record->active >= 2u ||
++            record->physical[record->active] == 0)
++            continue;
++        if (!gpuBuffersEqual(record->shadow, rgbaPixels, bytes)) return 0;
++        // Match the normal unversioned lookup's revision bookkeeping. A later
++        // versioned caller must not trust a revision from before this lookup.
++        record->source_revision = 0;
++        record->source_revision_valid = false;
++        return record->physical[record->active];
++    }
++    return 0;
++}
++
+ uint32_t MisterGpu_uploadDynamicTexture(const void* rgbaPixels, size_t bytes) {
+     RD_SCOPE(RD_UPLOAD, -1, 0);
+-    if (g_gpu_unified_enabled && !MisterGpu_flushNoPresent()) return 0;
++    if (g_gpu_unified_enabled) {
++        if (!MisterGpu_unifiedEnabled()) return 0;
++        uint32_t cached = gpuUnchangedDynamicTexture(rgbaPixels, bytes);
++        if (cached != 0) return cached;
++        if (!MisterGpu_flushNoPresent()) return 0;
++    }
+     return uploadDynamicTexture(rgbaPixels, bytes, false, 0);
+ }
+ 

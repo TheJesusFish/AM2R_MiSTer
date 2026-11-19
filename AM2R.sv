@@ -140,7 +140,7 @@ pll_video pll_vid
 	.locked(pll_video_locked)
 );
 
-// Keep the framework's system and native-video domains on the same 26.8 MHz
+// Keep the framework's system and native-video domains on the same 25 MHz
 // core PLL. Besides being ample for hps_io, this lets the untouched upstream
 // OSD infer its normal block RAM rather than becoming a mixed-clock register
 // array. The GPU remains on its independent 88 MHz PLL output.
@@ -159,7 +159,7 @@ always @(posedge clk_gpu) begin
 	gpu_reset <= gpu_reset_meta;
 end
 
-// The framework and native video run at 26.8 MHz while the renderer remains at
+// The framework and native video run at 25 MHz while the renderer remains at
 // 88 MHz. Keep reset deassertion synchronous to scanout.
 reg video_reset_meta = 1;
 reg video_reset = 1;
@@ -174,6 +174,7 @@ wire       vblank;
 wire       vsync;
 wire       ce_pix;
 wire       new_frame;
+wire       active_frame;
 wire       new_line;
 wire       pace_tick;
 wire       native_pal;
@@ -281,7 +282,7 @@ am2r_ddr_arbiter ddr_arbiter
 	.clk(clk_gpu),
 	.reset(gpu_reset),
 	.frame_tick(pace_tick),
-	.display_tick(new_frame),
+	.display_tick(active_frame),
 	.native_frame(native_frame_number),
 	.scanout_frame(scanout_frame_number),
 	.gpu_burstcnt(gpu_ddr_burstcnt), .gpu_addr(gpu_ddr_addr),
@@ -316,6 +317,7 @@ am2r_native_video native_video
 	.vblank(vblank),
 	.vsync(vsync),
 	.new_frame(new_frame),
+	.active_frame(active_frame),
 	.new_line(new_line),
 	.pace_tick(pace_tick),
 	.pal(native_pal),

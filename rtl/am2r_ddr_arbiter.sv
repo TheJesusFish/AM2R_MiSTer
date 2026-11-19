@@ -10,9 +10,8 @@ module am2r_ddr_arbiter (
 	// shared DDR so the ARM runner can phase-lock game ticks to scanout without
 	// modifying MiSTer's sys/ framework.
 	input              frame_tick,
-	// A separate pulse at the real raster boundary. The pacing heartbeat may
-	// intentionally lead vblank, but diagnostics must sample the frame selected
-	// for scanout at the actual presentation edge.
+	// First active pixel, after the native reader's normal late-latch window.
+	// Diagnostic only: never drives the pacing heartbeat or buffer ownership.
 	input              display_tick,
 	input      [31:0]  native_frame,
 	input      [31:0]  scanout_frame,
@@ -44,11 +43,15 @@ module am2r_ddr_arbiter (
 	output reg  [7:0]  ddram_be,
 	output reg         ddram_we
 );
-	localparam [1:0] IDLE = 0, GPU_READ = 1, VID_READ = 2, GPU_WRITE = 3;
+	localparam [2:0] IDLE = 0, GPU_READ = 1, VID_READ = 2, GPU_WRITE = 3, PRESENT_STATUS = 4;
 	localparam [28:0] FRAME_STATUS_ADDR = 29'h047fe008; // 0x23ff0040 >> 3
 	localparam [28:0] FRAME_DETAIL_ADDR = 29'h047fe009; // 0x23ff0048 >> 3
 	localparam [31:0] FRAME_STATUS_MAGIC = 32'h56424c4b; // "VBLK"
-	reg [1:0] owner = IDLE;
+	// Words22..27 are a read-only native presentation seqlock. Existing GPU,
+	// capability and heartbeat words0..21 retain their layout and behavior.
+	localparam [28:0] PRESENT_HEADER_ADDR = 29'h047fe00b; // 0x23ff0058 >> 3
+	localparam [31:0] PRESENT_MAGIC = 32'h5352504e; // "NPRS" in little endian
+	reg [2:0] owner = IDLE;
 	reg [7:0] beats_left = 0;
 	reg [2:0] frame_tick_sync = 0;
 	reg [2:0] display_tick_sync = 0;
@@ -56,6 +59,15 @@ module am2r_ddr_arbiter (
 	reg frame_status_pending = 0;
 	reg frame_detail_pending = 0;
 	reg [63:0] frame_detail = 0;
+	reg [31:0] presentation_rasters = 0, presentation_repeats = 0;
+	reg [31:0] presentation_skips = 0, previous_scanout = 0;
+	reg previous_scanout_valid = 0;
+	reg presentation_pending = 0;
+	reg [31:0] presentation_generation = 0;
+	reg [1:0] presentation_write_stage = 0;
+	reg [31:0] record_generation = 0, record_rasters = 0;
+	reg [31:0] record_scanout = 0, record_repeats = 0, record_skips = 0;
+	wire [31:0] scanout_delta = scanout_frame - previous_scanout;
 	wire frame_tick_clk = frame_tick_sync[1] & ~frame_tick_sync[2];
 	wire display_tick_clk = display_tick_sync[1] & ~display_tick_sync[2];
 
@@ -97,6 +109,10 @@ module am2r_ddr_arbiter (
 					ddram_din = frame_detail;
 					ddram_be = 8'hff;
 					ddram_we = 1;
+				end else if (presentation_pending) begin
+					// One reservation cycle to freeze the record before issuing
+					// its first write. Do not accidentally grant a GPU transaction
+					// while the sequential owner moves to PRESENT_STATUS.
 				end else if (gpu_rd || gpu_we) begin
 					ddram_burstcnt = gpu_burstcnt;
 					ddram_addr = gpu_addr;
@@ -123,6 +139,31 @@ module am2r_ddr_arbiter (
 				ddram_we = gpu_we;
 				gpu_busy = ddram_busy;
 			end
+			PRESENT_STATUS: begin
+				// Freeze the complete four-beat record, including the odd/even
+				// generation, under DDR backpressure. At most four single writes
+				// per raster; an in-flight record never changes at a newer edge.
+				ddram_be = 8'hff;
+				ddram_we = 1;
+				case (presentation_write_stage)
+					0: begin
+						ddram_addr = PRESENT_HEADER_ADDR;
+						ddram_din = {record_generation - 32'd1, PRESENT_MAGIC};
+					end
+					1: begin
+						ddram_addr = PRESENT_HEADER_ADDR + 29'd1;
+						ddram_din = {record_scanout, record_rasters};
+					end
+					2: begin
+						ddram_addr = PRESENT_HEADER_ADDR + 29'd2;
+						ddram_din = {record_skips, record_repeats};
+					end
+					3: begin
+						ddram_addr = PRESENT_HEADER_ADDR;
+						ddram_din = {record_generation, PRESENT_MAGIC};
+					end
+				endcase
+			end
 			default: begin end
 		endcase
 	end
@@ -137,6 +178,19 @@ module am2r_ddr_arbiter (
 			frame_status_pending <= 0;
 			frame_detail_pending <= 0;
 			frame_detail <= 0;
+			presentation_rasters <= 0;
+			presentation_repeats <= 0;
+			presentation_skips <= 0;
+			previous_scanout <= 0;
+			previous_scanout_valid <= 0;
+			presentation_pending <= 0;
+			presentation_generation <= 0;
+			presentation_write_stage <= 0;
+			record_generation <= 0;
+			record_rasters <= 0;
+			record_scanout <= 0;
+			record_repeats <= 0;
+			record_skips <= 0;
 		end else begin
 			frame_tick_sync <= {frame_tick_sync[1:0], frame_tick};
 			display_tick_sync <= {display_tick_sync[1:0], display_tick};
@@ -147,6 +201,16 @@ module am2r_ddr_arbiter (
 			if (display_tick_clk) begin
 				frame_detail_pending <= 1;
 				frame_detail <= {native_frame, scanout_frame};
+				presentation_rasters <= presentation_rasters + 1'b1;
+				presentation_pending <= 1;
+				previous_scanout <= scanout_frame;
+				previous_scanout_valid <= scanout_frame != 0;
+				if (previous_scanout_valid && scanout_frame != 0) begin
+					if (scanout_delta == 0)
+						presentation_repeats <= presentation_repeats + 1'b1;
+					else if (scanout_delta > 1)
+						presentation_skips <= presentation_skips + scanout_delta - 1'b1;
+				end
 			end
 			case (owner)
 				IDLE: begin
@@ -159,6 +223,19 @@ module am2r_ddr_arbiter (
 						frame_status_pending <= frame_tick_clk;
 					end else if (frame_detail_pending && !ddram_busy) begin
 						frame_detail_pending <= display_tick_clk;
+					end else if (presentation_pending && !vid_rd && !frame_status_pending &&
+					             !frame_detail_pending) begin
+						// Coalesce delayed snapshots, not events: the counters above
+						// still account for every active raster while DDR is occupied.
+						owner <= PRESENT_STATUS;
+						presentation_write_stage <= 0;
+						presentation_generation <= presentation_generation + 32'd2;
+						record_generation <= presentation_generation + 32'd2;
+						record_rasters <= presentation_rasters;
+						record_scanout <= previous_scanout;
+						record_repeats <= presentation_repeats;
+						record_skips <= presentation_skips;
+						presentation_pending <= display_tick_clk;
 					end else if (gpu_rd && !ddram_busy) begin
 						owner <= GPU_READ;
 						beats_left <= gpu_burstcnt;
@@ -182,6 +259,14 @@ module am2r_ddr_arbiter (
 						owner <= IDLE;
 					end else begin
 						beats_left <= beats_left - 1'b1;
+					end
+				end
+				PRESENT_STATUS: if (!ddram_busy) begin
+					if (presentation_write_stage == 3) begin
+						presentation_write_stage <= 0;
+						owner <= IDLE;
+					end else begin
+						presentation_write_stage <= presentation_write_stage + 1'b1;
 					end
 				end
 				default: owner <= IDLE;

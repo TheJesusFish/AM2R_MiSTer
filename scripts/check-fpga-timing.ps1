@@ -161,6 +161,11 @@ $changes = @()
 try {
     $arguments = @('-t', ('"' + $tclPath + '"'), ('"' + $projectRoot + '"'), ('"' + $reportsRoot + '"'))
     $auditProcess = Start-Process -FilePath $staPath -ArgumentList $arguments -WorkingDirectory $projectRoot -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $outputRoot 'stdout.log') -RedirectStandardError (Join-Path $outputRoot 'stderr.log')
+    # Windows PowerShell 5.1 can lose ExitCode when Start-Process's returned
+    # object never opens its process handle before exit. Retain the handle;
+    # never replace an unavailable code with an inferred success from logs.
+    $auditHandle = $auditProcess.Handle
+    if ($auditHandle -eq [IntPtr]::Zero) { throw 'Timing audit process handle unavailable.' }
     $auditCreated = $auditProcess.StartTime
     $timer = [Diagnostics.Stopwatch]::StartNew()
     $lastNotice = 0
@@ -185,6 +190,7 @@ try {
     }
     $auditProcess.WaitForExit()
     $auditExit = $auditProcess.ExitCode
+    if ($null -eq $auditExit) { throw 'Timing audit process exit code unavailable.' }
 } catch {
     $auditError = $_.Exception.Message
 } finally {
